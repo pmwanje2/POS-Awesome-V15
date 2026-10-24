@@ -118,6 +118,240 @@ class TestExchangeValidation(unittest.TestCase):
             payments=[{"amount": 500}],
         )
 
+    def test_cashier_exchange_uses_system_credit_journal_without_journal_entry_permission(self):
+        journals = []
+        exchanges = []
+        submitted = []
+        frappe = sys.modules["frappe"]
+        return_doc = AttrDict(
+            name="SINV-RETURN",
+            doctype="Sales Invoice",
+            docstatus=1,
+            is_return=1,
+            return_against="SINV-0001",
+            company="Example Co",
+            pos_profile="Main POS",
+            customer="Customer A",
+            currency="PKR",
+            outstanding_amount=-100,
+            rounded_total=100,
+            conversion_rate=1,
+            posting_date="2026-10-24",
+            debit_to="Debtors - EC",
+            items=[],
+            reload=lambda: None,
+        )
+        sale_doc = AttrDict(
+            name="SINV-SALE",
+            doctype="Sales Invoice",
+            docstatus=1,
+            is_return=0,
+            company="Example Co",
+            pos_profile="Main POS",
+            customer="Customer A",
+            currency="PKR",
+            outstanding_amount=100,
+            rounded_total=100,
+            conversion_rate=1,
+            posting_date="2026-10-24",
+            debit_to="Debtors - EC",
+            items=[],
+            reload=lambda: None,
+        )
+
+        class FakeJournalEntry(AttrDict):
+            def __init__(self, values):
+                super().__init__(values)
+                self.flags = types.SimpleNamespace(
+                    ignore_permissions=False,
+                    ignore_mandatory=False,
+                    ignore_exchange_rate=False,
+                    skip_remarks_creation=False,
+                )
+                self.accounts = [AttrDict(row) for row in values["accounts"]]
+
+            def submit(self):
+                submitted.append(self)
+                if not self.flags.ignore_permissions:
+                    raise PermissionError("Journal Entry submit permission required")
+                self.name = "JV-EXCHANGE-1"
+                self.docstatus = 1
+                return_doc["outstanding_amount"] = 0
+                sale_doc["outstanding_amount"] = 0
+
+        class FakeExchange(AttrDict):
+            def insert(self, ignore_permissions=False):
+                self["name"] = "POS-EXCH-00001"
+                self["insert_ignore_permissions"] = ignore_permissions
+
+        def get_doc(*args):
+            if len(args) == 1 and isinstance(args[0], dict):
+                values = args[0]
+                if values["doctype"] == "Journal Entry":
+                    journal = FakeJournalEntry(values)
+                    journals.append(journal)
+                    return journal
+                exchange_doc = FakeExchange(values)
+                exchanges.append(exchange_doc)
+                return exchange_doc
+            documents = {return_doc.name: return_doc, sale_doc.name: sale_doc}
+            return documents[args[1]]
+
+        frappe.get_doc = get_doc
+        frappe.get_cached_value = lambda *args: "PKR"
+        frappe.get_all = lambda *args, **kwargs: [
+            AttrDict(parent="JV-EXCHANGE-1", reference_name=return_doc.name),
+            AttrDict(parent="JV-EXCHANGE-1", reference_name=sale_doc.name),
+        ]
+        self.exchange.get_authorized_pos_profile = lambda pos_profile, company=None: self.profile
+        self.exchange._existing_exchange = lambda client_request_id: None
+        self.exchange._validate_original_invoice = lambda return_invoice, profile: None
+
+        def submit_invoice(payload, _data, submit_in_background=False):
+            payload = json.loads(payload)
+            return {
+                "doctype": "Sales Invoice",
+                "name": "SINV-RETURN" if payload.get("is_return") else "SINV-SALE",
+            }
+
+        self.exchange.submit_invoice = submit_invoice
+
+        erpnext = types.ModuleType("erpnext")
+        accounts = types.ModuleType("erpnext.accounts")
+        doctype = types.ModuleType("erpnext.accounts.doctype")
+        reconciliation = types.ModuleType(
+            "erpnext.accounts.doctype.payment_reconciliation"
+        )
+        payment_reconciliation = types.ModuleType(
+            "erpnext.accounts.doctype.payment_reconciliation.payment_reconciliation"
+        )
+        def reconcile_dr_cr_note(dr_cr_notes, company):
+            for inv in dr_cr_notes:
+                jv = frappe.get_doc(
+                    {
+                        "doctype": "Journal Entry",
+                        "voucher_type": "Credit Note",
+                        "posting_date": inv.get("debit_or_credit_note_posting_date"),
+                        "company": company,
+                        "accounts": [],
+                    }
+                )
+                jv.is_system_generated = True
+                jv.submit()
+
+        payment_reconciliation.reconcile_dr_cr_note = reconcile_dr_cr_note
+        sys.modules.update(
+            {
+                "erpnext": erpnext,
+                "erpnext.accounts": accounts,
+                "erpnext.accounts.doctype": doctype,
+                "erpnext.accounts.doctype.payment_reconciliation": reconciliation,
+                "erpnext.accounts.doctype.payment_reconciliation.payment_reconciliation": payment_reconciliation,
+            }
+        )
+
+        result = self.exchange.submit_item_exchange(
+            self.return_invoice,
+            self.sale_invoice,
+            pos_profile="Main POS",
+            client_request_id="exchange-1",
+        )
+
+        self.assertEqual(result["exchange_reference"], "POS-EXCH-00001")
+        self.assertEqual(len(exchanges), 1)
+        self.assertEqual(exchanges[0].reconciliation_journal, "JV-EXCHANGE-1")
+        self.assertEqual(len(journals), 1)
+        journal = journals[0]
+        self.assertEqual(journal.voucher_type, "Credit Note")
+        self.assertEqual(journal.is_system_generated, 1)
+        self.assertIsNone(journal.remark)
+        self.assertTrue(journal.flags.ignore_permissions)
+        self.assertTrue(journal.flags.ignore_mandatory)
+        self.assertTrue(journal.flags.ignore_exchange_rate)
+        self.assertTrue(journal.flags.skip_remarks_creation)
+        self.assertEqual(
+            journal.accounts,
+            [
+                AttrDict(
+                    account="Debtors - EC",
+                    party="Customer A",
+                    party_type="Customer",
+                    credit_in_account_currency=100,
+                    reference_type="Sales Invoice",
+                    reference_name="SINV-SALE",
+                    cost_center=None,
+                    exchange_rate=1,
+                ),
+                AttrDict(
+                    account="Debtors - EC",
+                    party="Customer A",
+                    party_type="Customer",
+                    debit_in_account_currency=100,
+                    reference_type="Sales Invoice",
+                    reference_name="SINV-RETURN",
+                    cost_center=None,
+                    exchange_rate=1,
+                ),
+            ],
+        )
+        self.assertEqual(len(submitted), 1)
+
+    def test_exchange_refuses_unassigned_profile_before_invoice_or_journal(self):
+        calls = []
+        self.exchange.get_authorized_pos_profile = lambda *args, **kwargs: (_ for _ in ()).throw(
+            PermissionError("POS Profile is not assigned to this user")
+        )
+        self.exchange.submit_invoice = lambda *args, **kwargs: calls.append("invoice")
+
+        with self.assertRaisesRegex(PermissionError, "not assigned"):
+            self.exchange.submit_item_exchange(
+                self.return_invoice,
+                self.sale_invoice,
+                pos_profile="Unassigned POS",
+                client_request_id="exchange-2",
+            )
+
+        self.assertEqual(calls, [])
+
+    def test_exchange_refuses_unsubmitted_invoice_before_credit_journal(self):
+        journals = []
+        frappe = sys.modules["frappe"]
+        return_doc = AttrDict(
+            name="SINV-RETURN",
+            doctype="Sales Invoice",
+            docstatus=1,
+            is_return=1,
+            return_against="SINV-0001",
+        )
+        sale_doc = AttrDict(
+            name="SINV-SALE",
+            doctype="Sales Invoice",
+            docstatus=0,
+            is_return=0,
+        )
+        frappe.get_doc = lambda *args: (
+            journals.append(args[0])
+            if len(args) == 1
+            else (return_doc if args[1] == "SINV-RETURN" else sale_doc)
+        )
+        self.exchange.get_authorized_pos_profile = lambda pos_profile, company=None: self.profile
+        self.exchange._existing_exchange = lambda client_request_id: None
+        self.exchange._validate_original_invoice = lambda return_invoice, profile: None
+        self.exchange.submit_invoice = lambda payload, _data, submit_in_background=False: {
+            "doctype": "Sales Invoice",
+            "name": "SINV-RETURN" if json.loads(payload).get("is_return") else "SINV-SALE",
+        }
+
+        with self.assertRaisesRegex(ValueError, "submitted synchronously"):
+            self.exchange.submit_item_exchange(
+                self.return_invoice,
+                self.sale_invoice,
+                pos_profile="Main POS",
+                client_request_id="exchange-3",
+            )
+
+        self.assertEqual(journals, [])
+
     def test_accepts_linked_sales_invoice_exchange(self):
         self.exchange._validate_exchange_payload(
             self.return_invoice,
