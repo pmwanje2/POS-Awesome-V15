@@ -177,7 +177,7 @@ class TestEmployeesApi(unittest.TestCase):
             def __init__(self, name):
                 self.name = name
 
-            def get_password(self, fieldname):
+            def get_password(self, fieldname, raise_exception=True):
                 return "1234" if self.name == "cashier@example.com" else "123456"
 
         self.employees.frappe.get_doc = lambda doctype, name: FakeUserDoc(name)
@@ -275,7 +275,7 @@ class TestEmployeesApi(unittest.TestCase):
                 self.posa_is_pos_supervisor = 0
                 self.flags = types.SimpleNamespace()
 
-            def get_password(self, fieldname):
+            def get_password(self, fieldname, raise_exception=True):
                 self.last_password_field = fieldname
                 return "1234"
 
@@ -321,7 +321,7 @@ class TestEmployeesApi(unittest.TestCase):
             enabled = 1
             posa_is_pos_supervisor = 0
 
-            def get_password(self, fieldname):
+            def get_password(self, fieldname, raise_exception=True):
                 return "1234"
 
         self.employees.frappe.get_all = lambda doctype, **kwargs: (
@@ -412,7 +412,7 @@ class TestEmployeesApi(unittest.TestCase):
             def __init__(self):
                 self.password_reads = 0
 
-            def get_password(self, fieldname):
+            def get_password(self, fieldname, raise_exception=True):
                 self.password_reads += 1
                 return "1234"
 
@@ -452,7 +452,7 @@ class TestEmployeesApi(unittest.TestCase):
                 self.full_name = name
                 self.pin = pin
 
-            def get_password(self, fieldname):
+            def get_password(self, fieldname, raise_exception=True):
                 return self.pin
 
         user_docs = {
@@ -501,7 +501,7 @@ class TestEmployeesApi(unittest.TestCase):
             enabled = 1
             posa_is_pos_supervisor = 0
 
-            def get_password(self, fieldname):
+            def get_password(self, fieldname, raise_exception=True):
                 return "1234"
 
         self.employees.frappe.get_all = lambda doctype, **kwargs: (
@@ -541,7 +541,7 @@ class TestEmployeesApi(unittest.TestCase):
             enabled = 1
             posa_is_pos_supervisor = 0
 
-            def get_password(self, fieldname):
+            def get_password(self, fieldname, raise_exception=True):
                 raise AssertionError("PIN must not be read without the attempt lock")
 
         self.employees.frappe.get_all = lambda doctype, **kwargs: (
@@ -573,7 +573,7 @@ class TestEmployeesApi(unittest.TestCase):
                 self.enabled = 1
                 self.posa_is_pos_supervisor = 1
 
-            def get_password(self, fieldname):
+            def get_password(self, fieldname, raise_exception=True):
                 self.last_password_field = fieldname
                 return "4321"
 
@@ -600,7 +600,7 @@ class TestEmployeesApi(unittest.TestCase):
                 self.saved = False
                 self.saved_value = None
 
-            def get_password(self, fieldname):
+            def get_password(self, fieldname, raise_exception=True):
                 return self.saved_value or ""
 
             def set(self, fieldname, value):
@@ -639,7 +639,7 @@ class TestEmployeesApi(unittest.TestCase):
             flags=types.SimpleNamespace(),
             pin=pin,
         )
-        user_doc.get_password = lambda fieldname: user_doc.pin
+        user_doc.get_password = lambda fieldname, raise_exception=True: user_doc.pin
         user_doc.set = lambda fieldname, value: setattr(user_doc, "pin", value)
         user_doc.save = Mock()
         self.employees.frappe.get_doc = lambda doctype, name: user_doc
@@ -756,7 +756,7 @@ class TestEmployeesApi(unittest.TestCase):
                 self.posa_is_pos_supervisor = 0
                 self.flags = types.SimpleNamespace()
 
-            def get_password(self, fieldname):
+            def get_password(self, fieldname, raise_exception=True):
                 return "4321"
 
             def set(self, fieldname, value):
@@ -834,7 +834,7 @@ class TestEmployeesApi(unittest.TestCase):
             def __init__(self):
                 self.saved_value = None
 
-            def get_password(self, fieldname):
+            def get_password(self, fieldname, raise_exception=True):
                 return ""
 
             def set(self, fieldname, value):
@@ -881,6 +881,23 @@ class TestEmployeesApi(unittest.TestCase):
         self.employees._require_pin_management_access("Main POS", "cashier@example.com")
 
         self.employees.get_active_terminal_cashier.assert_called_once_with("Main POS")
+
+    def test_missing_cashier_pin_returns_empty_without_logging_error(self):
+        class FakeUserDoc:
+            name = "new-cashier@example.com"
+
+            def get_password(self, fieldname, raise_exception=True):
+                self.last_call = (fieldname, raise_exception)
+                if raise_exception:
+                    raise Exception("Password not found")
+                return None
+
+        user_doc = FakeUserDoc()
+        self.employees.frappe.log_error = Mock()
+
+        self.assertEqual(self.employees._get_user_pin(user_doc), "")
+        self.employees.frappe.log_error.assert_not_called()
+        self.assertEqual(user_doc.last_call, ("posa_pos_pin", False))
 
 
 if __name__ == "__main__":
