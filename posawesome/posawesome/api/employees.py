@@ -64,7 +64,7 @@ def _get_user_doc(user: str):
 
 def _get_user_pin(user_doc) -> str:
     try:
-        return str(user_doc.get_password("posa_pos_pin") or "").strip()
+        return str(user_doc.get_password("posa_pos_pin", raise_exception=False) or "").strip()
     except Exception:
         frappe.log_error(
             frappe.get_traceback(),
