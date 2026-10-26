@@ -139,7 +139,9 @@ def _shift(**overrides):
     return FakeDoc(**base)
 
 
-class TestTillPostingAuthority(unittest.TestCase):
+class TillAuthorityHarness(unittest.TestCase):
+    """Shared Frappe-stub harness; holds no tests of its own."""
+
     @classmethod
     def setUpClass(cls):
         cls.frappe, cls.enqueue_calls = creation_harness._install_framework_stubs()
@@ -153,6 +155,8 @@ class TestTillPostingAuthority(unittest.TestCase):
         self.invoices = {}
         self.shifts = {SHIFT_NAME: _shift()}
         self.created = []
+        self.new_invoice_grants = ("read", "print")
+        self.realtime_events = []
         self.frappe.session = types.SimpleNamespace(user=SESSION_USER)
         self.frappe.flags = types.SimpleNamespace(ignore_account_permission=False)
         self.frappe.db.has_column = lambda doctype, fieldname: True
@@ -162,6 +166,9 @@ class TestTillPostingAuthority(unittest.TestCase):
         self.frappe.get_value = lambda *args, **kwargs: 0
         self.frappe.get_cached_value = lambda *args, **kwargs: None
         self.frappe.get_doc = self._get_doc
+        self.frappe.publish_realtime = lambda event, payload=None, **kwargs: self.realtime_events.append(
+            (event, payload)
+        )
         self._patch("get_active_terminal_cashier", lambda *_args, **_kwargs: "cashier@example.com")
         self._patch("_process_post_submit_payments", lambda *_args, **_kwargs: None)
         self._patch("_apply_invoice_gift_card_settlement", lambda *_args, **_kwargs: None)
@@ -181,7 +188,10 @@ class TestTillPostingAuthority(unittest.TestCase):
             payload = dict(args[0])
             payload.pop("name", None)
             name = f"ACC-SINV-TILL-{len(self.created) + 1:04d}"
-            invoice = PermissionRecordingInvoice(**_invoice_fields(**payload, name=name))
+            invoice = PermissionRecordingInvoice(
+                granted=self.new_invoice_grants,
+                **_invoice_fields(**payload, name=name),
+            )
             self.created.append(invoice)
             self.invoices[name] = invoice
             return invoice
@@ -219,6 +229,8 @@ class TestTillPostingAuthority(unittest.TestCase):
     def _all_saved(self):
         return [doc for doc in self.invoices.values() if doc.save_count or doc.submit_count]
 
+
+class TestTillPostingAuthority(TillAuthorityHarness):
     def test_read_only_cashier_sale_posts_under_till_authority(self):
         result = self.creation.submit_invoice(
             json.dumps(self._sale_payload()),
@@ -380,6 +392,299 @@ class TestTillPostingAuthority(unittest.TestCase):
             draft,
         )
         self.assertEqual(set(draft.permission_checks), {"read"})
+
+
+SERVER_OWNED_CLIENT_VALUES = {
+    "is_consolidated": 1,
+    "consolidated_invoice": "ACC-SINV-CONSOLIDATED-0001",
+    "pos_closing_entry": "POS-CLOSE-0001",
+    "is_created_using_pos": 1,
+    "docstatus": 1,
+    "status": "Paid",
+    "owner": "manager@example.com",
+    "creation": "2026-01-01 00:00:00",
+    "modified_by": "manager@example.com",
+    "amended_from": "ACC-SINV-OLD-0001",
+    "posa_is_printed": 1,
+    "posa_below_cost_override_by": "supervisor@example.com",
+    "posa_below_cost_override_details": "[]",
+    "posa_redeemed_customer_credit": 500,
+    "posa_remaining_customer_credit_balance": 500,
+    "posa_return_valid_upto": "2099-12-31",
+}
+
+
+class TestTillPayloadCannotSetServerOwnedFields(TillAuthorityHarness):
+    """P1a: a till payload never sets fields the server or ERPNext owns.
+
+    JB's Sales Invoice controls (JB-PRC-001, the staff discount cap, JBRC-003,
+    JB-RET-001) skip consolidated invoices; ERPNext sets is_consolidated only
+    in POS Invoice Merge Log. A till sale must never arrive pre-marked.
+    """
+
+    def assert_server_owned_fields_not_taken_from_client(self, doc, server_sets=()):
+        for fieldname, client_value in SERVER_OWNED_CLIENT_VALUES.items():
+            if fieldname == "docstatus" or fieldname in server_sets:
+                continue
+            with self.subTest(field=fieldname):
+                self.assertNotEqual(doc.get(fieldname), client_value)
+
+    def test_new_till_draft_strips_server_owned_fields(self):
+        result = self.creation.update_invoice(
+            json.dumps(self._sale_payload(**SERVER_OWNED_CLIENT_VALUES))
+        )
+
+        sale = self.invoices[result["name"]]
+        self.assertEqual(sale.save_count, 1)
+        self.assertEqual(sale.docstatus, 0)
+        self.assert_server_owned_fields_not_taken_from_client(sale)
+
+    def test_submitted_till_sale_cannot_be_marked_consolidated(self):
+        result = self.creation.submit_invoice(
+            json.dumps(self._sale_payload(**SERVER_OWNED_CLIENT_VALUES)),
+            json.dumps({}),
+            submit_in_background=0,
+        )
+
+        sale = self.invoices[result["name"]]
+        self.assertEqual(sale.submit_count, 1)
+        self.assertFalse(sale.get("is_consolidated"))
+        # Submission itself marks the receipt printed.
+        self.assert_server_owned_fields_not_taken_from_client(sale, server_sets={"posa_is_printed"})
+
+    def test_parked_draft_update_and_submit_strip_server_owned_fields(self):
+        draft = self._parked_draft()
+
+        self.creation.update_invoice(
+            json.dumps(self._sale_payload(name=draft.name, **SERVER_OWNED_CLIENT_VALUES))
+        )
+        self.assert_server_owned_fields_not_taken_from_client(draft)
+
+        self.creation.submit_invoice(
+            json.dumps(self._sale_payload(name=draft.name, **SERVER_OWNED_CLIENT_VALUES)),
+            json.dumps({}),
+            submit_in_background=0,
+        )
+        self.assertEqual(draft.submit_count, 1)
+        self.assert_server_owned_fields_not_taken_from_client(draft, server_sets={"posa_is_printed"})
+
+    def test_stored_consolidated_draft_is_refused_at_the_till(self):
+        draft = self._parked_draft(is_consolidated=1)
+
+        with self.assertRaisesRegex(Exception, "consolidated invoice cannot be changed at the till"):
+            self.creation.submit_invoice(
+                json.dumps(self._sale_payload(name=draft.name)),
+                json.dumps({}),
+                submit_in_background=0,
+            )
+        with self.assertRaisesRegex(Exception, "consolidated invoice cannot be changed at the till"):
+            self.creation.update_invoice(json.dumps(self._sale_payload(name=draft.name)))
+
+        self.assertEqual(draft.save_count, 0)
+        self.assertEqual(draft.submit_count, 0)
+
+    def test_merge_item_markers_are_stripped_from_sales_invoice_rows(self):
+        payload = self._sale_payload(
+            items=[
+                {
+                    "item_code": "ITEM-1",
+                    "qty": 1,
+                    "pos_invoice": "POS-INV-0001",
+                    "pos_invoice_item": "row-1",
+                    "sales_invoice_item": "si-row-1",
+                }
+            ]
+        )
+
+        self.creation._strip_server_owned_invoice_fields(payload, doctype="Sales Invoice")
+
+        self.assertEqual(
+            payload["items"],
+            [{"item_code": "ITEM-1", "qty": 1, "sales_invoice_item": "si-row-1"}],
+        )
+
+    def test_return_against_is_dropped_from_a_sale(self):
+        result = self.creation.update_invoice(
+            json.dumps(self._sale_payload(is_return=0, return_against="ACC-SINV-OTHER-0001"))
+        )
+
+        self.assertFalse(self.invoices[result["name"]].get("return_against"))
+
+    def test_return_must_reference_a_submitted_sale_of_this_company(self):
+        returns_name = "posawesome.posawesome.api.invoice_processing.returns"
+        returns_stub = types.ModuleType(returns_name)
+        returns_stub.validate_return_items = lambda *_args, **_kwargs: {"valid": True}
+        previous_returns = sys.modules.get(returns_name)
+        sys.modules[returns_name] = returns_stub
+        self.addCleanup(
+            lambda: sys.modules.__setitem__(returns_name, previous_returns)
+            if previous_returns
+            else sys.modules.pop(returns_name, None)
+        )
+        originals = {
+            "ACC-SINV-DRAFT-0001": {"docstatus": 0, "is_return": 0, "company": "Test Company"},
+            "ACC-SINV-RETURN-0001": {"docstatus": 1, "is_return": 1, "company": "Test Company"},
+            "ACC-SINV-OTHERCO-0001": {"docstatus": 1, "is_return": 0, "company": "Other Company"},
+        }
+
+        def get_value(doctype, name, fieldname=None, *args, **kwargs):
+            # Only the original-invoice lookup asks for several fields at once.
+            if doctype in {"Sales Invoice", "POS Invoice"} and isinstance(fieldname, (list, tuple)):
+                row = originals.get(name)
+                return types.SimpleNamespace(**row) if row else None
+            return None
+
+        self.frappe.db.get_value = get_value
+        for original in [*originals, "ACC-SINV-MISSING-0001"]:
+            with self.subTest(original=original):
+                with self.assertRaisesRegex(Exception, "submitted sale of this company"):
+                    self.creation.update_invoice(
+                        json.dumps(self._sale_payload(is_return=1, return_against=original))
+                    )
+        self.assertEqual(self._all_saved(), [])
+
+    def test_trusted_submitted_amendment_keeps_its_amended_from_link(self):
+        self.frappe.flags.posa_trusted_shift_audit = {"source": "submitted_amendment"}
+
+        result = self.creation.update_invoice(
+            json.dumps(self._sale_payload(amended_from="ACC-SINV-OLD-0001"))
+        )
+
+        self.assertEqual(self.invoices[result["name"]].get("amended_from"), "ACC-SINV-OLD-0001")
+
+
+class TestNewTillDraftReadScope(TillAuthorityHarness):
+    """P2: a new till draft passes the same read/scope gate before its first save."""
+
+    def test_new_draft_without_invoice_read_is_refused_before_save(self):
+        self.new_invoice_grants = ()
+        submitted = self._parked_draft(name="ACC-SINV-SUBMITTED-0002", docstatus=1)
+
+        for label, payload in {
+            "new": self._sale_payload(),
+            "stale name": self._sale_payload(name="ACC-SINV-GONE-0001"),
+            "submitted source": self._sale_payload(name=submitted.name),
+        }.items():
+            for call in (
+                lambda: self.creation.update_invoice(json.dumps(payload)),
+                lambda: self.creation.submit_invoice(
+                    json.dumps(payload), json.dumps({}), submit_in_background=0
+                ),
+            ):
+                with self.subTest(source=label):
+                    with self.assertRaisesRegex(PermissionError, "No read permission"):
+                        call()
+
+        self.assertTrue(self.created)
+        for invoice in self.created:
+            self.assertEqual(invoice.save_count, 0)
+            self.assertEqual(invoice.submit_count, 0)
+            self.assertIn("read", invoice.permission_checks)
+
+    def test_new_draft_is_bound_to_the_validated_shift_before_save(self):
+        result = self.creation.update_invoice(json.dumps(self._sale_payload()))
+
+        sale = self.invoices[result["name"]]
+        self.assertEqual(sale.posa_pos_opening_shift, SHIFT_NAME)
+        self.assertEqual(sale.permission_checks, ["read"])
+
+
+class TestQueuedSubmissionRechecksTillAuthority(TillAuthorityHarness):
+    """P1b: a queued submission re-checks the till authority when it runs."""
+
+    def _close_shift(self):
+        self.shifts[SHIFT_NAME] = _shift(status="Closed", pos_closing_shift="POS-CLOSE-0001")
+
+    def _worker_kwargs(self, draft, **overrides):
+        kwargs = {
+            "invoice": draft.name,
+            "doctype": "Sales Invoice",
+            "data": {},
+            "payments": [],
+            "user": SESSION_USER,
+            "cashier": "cashier@example.com",
+            "ledger_name": None,
+            "opening_shift": SHIFT_NAME,
+            "opening_user": SESSION_USER,
+        }
+        kwargs.update(overrides)
+        return kwargs
+
+    def assert_refused(self, draft, message):
+        self.assertEqual(draft.submit_count, 0)
+        errors = [payload for event, payload in self.realtime_events if event == "pos_invoice_submit_error"]
+        self.assertEqual(len(errors), 1)
+        self.assertRegex(errors[0]["error"], message)
+
+    def test_queued_draft_still_submits_while_shift_is_open(self):
+        draft = self._parked_draft()
+
+        self.creation.submit_in_background_job(self._worker_kwargs(draft))
+
+        self.assertEqual(draft.submit_count, 1)
+        self.assertIn("read", draft.permission_checks)
+
+    def test_queued_draft_is_refused_after_shift_closes(self):
+        draft = self._parked_draft()
+        self._close_shift()
+
+        self.creation.submit_in_background_job(self._worker_kwargs(draft))
+
+        self.assert_refused(draft, "is not open")
+
+    def test_queued_draft_rebound_to_another_shift_is_refused(self):
+        self.shifts["POS-OPEN-FOREIGN"] = _shift(name="POS-OPEN-FOREIGN")
+        draft = self._parked_draft(posa_pos_opening_shift="POS-OPEN-FOREIGN")
+
+        self.creation.submit_in_background_job(self._worker_kwargs(draft))
+
+        self.assert_refused(draft, "another POS Opening Shift")
+
+    def test_queued_draft_with_another_cashiers_shift_is_refused(self):
+        self.shifts[SHIFT_NAME] = _shift(user="other@example.com")
+        draft = self._parked_draft()
+
+        self.creation.submit_in_background_job(self._worker_kwargs(draft))
+
+        self.assert_refused(draft, "does not belong to the current user")
+
+    def test_queued_payload_is_refused_after_shift_closes(self):
+        draft = self._parked_draft()
+        self._close_shift()
+
+        self.creation.submit_payload_in_background_job(
+            {
+                "invoice": self._sale_payload(name=draft.name),
+                "data": {},
+                "doctype": "Sales Invoice",
+                "ledger_name": None,
+                "cashier": "cashier@example.com",
+                "user": SESSION_USER,
+                "opening_shift": SHIFT_NAME,
+                "opening_user": SESSION_USER,
+            }
+        )
+
+        self.assert_refused(draft, "is not open")
+
+    def test_queued_payload_is_refused_when_stored_draft_was_rebound(self):
+        self.shifts["POS-OPEN-FOREIGN"] = _shift(name="POS-OPEN-FOREIGN")
+        draft = self._parked_draft(posa_pos_opening_shift="POS-OPEN-FOREIGN")
+
+        self.creation.submit_payload_in_background_job(
+            {
+                "invoice": self._sale_payload(name=draft.name),
+                "data": {},
+                "doctype": "Sales Invoice",
+                "ledger_name": None,
+                "cashier": "cashier@example.com",
+                "user": SESSION_USER,
+                "opening_shift": SHIFT_NAME,
+                "opening_user": SESSION_USER,
+            }
+        )
+
+        self.assert_refused(draft, "another POS Opening Shift")
 
 
 class SubmittedInvoiceWithoutCancel(edits_harness.FakeInvoice):

@@ -2108,7 +2108,9 @@ class TestInvoiceIdempotency(unittest.TestCase):
             ):
                 pass
 
-    def test_accepted_background_shift_ownership_survives_later_shift_close(self):
+    def test_accepted_background_submission_is_refused_after_shift_close(self):
+        # A queued submission re-checks the till authority when it runs: the
+        # shift must still be open, whoever accepted it earlier.
         opening_doc = FakeDoc(
             name="POS-OPEN-0001",
             pos_profile="Main POS",
@@ -2138,11 +2140,20 @@ class TestInvoiceIdempotency(unittest.TestCase):
             ]
         )
 
+        with self.assertRaisesRegex(Exception, "is not open"):
+            self.real_validate_invoice_opening_shift(
+                AttrDict(name="Main POS", company="Test Company"),
+                {"posa_pos_opening_shift": "POS-OPEN-0001"},
+            )
+
+        opening_doc.status = "Open"
+        opening_doc.pos_closing_shift = None
+        self.creation.frappe.session.user = "worker@example.com"
+        self.addCleanup(setattr, self.creation.frappe.session, "user", "test@example.com")
         result = self.real_validate_invoice_opening_shift(
             AttrDict(name="Main POS", company="Test Company"),
             {"posa_pos_opening_shift": "POS-OPEN-0001"},
         )
-
         self.assertIs(result, opening_doc)
 
     def test_client_named_draft_cannot_cross_pos_profile_scope(self):
