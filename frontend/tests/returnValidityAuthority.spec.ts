@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { mount } from "@vue/test-utils";
+import { flushPromises, mount } from "@vue/test-utils";
 import VueDatePicker from "@vuepic/vue-datepicker";
 import { defineComponent, h, ref } from "vue";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -22,7 +22,7 @@ describe("server-owned return validity", () => {
 		(window as any).__ = (text: string) => text;
 	});
 
-	it("displays the saved server date in a disabled payment picker", () => {
+	it("displays the saved server date in a disabled payment picker", async () => {
 		const wrapper = mount(PaymentAdditionalInfo, {
 			props: {
 				invoiceDoc: { posa_return_valid_upto: "2026-11-25" },
@@ -34,6 +34,7 @@ describe("server-owned return validity", () => {
 				components: { VueDatePicker, VRow: Box, VCol: Box },
 			},
 		});
+		await flushPromises();
 
 		const input = wrapper.get("input");
 		expect.soft((input.element as HTMLInputElement).value).toBe("25-11-2026");
