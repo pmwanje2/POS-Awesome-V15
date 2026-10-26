@@ -633,6 +633,9 @@ def submit_submitted_invoice_edit(
     ):
         frappe.throw(_("This invoice is not available for the selected POS Profile."))
     scoped_original.check_permission("read")
+    # A receipt reversal cancels a submitted invoice; that needs the native
+    # cancel right, never the till's draft-posting authority.
+    scoped_original.check_permission("cancel")
 
     existing = find_invoice_by_client_request_id(
         client_request_id,

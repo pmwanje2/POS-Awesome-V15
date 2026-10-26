@@ -161,13 +161,57 @@ def get_item_exchange(client_request_id, pos_profile=None):
     return _public_result(exchange_doc, return_doc, sale_doc)
 
 
+def _submit_exchange_credit_journal(entry, company):
+    reconcile_dr_or_cr = (
+        "debit_in_account_currency"
+        if entry.dr_or_cr == "credit_in_account_currency"
+        else "credit_in_account_currency"
+    )
+    allocated = abs(flt(entry.allocated_amount))
+    unadjusted = abs(flt(entry.unadjusted_amount))
+    common = {
+        "account": entry.account,
+        "party": entry.party,
+        "party_type": entry.party_type,
+        "cost_center": entry.cost_center,
+        "exchange_rate": entry.exchange_rate,
+    }
+    jv = frappe.get_doc(
+        {
+            "doctype": "Journal Entry",
+            "voucher_type": "Credit Note",
+            "posting_date": entry.get("debit_or_credit_note_posting_date"),
+            "company": company,
+            "is_system_generated": 1,
+            "accounts": [
+                {
+                    **common,
+                    entry.dr_or_cr: allocated,
+                    "reference_type": entry.against_voucher_type,
+                    "reference_name": entry.against_voucher,
+                },
+                {
+                    **common,
+                    reconcile_dr_or_cr: allocated if unadjusted > allocated else unadjusted,
+                    "reference_type": entry.voucher_type,
+                    "reference_name": entry.voucher_no,
+                },
+            ],
+        }
+    )
+    jv.flags.ignore_permissions = True
+    jv.flags.ignore_mandatory = True
+    jv.flags.ignore_exchange_rate = True
+    jv.remark = None
+    jv.flags.skip_remarks_creation = True
+    jv.is_system_generated = 1
+    jv.submit()
+    return jv.name
+
+
 def _reconcile_credit_note(return_doc, sale_doc, amount, profile):
     if flt(amount) <= 0:
         return None
-
-    from erpnext.accounts.doctype.payment_reconciliation.payment_reconciliation import (
-        reconcile_dr_cr_note,
-    )
 
     account = sale_doc.get("debit_to")
     if not account or account != return_doc.get("debit_to"):
@@ -202,7 +246,7 @@ def _reconcile_credit_note(return_doc, sale_doc, amount, profile):
             "cost_center": cost_center,
         }
     )
-    reconcile_dr_cr_note([entry], sale_doc.company)
+    _submit_exchange_credit_journal(entry, sale_doc.company)
     rows = frappe.get_all(
         "Journal Entry Account",
         filters={
