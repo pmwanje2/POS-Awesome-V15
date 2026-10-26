@@ -240,6 +240,31 @@ def _get_scoped_invoice_doc(doctype, invoice_name, pos_profile, company, permiss
     )
 
 
+def _assert_till_draft_authority(invoice_doc, *, pos_profile, company, opening_shift_doc):
+    """Authorize a till draft under the till's technical posting authority.
+
+    Cashiers hold read (and print) on invoices, never write. A till may change
+    a draft only through its POS Profile scope, for the cashier's own validated
+    POS Opening Shift, and only while the draft still belongs to that shift.
+    """
+
+    assert_invoice_request_scope(
+        invoice_doc,
+        pos_profile=pos_profile,
+        company=company,
+        permission_type="read",
+    )
+    shift_name = str(_doc_value(opening_shift_doc, "name") or "").strip()
+    if not opening_shift_doc or not shift_name:
+        _permission_denied(_("A valid POS Opening Shift is required."))
+    if cint(_doc_value(invoice_doc, "docstatus")) != 0:
+        _permission_denied(_("Only a draft invoice can be changed at the till."))
+    invoice_shift = str(_doc_value(invoice_doc, "posa_pos_opening_shift") or "").strip()
+    if invoice_shift != shift_name:
+        _permission_denied(_("This draft invoice belongs to another POS Opening Shift."))
+    return invoice_doc
+
+
 def _assert_submission_ledger_scope(ledger_doc, pos_profile, company, document_type):
     if not ledger_doc:
         return None
@@ -1213,7 +1238,7 @@ def _clear_stale_party_fields_for_customer_change(
     return invoice_doc
 
 
-def _get_mutable_invoice_doc(data, doctype, pos_profile, company):
+def _get_mutable_invoice_doc(data, doctype, pos_profile, company, opening_shift_doc=None):
     invoice_name = (data or {}).get("name")
     if not invoice_name:
         return frappe.get_doc(data)
@@ -1252,11 +1277,11 @@ def _get_mutable_invoice_doc(data, doctype, pos_profile, company):
         )
         return frappe.get_doc(fresh_payload)
 
-    assert_invoice_request_scope(
+    _assert_till_draft_authority(
         invoice_doc,
         pos_profile=pos_profile,
         company=company,
-        permission_type="write",
+        opening_shift_doc=opening_shift_doc,
     )
 
     invoice_doc.update(data)
@@ -1511,7 +1536,7 @@ def update_invoice(data):
     ignore_pricing_rule = 1 if cint(data.get("is_return")) else profile_ignore_pricing_rule
     # Never trust a stale/client-edited copy of this POS Profile setting.
     data["ignore_pricing_rule"] = ignore_pricing_rule
-    _validate_invoice_opening_shift(profile_doc, data, required=True)
+    opening_shift_doc = _validate_invoice_opening_shift(profile_doc, data, required=True)
     forced_doctype = data.pop("_force_invoice_doctype", None)
     doctype = "Sales Invoice"
     if forced_doctype in {"Sales Invoice", "POS Invoice"}:
@@ -1530,6 +1555,7 @@ def update_invoice(data):
         doctype,
         pos_profile,
         company,
+        opening_shift_doc=opening_shift_doc,
     )
     set_invoice_client_request_id(invoice_doc, client_request_id)
     _set_authoritative_cashier(invoice_doc, authoritative_cashier)
@@ -1799,22 +1825,6 @@ def _submit_invoice_once(invoice, data, submit_in_background=False):
         strip_invoice_client_request_id(invoice)
 
     client_invoice_name = invoice.get("name")
-    if client_invoice_name and frappe.db.exists(doctype, client_invoice_name):
-        client_invoice_doc = _get_scoped_invoice_doc(
-            doctype,
-            client_invoice_name,
-            pos_profile,
-            company,
-            "read",
-        )
-        if cint(client_invoice_doc.get("docstatus")) == 0:
-            assert_invoice_request_scope(
-                client_invoice_doc,
-                pos_profile=pos_profile,
-                company=company,
-                permission_type="write",
-            )
-
     ledger_scope = _resolve_ledger_scope(invoice, data, doctype)
     ledger_doc = _get_submission_ledger(
         client_request_id,
@@ -1876,11 +1886,11 @@ def _submit_invoice_once(invoice, data, submit_in_background=False):
                 "ledger_state": ledger_doc.get("state") if ledger_doc else STATE_POST_SUBMIT_DONE,
                 "client_request_id": client_request_id,
             }
-        assert_invoice_request_scope(
+        _assert_till_draft_authority(
             existing_by_request,
             pos_profile=pos_profile,
             company=company,
-            permission_type="write",
+            opening_shift_doc=opening_shift_doc,
         )
         invoice["name"] = existing_by_request.name
         doctype = existing_by_request.doctype
@@ -1913,13 +1923,29 @@ def _submit_invoice_once(invoice, data, submit_in_background=False):
                 replay_response = _ledger_response(ledger_doc, replayed=True)
                 if replay_response:
                     return replay_response
-            assert_invoice_request_scope(
+            _assert_till_draft_authority(
                 ledger_invoice,
                 pos_profile=pos_profile,
                 company=company,
-                permission_type="write",
+                opening_shift_doc=opening_shift_doc,
             )
             invoice["name"] = ledger_invoice.name
+
+    if client_invoice_name and frappe.db.exists(doctype, client_invoice_name):
+        client_invoice_doc = _get_scoped_invoice_doc(
+            doctype,
+            client_invoice_name,
+            pos_profile,
+            company,
+            "read",
+        )
+        if cint(client_invoice_doc.get("docstatus")) == 0:
+            _assert_till_draft_authority(
+                client_invoice_doc,
+                pos_profile=pos_profile,
+                company=company,
+                opening_shift_doc=opening_shift_doc,
+            )
 
     authoritative_cashier = _resolve_authoritative_cashier(pos_profile, ledger_doc)
     data["_posa_authoritative_cashier"] = authoritative_cashier
@@ -1999,35 +2025,40 @@ def _submit_invoice_once(invoice, data, submit_in_background=False):
             invoice_name,
             pos_profile,
             company,
-            "write",
+            "read",
         )
         if cint(existing_doc.docstatus) != 0:
             invoice = _build_fresh_invoice_payload(invoice, doctype)
             invoice_name = None
+        else:
+            _assert_till_draft_authority(
+                existing_doc,
+                pos_profile=pos_profile,
+                company=company,
+                opening_shift_doc=opening_shift_doc,
+            )
 
     if not invoice_name or not frappe.db.exists(doctype, invoice_name):
         if client_request_id:
             invoice["posa_client_request_id"] = client_request_id
         created = update_invoice(json.dumps(invoice))
         invoice_name = created.get("name")
-        invoice_doc = _get_scoped_invoice_doc(
-            doctype,
-            invoice_name,
-            pos_profile,
-            company,
-            "write",
+        invoice_doc = _assert_till_draft_authority(
+            frappe.get_doc(doctype, invoice_name),
+            pos_profile=pos_profile,
+            company=company,
+            opening_shift_doc=opening_shift_doc,
         )
     else:
         # Prevent TimestampMismatchError by relying on server-side timestamp
         if "modified" in invoice:
             del invoice["modified"]
         invoice.pop("_force_invoice_doctype", None)
-        invoice_doc = _get_scoped_invoice_doc(
-            doctype,
-            invoice_name,
-            pos_profile,
-            company,
-            "write",
+        invoice_doc = _assert_till_draft_authority(
+            frappe.get_doc(doctype, invoice_name),
+            pos_profile=pos_profile,
+            company=company,
+            opening_shift_doc=opening_shift_doc,
         )
         invoice_doc.update(invoice)
 
