@@ -510,6 +510,136 @@ class TestTillPayloadCannotSetServerOwnedFields(TillAuthorityHarness):
 
         self.assertFalse(self.invoices[result["name"]].get("return_against"))
 
+    def _stub_return_originals(self, originals):
+        returns_name = "posawesome.posawesome.api.invoice_processing.returns"
+        returns_stub = types.ModuleType(returns_name)
+        returns_stub.validate_return_items = lambda *_args, **_kwargs: {"valid": True}
+        previous_returns = sys.modules.get(returns_name)
+        sys.modules[returns_name] = returns_stub
+        self.addCleanup(
+            lambda: sys.modules.__setitem__(returns_name, previous_returns)
+            if previous_returns
+            else sys.modules.pop(returns_name, None)
+        )
+
+        def get_value(doctype, name, fieldname=None, *args, **kwargs):
+            if doctype in {"Sales Invoice", "POS Invoice"} and isinstance(fieldname, (list, tuple)):
+                row = originals.get(name)
+                return types.SimpleNamespace(**row) if row else None
+            return None
+
+        self.frappe.db.get_value = get_value
+
+    def test_sale_drops_return_against_when_client_omits_is_return(self):
+        """The effective document decides: an omitted flag leaves a sale a sale."""
+
+        def fresh_update():
+            result = self.creation.update_invoice(
+                json.dumps(self._sale_payload(return_against="ACC-SINV-OTHER-0001"))
+            )
+            return self.invoices[result["name"]]
+
+        def fresh_submit():
+            result = self.creation.submit_invoice(
+                json.dumps(self._sale_payload(return_against="ACC-SINV-OTHER-0001")),
+                json.dumps({}),
+                submit_in_background=0,
+            )
+            return self.invoices[result["name"]]
+
+        def parked_update():
+            draft = self._parked_draft(name="ACC-SINV-PARKED-0011", is_pos=0)
+            self.creation.update_invoice(
+                json.dumps(
+                    self._sale_payload(
+                        name=draft.name, is_pos=0, return_against="ACC-SINV-OTHER-0001"
+                    )
+                )
+            )
+            return draft
+
+        def parked_submit():
+            draft = self._parked_draft(name="ACC-SINV-PARKED-0012", is_pos=0)
+            result = self.creation.submit_invoice(
+                json.dumps(
+                    self._sale_payload(
+                        name=draft.name, is_pos=0, return_against="ACC-SINV-OTHER-0001"
+                    )
+                ),
+                json.dumps({}),
+                submit_in_background=0,
+            )
+            self.assertEqual(result["docstatus"], 1)
+            return draft
+
+        for label, run in {
+            "fresh sale update": fresh_update,
+            "fresh sale submit": fresh_submit,
+            "parked sale update": parked_update,
+            "parked sale submit": parked_submit,
+        }.items():
+            with self.subTest(path=label):
+                sale = run()
+                self.assertFalse(int(sale.get("is_return") or 0))
+                self.assertFalse(sale.get("return_against"))
+
+    def test_partial_update_of_a_stored_return_keeps_its_return_against(self):
+        self._stub_return_originals(
+            {"ACC-SINV-ORIG-0001": {"docstatus": 1, "is_return": 0, "company": "Test Company"}}
+        )
+        stored = self._parked_draft(
+            name="ACC-SINV-RET-DRAFT-0001",
+            is_return=1,
+            return_against="ACC-SINV-ORIG-0001",
+        )
+
+        self.creation.update_invoice(
+            json.dumps(self._sale_payload(name=stored.name, customer="CUST-0002"))
+        )
+        self.assertEqual(stored.is_return, 1)
+        self.assertEqual(stored.return_against, "ACC-SINV-ORIG-0001")
+
+        self.creation.submit_invoice(
+            json.dumps(self._sale_payload(name=stored.name)),
+            json.dumps({}),
+            submit_in_background=0,
+        )
+        self.assertEqual(stored.submit_count, 1)
+        self.assertEqual(stored.is_return, 1)
+        self.assertEqual(stored.return_against, "ACC-SINV-ORIG-0001")
+
+    def test_partial_update_of_a_stored_return_cannot_repoint_it(self):
+        self._stub_return_originals(
+            {
+                "ACC-SINV-ORIG-0001": {"docstatus": 1, "is_return": 0, "company": "Test Company"},
+                "ACC-SINV-OTHERCO-0001": {"docstatus": 1, "is_return": 0, "company": "Other Company"},
+            }
+        )
+        stored = self._parked_draft(
+            name="ACC-SINV-RET-DRAFT-0002",
+            is_return=1,
+            return_against="ACC-SINV-ORIG-0001",
+        )
+
+        for call in (
+            lambda: self.creation.update_invoice(
+                json.dumps(
+                    self._sale_payload(name=stored.name, return_against="ACC-SINV-OTHERCO-0001")
+                )
+            ),
+            lambda: self.creation.submit_invoice(
+                json.dumps(
+                    self._sale_payload(name=stored.name, return_against="ACC-SINV-OTHERCO-0001")
+                ),
+                json.dumps({}),
+                submit_in_background=0,
+            ),
+        ):
+            with self.assertRaisesRegex(Exception, "submitted sale of this company"):
+                call()
+        self.assertEqual(stored.save_count, 0)
+        self.assertEqual(stored.submit_count, 0)
+
     def test_return_must_reference_a_submitted_sale_of_this_company(self):
         returns_name = "posawesome.posawesome.api.invoice_processing.returns"
         returns_stub = types.ModuleType(returns_name)
