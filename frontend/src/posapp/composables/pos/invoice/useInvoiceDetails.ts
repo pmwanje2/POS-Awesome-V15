@@ -19,8 +19,7 @@
  * **Date inputs**
  * - `delivery_date` / `po_date`: straightforward date pickers on the invoice.
  * - `posa_credit_due_date`: preset buttons (7 / 14 / 30 days) + custom dialog.
- * - `posa_return_valid_upto`: return validity date; the allowed window in days is
- *   read from `profile.posa_return_validity_days` (or system settings fallback).
+ * - `posa_return_valid_upto`: read-only server date derived from POS Profile policy.
  */
 import { ref, unref, type Ref } from "vue";
 import { formatUtils, normalizeDateForBackend } from "../../../format";
@@ -347,39 +346,6 @@ export function useInvoiceDetails(options: InvoiceDetailsOptions) {
 	};
 
 	// Return Validity
-	const calculateReturnValidUntil = (baseDate: any) => {
-		const formattedBase = formatDate(baseDate);
-		if (!formattedBase) return null;
-
-		const parsed = new Date(formattedBase);
-		if (Number.isNaN(parsed.getTime())) return null;
-
-		const profile = unref(posProfile);
-		const settings = unref(posSettings);
-
-		const profileDays = parseInt(
-			profile?.posa_return_validity_days ?? 0,
-			10,
-		);
-		const settingsDays = parseInt(
-			settings?.posa_return_validity_days ?? 0,
-			10,
-		);
-		const daysSetting =
-			Number.isFinite(profileDays) && profileDays > 0
-				? profileDays
-				: settingsDays;
-
-		if (Number.isFinite(daysSetting) && daysSetting > 0) {
-			parsed.setDate(parsed.getDate() + daysSetting);
-		}
-
-		const year = parsed.getFullYear();
-		const month = `0${parsed.getMonth() + 1}`.slice(-2);
-		const day = `0${parsed.getDate()}`.slice(-2);
-		return `${year}-${month}-${day}`;
-	};
-
 	const initializeReturnValidity = (doc: any) => {
 		const profile = unref(posProfile);
 		const settings = unref(posSettings);
@@ -390,47 +356,14 @@ export function useInvoiceDetails(options: InvoiceDetailsOptions) {
 
 		if (!enabled || !doc || doc.is_return) {
 			return_valid_upto_date.value = null;
-			if (doc) {
-				doc.posa_return_valid_upto = null;
-			}
 			return;
 		}
 
-		const existing = doc.posa_return_valid_upto;
-		const proposedDate =
-			existing ||
-			calculateReturnValidUntil(
-				doc.posting_date ||
-					(typeof frappe !== "undefined"
-						? frappe.datetime.nowdate()
-						: new Date().toISOString().split("T")[0]),
-			);
-
-		return_valid_upto_date.value = proposedDate;
-		doc.posa_return_valid_upto = proposedDate;
+		return_valid_upto_date.value = doc.posa_return_valid_upto || null;
 	};
 
-	const updateReturnValidUpto = (value: any) => {
-		const profile = unref(posProfile);
-		const settings = unref(posSettings);
-		const enabled = Boolean(
-			profile?.posa_enable_return_validity ||
-			settings?.posa_enable_return_validity,
-		);
-
-		if (!enabled) return;
-
-		const formatted = formatDate(value); // YYYY-MM-DD
-		return_valid_upto_date.value = formatDateDisplay(formatted) || null;
-
-		const doc = unref(invoiceDoc);
-		if (doc) {
-			doc.posa_return_valid_upto = formatted;
-		} else if (stores?.invoiceStore) {
-			stores.invoiceStore.mergeInvoiceDoc({
-				posa_return_valid_upto: formatted,
-			});
-		}
+	const updateReturnValidUpto = (_value?: any) => {
+		initializeReturnValidity(unref(invoiceDoc));
 	};
 
 	return {
@@ -456,7 +389,6 @@ export function useInvoiceDetails(options: InvoiceDetailsOptions) {
 		applyDuePreset,
 		applyCustomDays,
 		initializeReturnValidity,
-		calculateReturnValidUntil,
 		updateReturnValidUpto,
 		formatDateDisplay,
 		formatDate,

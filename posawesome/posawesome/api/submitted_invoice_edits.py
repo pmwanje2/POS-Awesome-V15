@@ -388,6 +388,9 @@ def get_submitted_invoice_edit_metadata(doc, list_context=None):
     elif cint(doc.get("docstatus")) != 1:
         can_edit = False
         reason = _("Only submitted invoices can be edited.")
+    elif not frappe.has_permission(doc.doctype, "cancel", doc=doc.name):
+        can_edit = False
+        reason = _("Cancel permission is required to edit this submitted invoice.")
     elif cint(doc.get("is_return")):
         can_edit = False
         reason = _("Return invoices cannot be edited. Use the return workflow.")
