@@ -828,6 +828,45 @@ class SubmittedInvoiceWithoutCancel(edits_harness.FakeInvoice):
 
 
 class TestSubmittedEditNeedsCancelPermission(unittest.TestCase):
+    def _edit_metadata(self, granted, doctype="Sales Invoice"):
+        module, frappe = edits_harness._load_module({})
+        doc = edits_harness.AttrDict(
+            doctype=doctype,
+            name="INVOICE-1",
+            docstatus=1,
+            pos_profile="Main POS",
+        )
+        module._hours_since = lambda _value: 1
+        permission_checks = []
+
+        def has_permission(checked_doctype, ptype, doc=None):
+            permission_checks.append((checked_doctype, ptype, doc))
+            return ptype in granted
+
+        frappe.has_permission = has_permission
+        context = {
+            "root_info": {doc.name: {"original_creation": "2026-10-26"}},
+            "profile_settings": {"Main POS": {"feature_enabled": True, "edit_window_hours": 24}},
+        }
+        metadata = module.get_submitted_invoice_edit_metadata(doc, list_context=context)
+        return metadata, permission_checks
+
+    def test_edit_offer_requires_native_cancel_on_the_actual_invoice(self):
+        for doctype in ("Sales Invoice", "POS Invoice"):
+            with self.subTest(doctype=doctype):
+                metadata, checks = self._edit_metadata(granted=("read", "print"), doctype=doctype)
+
+                self.assertFalse(metadata["can_edit_submitted_invoice"])
+                self.assertIn("cancel", metadata["edit_block_reason"].lower())
+                self.assertEqual(checks, [(doctype, "cancel", "INVOICE-1")])
+
+    def test_native_cancel_holder_is_still_offered_edit(self):
+        metadata, checks = self._edit_metadata(granted=("read", "cancel"))
+
+        self.assertTrue(metadata["can_edit_submitted_invoice"])
+        self.assertIsNone(metadata["edit_block_reason"])
+        self.assertEqual(checks, [("Sales Invoice", "cancel", "INVOICE-1")])
+
     def _run_edit(self, granted):
         captured = {}
         module, frappe = edits_harness._load_module(captured)
