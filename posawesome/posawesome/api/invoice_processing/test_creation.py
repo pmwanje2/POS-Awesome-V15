@@ -1236,6 +1236,7 @@ class TestPostSubmitPaymentProcessing(unittest.TestCase):
             company="Test Company",
             customer="CUST-0001",
             is_return=0,
+            posa_pos_opening_shift=TILL_SHIFT_NAME,
             redeem_loyalty_points=0,
             loyalty_program=None,
             cost_center=None,
