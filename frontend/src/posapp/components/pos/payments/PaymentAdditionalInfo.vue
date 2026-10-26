@@ -17,14 +17,14 @@
 			<v-col cols="6" v-if="returnValidityEnabled && !invoiceDoc.is_return">
 				<VueDatePicker
 					:model-value="returnValidUptoDate"
-					model-type="format"
+					model-type="yyyy-MM-dd"
 					format="dd-MM-yyyy"
 					:min-date="returnValidityMinDate"
 					:enable-time-picker="false"
+					disabled
 					auto-apply
 					class="sleek-field pos-themed-input"
 					:placeholder="$frappe._('Return Valid Until')"
-					@update:model-value="$emit('update:returnValidUptoDate', $event)"
 				/>
 			</v-col>
 			<!-- Shipping Address Selection (if delivery date is set) -->
@@ -156,7 +156,7 @@ defineProps({
 	},
 });
 
-defineEmits(["update:newDeliveryDate", "update:returnValidUptoDate", "new-address"]);
+defineEmits(["update:newDeliveryDate", "new-address"]);
 
 const $frappe = inject("frappe", window.frappe);
 const $__ = inject("__", window.__);

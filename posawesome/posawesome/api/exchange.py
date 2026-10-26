@@ -162,6 +162,8 @@ def get_item_exchange(client_request_id, pos_profile=None):
 
 
 def _submit_exchange_credit_journal(entry, company):
+    import erpnext
+
     reconcile_dr_or_cr = (
         "debit_in_account_currency"
         if entry.dr_or_cr == "credit_in_account_currency"
@@ -173,7 +175,7 @@ def _submit_exchange_credit_journal(entry, company):
         "account": entry.account,
         "party": entry.party,
         "party_type": entry.party_type,
-        "cost_center": entry.cost_center,
+        "cost_center": entry.cost_center or erpnext.get_default_cost_center(company),
         "exchange_rate": entry.exchange_rate,
     }
     jv = frappe.get_doc(
