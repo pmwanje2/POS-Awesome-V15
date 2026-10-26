@@ -94,6 +94,25 @@ class FakeDoc:
         return dict(self._data)
 
 
+TILL_SHIFT_NAME = "POS-OPEN-0001"
+
+
+def _till_shift(**overrides):
+    """The cashier's own validated open POS Opening Shift (till posting authority)."""
+
+    base = {
+        "name": TILL_SHIFT_NAME,
+        "pos_profile": "Main POS",
+        "company": "Test Company",
+        "user": "test@example.com",
+        "docstatus": 1,
+        "status": "Open",
+        "pos_closing_shift": None,
+    }
+    base.update(overrides)
+    return FakeDoc(**base)
+
+
 def _install_framework_stubs():
     frappe_module = types.ModuleType("frappe")
     frappe_utils = types.ModuleType("frappe.utils")
@@ -413,7 +432,7 @@ class TestUpdateInvoiceReturnPayments(unittest.TestCase):
     def setUp(self):
         self.enqueue_calls.clear()
         self.frappe._publish_realtime_calls.clear()
-        self.creation._validate_invoice_opening_shift = lambda *args, **kwargs: None
+        self.creation._validate_invoice_opening_shift = lambda *args, **kwargs: _till_shift()
 
     def test_return_invoice_derives_missing_base_amount_from_amount(self):
         invoice_doc = FakeDoc(
@@ -645,7 +664,7 @@ class TestStaleNamedInvoiceHandling(unittest.TestCase):
     def setUp(self):
         self.enqueue_calls.clear()
         self.frappe._publish_realtime_calls.clear()
-        self.creation._validate_invoice_opening_shift = lambda *args, **kwargs: None
+        self.creation._validate_invoice_opening_shift = lambda *args, **kwargs: _till_shift()
 
     def _build_invoice_doc(self, **overrides):
         base = {
@@ -672,6 +691,7 @@ class TestStaleNamedInvoiceHandling(unittest.TestCase):
             "grand_total": 0,
             "rounded_total": 0,
             "docstatus": 0,
+            "posa_pos_opening_shift": TILL_SHIFT_NAME,
         }
         base.update(overrides)
         return FakeDoc(**base)
@@ -943,7 +963,7 @@ class TestPostSubmitPaymentProcessing(unittest.TestCase):
     def setUp(self):
         self.enqueue_calls.clear()
         self.frappe._publish_realtime_calls.clear()
-        self.creation._validate_invoice_opening_shift = lambda *args, **kwargs: None
+        self.creation._validate_invoice_opening_shift = lambda *args, **kwargs: _till_shift()
 
     def test_process_post_submit_payments_runs_inline_when_async_disabled(self):
         calls = []
@@ -1263,7 +1283,7 @@ class TestManualPostingDatePreservation(unittest.TestCase):
     def setUp(self):
         self.enqueue_calls.clear()
         self.frappe._publish_realtime_calls.clear()
-        self.creation._validate_invoice_opening_shift = lambda *args, **kwargs: None
+        self.creation._validate_invoice_opening_shift = lambda *args, **kwargs: _till_shift()
         self.creation.get_active_terminal_cashier = (
             lambda *_args, **_kwargs: "cashier@example.com"
         )
@@ -1388,6 +1408,7 @@ class TestManualPostingDatePreservation(unittest.TestCase):
             "grand_total": 0,
             "rounded_total": 0,
             "docstatus": 0,
+            "posa_pos_opening_shift": TILL_SHIFT_NAME,
             "redeem_loyalty_points": 0,
             "loyalty_program": None,
             "loyalty_redemption_account": None,
@@ -1792,7 +1813,7 @@ class TestInvoiceIdempotency(unittest.TestCase):
         self.creation.get_active_terminal_cashier = (
             lambda *_args, **_kwargs: "cashier@example.com"
         )
-        self.creation._validate_invoice_opening_shift = lambda *args, **kwargs: None
+        self.creation._validate_invoice_opening_shift = lambda *args, **kwargs: _till_shift()
 
     def test_forged_profile_or_company_values_are_rejected_before_authorization(self):
         authorize = Mock(
@@ -1844,7 +1865,7 @@ class TestInvoiceIdempotency(unittest.TestCase):
                 required=True,
             )
 
-    def test_mutable_named_draft_requires_write_after_scoped_read(self):
+    def test_mutable_named_draft_uses_till_authority_not_write(self):
         invoice_doc = FakeDoc(
             doctype="Sales Invoice",
             name="ACC-SINV-READ-ONLY-0001",
@@ -1852,6 +1873,7 @@ class TestInvoiceIdempotency(unittest.TestCase):
             pos_profile="Main POS",
             company="Test Company",
             customer="CUST-0001",
+            posa_pos_opening_shift="POS-OPEN-EARLIER",
         )
         permission_checks = []
 
@@ -1871,7 +1893,8 @@ class TestInvoiceIdempotency(unittest.TestCase):
         self.addCleanup(setattr, self.creation.frappe, "get_doc", original_get_doc)
         self.addCleanup(setattr, self.creation.frappe.db, "exists", original_exists)
 
-        with self.assertRaisesRegex(PermissionError, "write permission required"):
+        # A read-only cashier's till may change only its own shift's draft.
+        with self.assertRaisesRegex(Exception, "another POS Opening Shift"):
             self.creation._get_mutable_invoice_doc(
                 {
                     "doctype": "Sales Invoice",
@@ -1881,18 +1904,38 @@ class TestInvoiceIdempotency(unittest.TestCase):
                 "Sales Invoice",
                 "Main POS",
                 "Test Company",
+                opening_shift_doc=_till_shift(),
             )
 
-        self.assertEqual(permission_checks, ["read", "write"])
+        self.assertNotIn("write", permission_checks)
         self.assertEqual(invoice_doc.customer, "CUST-0001")
 
-    def test_idempotency_recovered_draft_requires_write_before_background_queue(self):
+        invoice_doc.posa_pos_opening_shift = TILL_SHIFT_NAME
+        permission_checks.clear()
+        result = self.creation._get_mutable_invoice_doc(
+            {
+                "doctype": "Sales Invoice",
+                "name": invoice_doc.name,
+                "customer": "CUST-0002",
+            },
+            "Sales Invoice",
+            "Main POS",
+            "Test Company",
+            opening_shift_doc=_till_shift(),
+        )
+
+        self.assertIs(result, invoice_doc)
+        self.assertEqual(invoice_doc.customer, "CUST-0002")
+        self.assertEqual(permission_checks, ["read", "read"])
+
+    def test_idempotency_recovered_draft_requires_till_authority_before_background_queue(self):
         invoice_doc = FakeDoc(
             doctype="Sales Invoice",
             name="ACC-SINV-RECOVERED-0001",
             docstatus=0,
             pos_profile="Main POS",
             company="Test Company",
+            posa_pos_opening_shift="POS-OPEN-EARLIER",
         )
         original_get_ledger = self.creation._get_submission_ledger
         original_find_invoice = self.creation.find_invoice_by_client_request_id
@@ -1902,9 +1945,7 @@ class TestInvoiceIdempotency(unittest.TestCase):
         self.creation.find_invoice_by_client_request_id = (
             lambda *_args, **_kwargs: invoice_doc
         )
-        self.creation.assert_invoice_request_scope = Mock(
-            side_effect=PermissionError("write permission required")
-        )
+        self.creation.assert_invoice_request_scope = Mock(side_effect=lambda doc, **_kwargs: doc)
         self.creation.get_active_terminal_cashier = Mock(
             side_effect=AssertionError("draft must be rejected before terminal or queue work")
         )
@@ -1924,7 +1965,7 @@ class TestInvoiceIdempotency(unittest.TestCase):
             setattr, self.creation, "get_active_terminal_cashier", original_cashier
         )
 
-        with self.assertRaisesRegex(PermissionError, "write permission required"):
+        with self.assertRaisesRegex(Exception, "another POS Opening Shift"):
             self.creation.submit_invoice(
                 json.dumps(
                     {
@@ -1933,6 +1974,7 @@ class TestInvoiceIdempotency(unittest.TestCase):
                         "company": "Test Company",
                         "customer": "CUST-0001",
                         "posa_client_request_id": "recovered-read-only-001",
+                        "posa_pos_opening_shift": TILL_SHIFT_NAME,
                     }
                 ),
                 json.dumps({"idempotency_key": "recovered-read-only-001"}),
@@ -1943,8 +1985,9 @@ class TestInvoiceIdempotency(unittest.TestCase):
             invoice_doc,
             pos_profile="Main POS",
             company="Test Company",
-            permission_type="write",
+            permission_type="read",
         )
+        self.assertEqual(self.enqueue_calls, [])
 
     def test_invoice_opening_shift_rejects_wrong_scope_owner_and_state(self):
         base = {
@@ -2454,6 +2497,7 @@ class TestInvoiceIdempotency(unittest.TestCase):
             doctype="Sales Invoice",
             name="ACC-SINV-NEW-0001",
             docstatus=0,
+            posa_pos_opening_shift=TILL_SHIFT_NAME,
             pos_profile="Main POS",
             company="Test Company",
             currency="USD",
@@ -2508,6 +2552,7 @@ class TestInvoiceIdempotency(unittest.TestCase):
             doctype="Sales Invoice",
             name="ACC-SINV-NEW-0002",
             docstatus=0,
+            posa_pos_opening_shift=TILL_SHIFT_NAME,
             pos_profile="Main POS",
             company="Test Company",
             currency="USD",
@@ -2573,6 +2618,7 @@ class TestInvoiceIdempotency(unittest.TestCase):
                 doctype="Sales Invoice",
                 name=name,
                 docstatus=0,
+                posa_pos_opening_shift=TILL_SHIFT_NAME,
                 pos_profile="Main POS",
                 company="Test Company",
                 currency="USD",
@@ -2747,6 +2793,7 @@ class TestInvoiceIdempotency(unittest.TestCase):
             doctype="Sales Invoice",
             name="ACC-SINV-DRAFT-0001",
             docstatus=0,
+            posa_pos_opening_shift=TILL_SHIFT_NAME,
             pos_profile="Main POS",
             company="Test Company",
         )
