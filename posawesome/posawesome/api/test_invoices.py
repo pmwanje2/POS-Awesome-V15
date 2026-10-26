@@ -34,6 +34,7 @@ def _install_frappe_stub():
     frappe_module._ = lambda text: text
     frappe_module.throw = lambda message: (_ for _ in ()).throw(Exception(message))
     frappe_module.whitelist = lambda *args, **kwargs: (lambda fn: fn)
+    frappe_module.has_permission = lambda doctype, ptype, doc=None: True
     frappe_module.db = types.SimpleNamespace(
         has_column=lambda *args, **kwargs: False,
         exists=lambda *args, **kwargs: False,
