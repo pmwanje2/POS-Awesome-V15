@@ -444,6 +444,7 @@ class TestUpdateInvoiceReturnPayments(unittest.TestCase):
             posting_date="2026-03-21",
             is_return=1,
             return_against=None,
+            posa_pos_opening_shift=TILL_SHIFT_NAME,
             pricing_rules=[FakeDoc(pricing_rule="GROUP-DISCOUNT")],
             items=[],
             payments=[
@@ -504,6 +505,7 @@ class TestUpdateInvoiceReturnPayments(unittest.TestCase):
             posting_date="2026-03-21",
             is_return=1,
             return_against=None,
+            posa_pos_opening_shift=TILL_SHIFT_NAME,
             items=[],
             payments=[
                 FakeDoc(
@@ -1233,6 +1235,7 @@ class TestPostSubmitPaymentProcessing(unittest.TestCase):
             company="Test Company",
             customer="CUST-0001",
             is_return=0,
+            posa_pos_opening_shift=TILL_SHIFT_NAME,
             redeem_loyalty_points=0,
             loyalty_program=None,
             cost_center=None,
@@ -1749,6 +1752,8 @@ class TestManualPostingDatePreservation(unittest.TestCase):
         self.creation.frappe.db.get_value = (
             lambda doctype, name, fieldname, *args, **kwargs: 90
             if fieldname == "paid_amount"
+            else AttrDict(docstatus=1, is_return=0, company="Test Company")
+            if isinstance(fieldname, (list, tuple))
             else 0
         )
         self.creation.frappe.get_value = lambda *args, **kwargs: 0
@@ -3023,6 +3028,7 @@ class TestInvoiceIdempotency(unittest.TestCase):
             currency="USD",
             customer="CUST-0001",
             is_return=0,
+            posa_pos_opening_shift=TILL_SHIFT_NAME,
             items=[],
             payments=[],
             taxes=[],
@@ -3094,6 +3100,7 @@ class TestInvoiceIdempotency(unittest.TestCase):
             currency="USD",
             customer="CUST-0001",
             is_return=0,
+            posa_pos_opening_shift=TILL_SHIFT_NAME,
             items=[],
             payments=[],
             taxes=[],

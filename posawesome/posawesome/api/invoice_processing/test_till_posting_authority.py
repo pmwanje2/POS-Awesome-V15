@@ -544,7 +544,10 @@ class TestTillPayloadCannotSetServerOwnedFields(TillAuthorityHarness):
         self.assertEqual(self._all_saved(), [])
 
     def test_trusted_submitted_amendment_keeps_its_amended_from_link(self):
-        self.frappe.flags.posa_trusted_shift_audit = {"source": "submitted_amendment"}
+        self.frappe.flags.posa_trusted_shift_audit = {
+            "source": "submitted_amendment",
+            "source_invoice_name": "ACC-SINV-OLD-0001",
+        }
 
         result = self.creation.update_invoice(
             json.dumps(self._sale_payload(amended_from="ACC-SINV-OLD-0001"))

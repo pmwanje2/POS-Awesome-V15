@@ -74,6 +74,33 @@ AUTHORITATIVE_CASHIER_FIELD = "posa_cashier"
 CLIENT_CASHIER_KEYS = {AUTHORITATIVE_CASHIER_FIELD, "_posa_authoritative_cashier"}
 TRUSTED_SHIFT_AUDIT_KEY = "_posa_shift_reassignment_audit"
 TRUSTED_SHIFT_SOURCES = {"offline_sync", "submitted_amendment"}
+# Fields only the server or ERPNext sets on a till invoice. ERPNext marks a
+# consolidated invoice in POS Invoice Merge Log, and JB's Sales Invoice controls
+# skip consolidated invoices, so a till payload must never carry these.
+SERVER_OWNED_INVOICE_FIELDS = (
+    "docstatus",
+    "status",
+    "owner",
+    "creation",
+    "modified",
+    "modified_by",
+    "amended_from",
+    "amendment_date",
+    "_liked_by",
+    "__last_sync_on",
+    "is_consolidated",
+    "consolidated_invoice",
+    "pos_closing_entry",
+    "is_created_using_pos",
+    "posa_is_printed",
+    "posa_below_cost_override_by",
+    "posa_below_cost_override_details",
+    "posa_redeemed_customer_credit",
+    "posa_remaining_customer_credit_balance",
+    "posa_return_valid_upto",
+)
+# ERPNext links each merged Sales Invoice row to its POS Invoice.
+SERVER_OWNED_SALES_INVOICE_ITEM_FIELDS = ("pos_invoice", "pos_invoice_item")
 DEADLOCK_RETRY_DELAYS = (0.08, 0.2)
 
 RETURN_OUTSTANDING_MESSAGE_MARKERS = (
@@ -84,6 +111,56 @@ RETURN_OUTSTANDING_MESSAGE_MARKERS = (
 
 def _permission_denied(message):
     frappe.throw(message, getattr(frappe, "PermissionError", PermissionError))
+
+
+def _strip_server_owned_invoice_fields(payload, doctype=None):
+    """Drop fields a till payload may not set; the server or ERPNext owns them."""
+
+    if not isinstance(payload, dict):
+        return payload
+    audit = getattr(getattr(frappe, "flags", None), "posa_trusted_shift_audit", None)
+    trusted_amendment = (
+        isinstance(audit, dict)
+        and audit.get("source") == "submitted_amendment"
+        and payload.get("amended_from")
+        and audit.get("source_invoice_name") == payload.get("amended_from")
+    )
+    for fieldname in SERVER_OWNED_INVOICE_FIELDS:
+        if fieldname == "amended_from" and trusted_amendment:
+            continue
+        payload.pop(fieldname, None)
+    if (doctype or payload.get("doctype") or "Sales Invoice") == "Sales Invoice":
+        for row in payload.get("items") or []:
+            if isinstance(row, dict):
+                for fieldname in SERVER_OWNED_SALES_INVOICE_ITEM_FIELDS:
+                    row.pop(fieldname, None)
+    return payload
+
+
+def _validate_client_return_reference(payload, doctype, company):
+    """A sale carries no return link; a return names a submitted sale of this company."""
+
+    if not isinstance(payload, dict) or "is_return" not in payload:
+        return
+    if not cint(payload.get("is_return")):
+        payload["return_against"] = None
+        return
+    return_against = str(payload.get("return_against") or "").strip()
+    if not return_against:
+        return
+    original = frappe.db.get_value(
+        doctype,
+        return_against,
+        ["docstatus", "is_return", "company"],
+        as_dict=True,
+    )
+    if (
+        not original
+        or cint(_doc_value(original, "docstatus")) != 1
+        or cint(_doc_value(original, "is_return"))
+        or str(_doc_value(original, "company") or "").strip() != str(company or "").strip()
+    ):
+        _permission_denied(_("A return must reference a submitted sale of this company."))
 
 
 def _request_profile_name(value):
@@ -219,7 +296,8 @@ def _validate_invoice_opening_shift(
 
     if cint(_doc_value(shift_doc, "docstatus")) != 1:
         _permission_denied(_("The POS Opening Shift is not submitted."))
-    if not accepted_background and not allow_closed_replay and (
+    # A queued submission is re-checked when it runs: the shift must still be open.
+    if not allow_closed_replay and (
         str(_doc_value(shift_doc, "status") or "").strip() != "Open"
         or _doc_value(shift_doc, "pos_closing_shift")
     ):
@@ -254,6 +332,8 @@ def _assert_till_draft_authority(invoice_doc, *, pos_profile, company, opening_s
         company=company,
         permission_type="read",
     )
+    if cint(_doc_value(invoice_doc, "is_consolidated")):
+        _permission_denied(_("A consolidated invoice cannot be changed at the till."))
     shift_name = str(_doc_value(opening_shift_doc, "name") or "").strip()
     if not opening_shift_doc or not shift_name:
         _permission_denied(_("A valid POS Opening Shift is required."))
@@ -1241,10 +1321,12 @@ def _clear_stale_party_fields_for_customer_change(
 def _get_mutable_invoice_doc(data, doctype, pos_profile, company, opening_shift_doc=None):
     invoice_name = (data or {}).get("name")
     if not invoice_name:
-        return frappe.get_doc(data)
+        return _new_till_draft(data, pos_profile, company, opening_shift_doc)
 
     if not frappe.db.exists(doctype, invoice_name):
-        return frappe.get_doc(_build_fresh_invoice_payload(data, doctype))
+        return _new_till_draft(
+            _build_fresh_invoice_payload(data, doctype), pos_profile, company, opening_shift_doc
+        )
 
     invoice_doc = _get_scoped_invoice_doc(
         doctype,
@@ -1275,7 +1357,7 @@ def _get_mutable_invoice_doc(data, doctype, pos_profile, company, opening_shift_
             previous_customer,
             previous_values=previous_values,
         )
-        return frappe.get_doc(fresh_payload)
+        return _new_till_draft(fresh_payload, pos_profile, company, opening_shift_doc)
 
     _assert_till_draft_authority(
         invoice_doc,
@@ -1292,6 +1374,18 @@ def _get_mutable_invoice_doc(data, doctype, pos_profile, company, opening_shift_
         previous_values=previous_values,
     )
     return invoice_doc
+
+
+def _new_till_draft(payload, pos_profile, company, opening_shift_doc):
+    """Build a new till draft and pass it through the same gate before its first save."""
+
+    invoice_doc = frappe.get_doc(payload)
+    return _assert_till_draft_authority(
+        invoice_doc,
+        pos_profile=pos_profile,
+        company=company,
+        opening_shift_doc=opening_shift_doc,
+    )
 
 
 def _save_draft_with_latest_timestamp(invoice_doc, retries=2):
@@ -1546,6 +1640,8 @@ def update_invoice(data):
 
     # Ensure the document type is set for new invoices to prevent validation errors
     data["doctype"] = doctype
+    _strip_server_owned_invoice_fields(data, doctype)
+    _validate_client_return_reference(data, doctype, company)
     authoritative_cashier = get_active_terminal_cashier(pos_profile)
 
     return_validity_enabled, default_validity_days = _get_return_validity_settings(pos_profile)
@@ -1823,6 +1919,8 @@ def _submit_invoice_once(invoice, data, submit_in_background=False):
 
     if not doctype_supports_client_request_id(doctype):
         strip_invoice_client_request_id(invoice)
+    _strip_server_owned_invoice_fields(invoice, doctype)
+    _validate_client_return_reference(invoice, doctype, company)
 
     client_invoice_name = invoice.get("name")
     ledger_scope = _resolve_ledger_scope(invoice, data, doctype)
@@ -2343,11 +2441,20 @@ def submit_in_background_job(kwargs):
                 company=profile_doc.get("company"),
                 permission_type="read",
             )
-        _validate_invoice_opening_shift(
+        opening_shift_doc = _validate_invoice_opening_shift(
             profile_doc,
             {"posa_pos_opening_shift": opening_shift or invoice_doc.get("posa_pos_opening_shift")},
             required=True,
         )
+        if cint(invoice_doc.get("docstatus")) == 0:
+            # Re-check the till authority when the queued job runs: the stored
+            # draft must still belong to the shift that queued it.
+            _assert_till_draft_authority(
+                invoice_doc,
+                pos_profile=profile_doc.get("name"),
+                company=profile_doc.get("company"),
+                opening_shift_doc=opening_shift_doc,
+            )
         if cashier:
             cashier = validate_assigned_terminal_cashier(
                 invoice_doc.get("pos_profile"),
