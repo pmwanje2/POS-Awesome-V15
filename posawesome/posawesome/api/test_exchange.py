@@ -217,6 +217,11 @@ class TestExchangeValidation(unittest.TestCase):
         self.exchange.submit_invoice = submit_invoice
 
         erpnext = types.ModuleType("erpnext")
+        def get_default_cost_center(company):
+            self.assertEqual(company, "Example Co")
+            return "Main - EC"
+
+        erpnext.get_default_cost_center = get_default_cost_center
         accounts = types.ModuleType("erpnext.accounts")
         doctype = types.ModuleType("erpnext.accounts.doctype")
         reconciliation = types.ModuleType(
@@ -279,7 +284,7 @@ class TestExchangeValidation(unittest.TestCase):
                     credit_in_account_currency=100,
                     reference_type="Sales Invoice",
                     reference_name="SINV-SALE",
-                    cost_center=None,
+                    cost_center="Main - EC",
                     exchange_rate=1,
                 ),
                 AttrDict(
@@ -289,7 +294,7 @@ class TestExchangeValidation(unittest.TestCase):
                     debit_in_account_currency=100,
                     reference_type="Sales Invoice",
                     reference_name="SINV-RETURN",
-                    cost_center=None,
+                    cost_center="Main - EC",
                     exchange_rate=1,
                 ),
             ],
