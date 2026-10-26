@@ -137,15 +137,14 @@ def _strip_server_owned_invoice_fields(payload, doctype=None):
     return payload
 
 
-def _validate_client_return_reference(payload, doctype, company):
-    """A sale carries no return link; a return names a submitted sale of this company."""
+def _validate_effective_return_reference(invoice_doc, doctype, company):
+    """Judge the merged invoice: a sale has no return link; a return names this company's submitted sale."""
 
-    if not isinstance(payload, dict) or "is_return" not in payload:
+    if not cint(_doc_value(invoice_doc, "is_return")):
+        if _doc_value(invoice_doc, "return_against"):
+            invoice_doc.set("return_against", None)
         return
-    if not cint(payload.get("is_return")):
-        payload["return_against"] = None
-        return
-    return_against = str(payload.get("return_against") or "").strip()
+    return_against = str(_doc_value(invoice_doc, "return_against") or "").strip()
     if not return_against:
         return
     original = frappe.db.get_value(
@@ -1641,7 +1640,6 @@ def update_invoice(data):
     # Ensure the document type is set for new invoices to prevent validation errors
     data["doctype"] = doctype
     _strip_server_owned_invoice_fields(data, doctype)
-    _validate_client_return_reference(data, doctype, company)
     authoritative_cashier = get_active_terminal_cashier(pos_profile)
 
     return_validity_enabled, default_validity_days = _get_return_validity_settings(pos_profile)
@@ -1653,6 +1651,7 @@ def update_invoice(data):
         company,
         opening_shift_doc=opening_shift_doc,
     )
+    _validate_effective_return_reference(invoice_doc, doctype, company)
     set_invoice_client_request_id(invoice_doc, client_request_id)
     _set_authoritative_cashier(invoice_doc, authoritative_cashier)
 
@@ -1920,7 +1919,6 @@ def _submit_invoice_once(invoice, data, submit_in_background=False):
     if not doctype_supports_client_request_id(doctype):
         strip_invoice_client_request_id(invoice)
     _strip_server_owned_invoice_fields(invoice, doctype)
-    _validate_client_return_reference(invoice, doctype, company)
 
     client_invoice_name = invoice.get("name")
     ledger_scope = _resolve_ledger_scope(invoice, data, doctype)
@@ -2160,6 +2158,7 @@ def _submit_invoice_once(invoice, data, submit_in_background=False):
         )
         invoice_doc.update(invoice)
 
+    _validate_effective_return_reference(invoice_doc, doctype, company)
     set_invoice_client_request_id(invoice_doc, client_request_id)
     _set_authoritative_cashier(invoice_doc, authoritative_cashier)
     _apply_pricing_rule_policy(invoice_doc, profile_doc)
