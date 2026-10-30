@@ -119,6 +119,15 @@ class TestExchangeValidation(unittest.TestCase):
         )
 
     def test_cashier_exchange_uses_system_credit_journal_without_journal_entry_permission(self):
+        self._assert_cashier_exchange_journal("PKR", "PKR", 1, 0)
+
+    def test_foreign_currency_exchange_keeps_document_rate_and_enables_multi_currency(self):
+        self._assert_cashier_exchange_journal("USD", "UGX", 3650, 1)
+
+    def test_company_currency_exchange_does_not_enable_multi_currency(self):
+        self._assert_cashier_exchange_journal("UGX", "UGX", 1, 0)
+
+    def _assert_cashier_exchange_journal(self, currency, company_currency, document_rate, multi_currency):
         journals = []
         exchanges = []
         submitted = []
@@ -132,10 +141,10 @@ class TestExchangeValidation(unittest.TestCase):
             company="Example Co",
             pos_profile="Main POS",
             customer="Customer A",
-            currency="PKR",
+            currency=currency,
             outstanding_amount=-100,
             rounded_total=100,
-            conversion_rate=1,
+            conversion_rate=document_rate,
             posting_date="2026-10-24",
             debit_to="Debtors - EC",
             items=[],
@@ -149,10 +158,10 @@ class TestExchangeValidation(unittest.TestCase):
             company="Example Co",
             pos_profile="Main POS",
             customer="Customer A",
-            currency="PKR",
+            currency=currency,
             outstanding_amount=100,
             rounded_total=100,
-            conversion_rate=1,
+            conversion_rate=document_rate,
             posting_date="2026-10-24",
             debit_to="Debtors - EC",
             items=[],
@@ -198,7 +207,7 @@ class TestExchangeValidation(unittest.TestCase):
             return documents[args[1]]
 
         frappe.get_doc = get_doc
-        frappe.get_cached_value = lambda *args: "PKR"
+        frappe.get_cached_value = lambda *args: currency
         frappe.get_all = lambda *args, **kwargs: [
             AttrDict(parent="JV-EXCHANGE-1", reference_name=return_doc.name),
             AttrDict(parent="JV-EXCHANGE-1", reference_name=sale_doc.name),
@@ -222,6 +231,7 @@ class TestExchangeValidation(unittest.TestCase):
             return "Main - EC"
 
         erpnext.get_default_cost_center = get_default_cost_center
+        erpnext.get_company_currency = lambda company: company_currency
         accounts = types.ModuleType("erpnext.accounts")
         doctype = types.ModuleType("erpnext.accounts.doctype")
         reconciliation = types.ModuleType(
@@ -268,6 +278,7 @@ class TestExchangeValidation(unittest.TestCase):
         self.assertEqual(len(journals), 1)
         journal = journals[0]
         self.assertEqual(journal.voucher_type, "Credit Note")
+        self.assertEqual(journal.multi_currency, multi_currency)
         self.assertEqual(journal.is_system_generated, 1)
         self.assertIsNone(journal.remark)
         self.assertTrue(journal.flags.ignore_permissions)
@@ -285,7 +296,7 @@ class TestExchangeValidation(unittest.TestCase):
                     reference_type="Sales Invoice",
                     reference_name="SINV-SALE",
                     cost_center="Main - EC",
-                    exchange_rate=1,
+                    exchange_rate=document_rate,
                 ),
                 AttrDict(
                     account="Debtors - EC",
@@ -295,7 +306,7 @@ class TestExchangeValidation(unittest.TestCase):
                     reference_type="Sales Invoice",
                     reference_name="SINV-RETURN",
                     cost_center="Main - EC",
-                    exchange_rate=1,
+                    exchange_rate=document_rate,
                 ),
             ],
         )
