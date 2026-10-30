@@ -185,6 +185,7 @@ def _submit_exchange_credit_journal(entry, company):
             "posting_date": entry.get("debit_or_credit_note_posting_date"),
             "company": company,
             "is_system_generated": 1,
+            "multi_currency": 1 if entry.currency != erpnext.get_company_currency(company) else 0,
             "accounts": [
                 {
                     **common,
