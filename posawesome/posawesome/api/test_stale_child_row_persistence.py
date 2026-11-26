@@ -1,3 +1,4 @@
+import copy
 import importlib.util
 import json
 import pathlib
@@ -181,6 +182,7 @@ def _install_framework_stubs():
 
     frappe_module.db = types.SimpleNamespace(
         get_value=lambda *args, **kwargs: None,
+        get_values=lambda *args, **kwargs: (),
         exists=lambda *args, **kwargs: False,
         has_column=lambda *args, **kwargs: False,
         count=lambda *args, **kwargs: 0,
@@ -374,6 +376,7 @@ class TestStaleChildRowPersistence(unittest.TestCase):
         )
         self.frappe.db = types.SimpleNamespace(
             get_value=lambda *args, **kwargs: None,
+            get_values=lambda *args, **kwargs: (),
             exists=lambda *args, **kwargs: False,
             has_column=lambda *args, **kwargs: False,
             count=lambda *args, **kwargs: 0,
@@ -387,7 +390,7 @@ class TestStaleChildRowPersistence(unittest.TestCase):
         shift_doc = _make_open_shift()
 
         self.frappe.db.exists = lambda doctype, name: doctype == "POS Invoice" and name == INVOICE_NAME
-        self.frappe.get_doc = lambda doctype, name: live_draft
+        self.frappe.get_doc = lambda doctype, name, **kwargs: live_draft
 
         incoming_payload = {
             "doctype": "POS Invoice",
@@ -418,6 +421,7 @@ class TestStaleChildRowPersistence(unittest.TestCase):
                 }
             ],
         }
+        original_snapshot = copy.deepcopy(incoming_payload)
 
         updated_doc = self.creation._get_mutable_invoice_doc(
             incoming_payload,
@@ -438,13 +442,14 @@ class TestStaleChildRowPersistence(unittest.TestCase):
         self.assertNotIn("name", payment_row)
         self.assertEqual(payment_row.get("__islocal"), 1)
         self.assertNotIn("parent", payment_row)
+        self.assertEqual(incoming_payload, original_snapshot)
 
     def test_get_mutable_invoice_doc_preserves_valid_live_child_row_names(self):
         live_draft = _make_draft_pos_invoice()
         shift_doc = _make_open_shift()
 
         self.frappe.db.exists = lambda doctype, name: doctype == "POS Invoice" and name == INVOICE_NAME
-        self.frappe.get_doc = lambda doctype, name: live_draft
+        self.frappe.get_doc = lambda doctype, name, **kwargs: live_draft
 
         incoming_payload = {
             "doctype": "POS Invoice",
@@ -504,7 +509,7 @@ class TestStaleChildRowPersistence(unittest.TestCase):
         self.assertEqual(updated_doc.payments[0].get("name"), "pay-live-1")
         self.assertFalse(updated_doc.payments[0].get("__islocal"))
 
-    def test_sanitize_helper_discovers_dynamic_meta_table_fields(self):
+    def test_sanitize_helper_discovers_dynamic_meta_table_fields_without_mutating_caller(self):
         live_draft = _make_draft_pos_invoice(
             custom_posa_lines=[AttrDict(name="custom-live-1", value="ok")],
             meta=types.SimpleNamespace(
@@ -520,16 +525,241 @@ class TestStaleChildRowPersistence(unittest.TestCase):
                 {"name": "custom-stale-9", "value": "recreated", "parent": INVOICE_NAME},
             ]
         }
+        original_snapshot = copy.deepcopy(payload)
 
-        self.creation._sanitize_stale_child_row_names(live_draft, payload)
+        sanitized = self.creation._sanitize_stale_child_row_names(live_draft, payload)
 
-        self.assertEqual(payload["custom_posa_lines"][0].get("name"), "custom-live-1")
-        self.assertFalse(payload["custom_posa_lines"][0].get("__islocal"))
-        self.assertNotIn("name", payload["custom_posa_lines"][1])
-        self.assertEqual(payload["custom_posa_lines"][1].get("__islocal"), 1)
-        self.assertNotIn("parent", payload["custom_posa_lines"][1])
+        self.assertIsNot(sanitized, payload)
+        self.assertEqual(payload, original_snapshot)
+        self.assertEqual(sanitized["custom_posa_lines"][0].get("name"), "custom-live-1")
+        self.assertFalse(sanitized["custom_posa_lines"][0].get("__islocal"))
+        self.assertNotIn("name", sanitized["custom_posa_lines"][1])
+        self.assertEqual(sanitized["custom_posa_lines"][1].get("__islocal"), 1)
+        self.assertNotIn("parent", sanitized["custom_posa_lines"][1])
 
-    def test_save_draft_retry_on_timestamp_mismatch_sanitizes_stale_child_row_names(self):
+    def test_sanitize_covers_gift_card_redemptions_and_posa_change_returns(self):
+        live_draft = _make_draft_pos_invoice(
+            gift_card_redemptions=[AttrDict(name="gc-live-1", gift_card="GC-001")],
+            posa_change_returns=[AttrDict(name="chg-live-1", amount=500)],
+        )
+        payload = {
+            "gift_card_redemptions": [
+                {"name": "gc-live-1", "gift_card": "GC-001"},
+                {"name": "gc-stale-9", "gift_card": "GC-002", "parent": INVOICE_NAME},
+            ],
+            "posa_change_returns": [
+                {"name": "chg-live-1", "amount": 500},
+                {"name": "chg-stale-9", "amount": 1000, "parent": INVOICE_NAME},
+            ],
+        }
+        original_snapshot = copy.deepcopy(payload)
+
+        sanitized = self.creation._sanitize_stale_child_row_names(live_draft, payload)
+
+        self.assertEqual(payload, original_snapshot)
+        self.assertEqual(sanitized["gift_card_redemptions"][0].get("name"), "gc-live-1")
+        self.assertNotIn("name", sanitized["gift_card_redemptions"][1])
+        self.assertEqual(sanitized["gift_card_redemptions"][1].get("__islocal"), 1)
+        self.assertNotIn("parent", sanitized["gift_card_redemptions"][1])
+
+        self.assertEqual(sanitized["posa_change_returns"][0].get("name"), "chg-live-1")
+        self.assertNotIn("name", sanitized["posa_change_returns"][1])
+        self.assertEqual(sanitized["posa_change_returns"][1].get("__islocal"), 1)
+        self.assertNotIn("parent", sanitized["posa_change_returns"][1])
+
+    def test_sanitize_handles_unhashable_bool_empty_islocal_duplicate_and_cross_invoice_names(self):
+        live_draft = _make_draft_pos_invoice(
+            items=[
+                AttrDict(name=LIVE_ROW_NAME, item_code="SUGAR-1KG", parent=INVOICE_NAME),
+                AttrDict(name=1, item_code="NUMERIC-ID-ITEM", parent=INVOICE_NAME),
+            ]
+        )
+        payload = {
+            "items": [
+                {"name": [], "item_code": "UNHASHABLE-LIST", "parent": INVOICE_NAME},
+                {"name": {"nested": 1}, "item_code": "UNHASHABLE-DICT", "parent": INVOICE_NAME},
+                {"name": True, "item_code": "BOOL-TRUE-COLLISION", "parent": INVOICE_NAME},
+                {"name": None, "item_code": "NONE-NAME", "parent": INVOICE_NAME},
+                {"name": "", "item_code": "EMPTY-NAME", "parent": INVOICE_NAME},
+                {
+                    "name": LIVE_ROW_NAME,
+                    "__islocal": 1,
+                    "item_code": "LIVE-NAME-MARKED-LOCAL",
+                    "parent": INVOICE_NAME,
+                },
+                {"name": LIVE_ROW_NAME, "item_code": "LIVE-FIRST", "parent": INVOICE_NAME},
+                {"name": LIVE_ROW_NAME, "item_code": "LIVE-DUPLICATE", "parent": INVOICE_NAME},
+                {
+                    "name": "row-on-other-invoice",
+                    "item_code": "CROSS-INVOICE",
+                    "parent": "ACC-PSINV-OTHER",
+                },
+            ]
+        }
+
+        sanitized = self.creation._sanitize_stale_child_row_names(live_draft, payload)
+        rows = sanitized["items"]
+
+        # Unhashable list / dict, bool True, None, "", live+__islocal=1 -> all stripped & __islocal=1
+        for idx in (0, 1, 2, 3, 4, 5):
+            with self.subTest(idx=idx, item_code=rows[idx]["item_code"]):
+                self.assertNotIn("name", rows[idx])
+                self.assertEqual(rows[idx].get("__islocal"), 1)
+                self.assertNotIn("parent", rows[idx])
+
+        # First genuine live row keeps its name; duplicate live row is stripped & marked local
+        self.assertEqual(rows[6].get("name"), LIVE_ROW_NAME)
+        self.assertFalse(rows[6].get("__islocal"))
+        self.assertNotIn("name", rows[7])
+        self.assertEqual(rows[7].get("__islocal"), 1)
+
+        # Cross-invoice row is stripped & marked local
+        self.assertNotIn("name", rows[8])
+        self.assertNotIn("parent", rows[8])
+        self.assertEqual(rows[8].get("__islocal"), 1)
+
+    def test_build_fresh_invoice_payload_and_new_till_draft_strip_child_identity_and_audit_fields(self):
+        source_payload = {
+            "doctype": "POS Invoice",
+            "name": "ACC-PSINV-SUBMITTED-001",
+            "docstatus": 1,
+            "pos_profile": "JB Till 1",
+            "company": "JB Supermarket",
+            "posa_pos_opening_shift": SHIFT_NAME,
+            "items": [
+                {
+                    "name": "old-item-row-1",
+                    "item_code": "SUGAR-1KG",
+                    "qty": 1,
+                    "parent": "ACC-PSINV-SUBMITTED-001",
+                    "parenttype": "POS Invoice",
+                    "parentfield": "items",
+                    "docstatus": 1,
+                    "creation": "2026-10-29 09:00:00",
+                    "owner": "other.cashier@example.com",
+                    "modified": "2026-10-29 09:05:00",
+                    "modified_by": "other.cashier@example.com",
+                }
+            ],
+            "payments": [
+                {
+                    "name": "old-pay-row-1",
+                    "mode_of_payment": "Cash",
+                    "amount": 10000,
+                    "parent": "ACC-PSINV-SUBMITTED-001",
+                    "parenttype": "POS Invoice",
+                    "parentfield": "payments",
+                    "docstatus": 1,
+                    "creation": "2026-10-29 09:00:00",
+                    "owner": "other.cashier@example.com",
+                    "modified": "2026-10-29 09:05:00",
+                    "modified_by": "other.cashier@example.com",
+                }
+            ],
+            "gift_card_redemptions": [
+                {
+                    "name": "old-gc-row-1",
+                    "gift_card": "GC-001",
+                    "parent": "ACC-PSINV-SUBMITTED-001",
+                    "docstatus": 1,
+                    "owner": "other.cashier@example.com",
+                }
+            ],
+        }
+        original_snapshot = copy.deepcopy(source_payload)
+
+        fresh = self.creation._build_fresh_invoice_payload(source_payload, "POS Invoice")
+        self.assertEqual(source_payload, original_snapshot)
+
+        audit_fields = (
+            "name",
+            "parent",
+            "parenttype",
+            "parentfield",
+            "docstatus",
+            "creation",
+            "owner",
+            "modified",
+            "modified_by",
+        )
+        for table_field in ("items", "payments", "gift_card_redemptions"):
+            row = fresh[table_field][0]
+            for field in audit_fields:
+                self.assertNotIn(field, row, f"{table_field}[0] retained {field}")
+            self.assertEqual(row.get("__islocal"), 1)
+
+        # Also verify _new_till_draft sanitizes brand-new payloads passed directly (e.g. returns)
+        captured_payloads = []
+        shift_doc = _make_open_shift()
+
+        def fake_get_doc(payload):
+            captured_payloads.append(payload)
+            return FakeDoc(
+                doctype="POS Invoice",
+                name=None,
+                docstatus=0,
+                pos_profile="JB Till 1",
+                company="JB Supermarket",
+                posa_pos_opening_shift=SHIFT_NAME,
+                items=payload.get("items", []),
+            )
+
+        self.frappe.get_doc = fake_get_doc
+        new_draft_input = {
+            "doctype": "POS Invoice",
+            "pos_profile": "JB Till 1",
+            "company": "JB Supermarket",
+            "is_return": 1,
+            "items": [
+                {
+                    "name": "orig-sale-item-1",
+                    "item_code": "SUGAR-1KG",
+                    "qty": -1,
+                    "parent": "ACC-PSINV-ORIG",
+                    "parenttype": "POS Invoice",
+                    "parentfield": "items",
+                    "docstatus": 1,
+                    "owner": "orig@example.com",
+                    "creation": "2026-10-29 08:00:00",
+                    "modified": "2026-10-29 08:00:00",
+                    "modified_by": "orig@example.com",
+                }
+            ],
+        }
+        new_draft_snapshot = copy.deepcopy(new_draft_input)
+
+        self.creation._new_till_draft(
+            new_draft_input,
+            "JB Till 1",
+            "JB Supermarket",
+            shift_doc,
+        )
+
+        self.assertEqual(new_draft_input, new_draft_snapshot)
+        self.assertEqual(len(captured_payloads), 1)
+        new_item = captured_payloads[0]["items"][0]
+        for field in audit_fields:
+            self.assertNotIn(field, new_item)
+        self.assertEqual(new_item.get("__islocal"), 1)
+
+    def test_merge_draft_state_preserves_ignore_pricing_rule_flag_for_normal_invoices(self):
+        source_doc = _make_draft_pos_invoice(
+            is_return=0,
+            flags=types.SimpleNamespace(ignore_permissions=True, ignore_pricing_rule=True),
+        )
+        latest_doc = _make_draft_pos_invoice(
+            is_return=0,
+            flags=types.SimpleNamespace(ignore_permissions=False, ignore_pricing_rule=False),
+        )
+        self.frappe.db.get_values = lambda *args, **kwargs: ((LIVE_ROW_NAME,),)
+
+        merged = self.creation._merge_draft_state_onto_latest_doc(source_doc, latest_doc)
+
+        self.assertIs(merged, latest_doc)
+        self.assertTrue(merged.flags.ignore_permissions)
+        self.assertTrue(merged.flags.ignore_pricing_rule)
+
+    def test_save_draft_retry_on_timestamp_mismatch_sanitizes_stale_child_row_names_with_for_update(self):
         stale_doc = _make_draft_pos_invoice(
             items=[
                 AttrDict(
@@ -570,9 +800,20 @@ class TestStaleChildRowPersistence(unittest.TestCase):
         stale_doc.save = fail_with_mismatch
         latest_doc.save = latest_save
 
+        get_doc_calls = []
+        get_values_calls = []
+
+        def fake_get_doc(doctype, name, **kwargs):
+            get_doc_calls.append((doctype, name, dict(kwargs)))
+            return latest_doc
+
+        def fake_get_values(doctype, filters=None, fieldname=None, **kwargs):
+            get_values_calls.append((doctype, dict(filters or {}), fieldname, dict(kwargs)))
+            return ((LIVE_ROW_NAME,),)
+
         self.frappe.db.get_value = lambda *args, **kwargs: None
-        self.frappe.db.count = lambda doctype, filters: len(latest_doc.items)
-        self.frappe.get_doc = lambda doctype, name: latest_doc
+        self.frappe.db.get_values = fake_get_values
+        self.frappe.get_doc = fake_get_doc
 
         result = self.creation._save_draft_with_latest_timestamp(stale_doc)
 
@@ -582,8 +823,10 @@ class TestStaleChildRowPersistence(unittest.TestCase):
         self.assertNotIn("name", saved_item)
         self.assertEqual(saved_item.get("__islocal"), 1)
         self.assertNotIn("parent", saved_item)
+        self.assertTrue(any(call[2].get("for_update") is True for call in get_doc_calls))
+        self.assertTrue(any(call[3].get("for_update") is True for call in get_values_calls))
 
-    def test_save_draft_concurrent_modified_drift_sanitizes_stale_child_row_names(self):
+    def test_save_draft_concurrent_modified_drift_uses_for_update_and_sanitizes_stale_rows(self):
         stale_doc = _make_draft_pos_invoice(
             modified="2026-10-30 10:00:00",
             items=[
@@ -617,11 +860,20 @@ class TestStaleChildRowPersistence(unittest.TestCase):
         stale_doc.save = lambda: saved_docs.append(("stale", [dict(r) for r in stale_doc.items]))
         latest_doc.save = lambda: saved_docs.append(("latest", [dict(r) for r in latest_doc.items]))
 
-        self.frappe.db.get_value = lambda doctype, name, field: (
-            "2026-10-30 10:00:05" if field == "modified" else None
-        )
-        self.frappe.db.count = lambda doctype, filters: 1
-        self.frappe.get_doc = lambda doctype, name: latest_doc
+        get_value_calls = []
+        get_doc_calls = []
+
+        def fake_get_value(doctype, name, field, **kwargs):
+            get_value_calls.append((doctype, name, field, dict(kwargs)))
+            return "2026-10-30 10:00:05" if field == "modified" else None
+
+        def fake_get_doc(doctype, name, **kwargs):
+            get_doc_calls.append((doctype, name, dict(kwargs)))
+            return latest_doc
+
+        self.frappe.db.get_value = fake_get_value
+        self.frappe.db.get_values = lambda *args, **kwargs: ((LIVE_ROW_NAME,),)
+        self.frappe.get_doc = fake_get_doc
 
         result = self.creation._save_draft_with_latest_timestamp(stale_doc)
 
@@ -631,6 +883,89 @@ class TestStaleChildRowPersistence(unittest.TestCase):
         saved_item = saved_docs[0][1][0]
         self.assertNotIn("name", saved_item)
         self.assertEqual(saved_item.get("__islocal"), 1)
+        self.assertTrue(any(call[3].get("for_update") is True for call in get_value_calls))
+        self.assertTrue(any(call[2].get("for_update") is True for call in get_doc_calls))
+
+    def test_save_draft_reloads_when_current_modified_is_none_and_never_overwrites_modified_on_failed_reload(
+        self,
+    ):
+        # Case 1: current_modified is None -> must reload via for_update=True, NOT blindly copy modified
+        doc_without_modified = _make_draft_pos_invoice(
+            modified=None,
+            items=[AttrDict(name=STALE_ROW_NAME, item_code="SUGAR-1KG", qty=1, parent=INVOICE_NAME)],
+        )
+        latest_doc = _make_draft_pos_invoice(
+            modified="2026-10-30 10:00:05",
+            items=[AttrDict(name=LIVE_ROW_NAME, item_code="SUGAR-1KG", qty=1, parent=INVOICE_NAME)],
+        )
+        saved_targets = []
+        doc_without_modified.save = lambda: saved_targets.append("stale")
+        latest_doc.save = lambda: saved_targets.append("latest")
+
+        get_doc_calls = []
+
+        def fake_get_doc(doctype, name, **kwargs):
+            get_doc_calls.append((doctype, name, dict(kwargs)))
+            return latest_doc
+
+        self.frappe.db.get_value = lambda doctype, name, field, **kwargs: "2026-10-30 10:00:05"
+        self.frappe.db.get_values = lambda *args, **kwargs: ((LIVE_ROW_NAME,),)
+        self.frappe.get_doc = fake_get_doc
+
+        result = self.creation._save_draft_with_latest_timestamp(doc_without_modified)
+
+        self.assertIs(result, latest_doc)
+        self.assertEqual(saved_targets, ["latest"])
+        self.assertTrue(any(call[2].get("for_update") is True for call in get_doc_calls))
+        self.assertNotIn("name", latest_doc.items[0])
+        self.assertEqual(latest_doc.items[0].get("__islocal"), 1)
+
+        # Case 2: reload returns None -> must NOT overwrite modified to bypass Frappe's check_if_latest()
+        stale_doc = _make_draft_pos_invoice(modified="2026-10-30 10:00:00")
+        modified_seen_by_save = []
+
+        def save_checks_timestamp():
+            modified_seen_by_save.append(stale_doc.modified)
+            if stale_doc.modified != "2026-10-30 10:00:05":
+                raise self.TimestampMismatchError("stale timestamp preserved")
+
+        stale_doc.save = save_checks_timestamp
+        self.frappe.get_doc = lambda doctype, name, **kwargs: None
+
+        with self.assertRaises(self.TimestampMismatchError):
+            self.creation._save_draft_with_latest_timestamp(stale_doc, retries=0)
+
+        self.assertEqual(modified_seen_by_save, ["2026-10-30 10:00:00"])
+
+    def test_save_draft_repeatable_read_uses_locking_db_child_names_when_doc_children_are_stale(self):
+        # Even if Frappe's load_children() returned stale row A under REPEATABLE READ,
+        # the locking DB child query sees committed row B and strips stale row A.
+        stale_doc = _make_draft_pos_invoice(
+            modified="2026-10-30 10:00:00",
+            items=[AttrDict(name=STALE_ROW_NAME, item_code="SUGAR-1KG", qty=1, parent=INVOICE_NAME)],
+        )
+        # latest_doc has updated modified, but its non-locking children still show STALE_ROW_NAME!
+        latest_doc_stale_children = _make_draft_pos_invoice(
+            modified="2026-10-30 10:00:05",
+            items=[AttrDict(name=STALE_ROW_NAME, item_code="SUGAR-1KG", qty=1, parent=INVOICE_NAME)],
+        )
+        saved_items = []
+        latest_doc_stale_children.save = lambda: saved_items.extend(
+            [dict(r) for r in latest_doc_stale_children.items]
+        )
+
+        self.frappe.db.get_value = lambda doctype, name, field, **kwargs: "2026-10-30 10:00:05"
+        self.frappe.get_doc = lambda doctype, name, **kwargs: latest_doc_stale_children
+        # Locking DB query returns the true committed live row B
+        self.frappe.db.get_values = lambda doctype, filters=None, fieldname=None, **kwargs: (
+            ((LIVE_ROW_NAME,),) if kwargs.get("for_update") else ((STALE_ROW_NAME,),)
+        )
+
+        self.creation._save_draft_with_latest_timestamp(stale_doc)
+
+        self.assertEqual(len(saved_items), 1)
+        self.assertNotIn("name", saved_items[0])
+        self.assertEqual(saved_items[0].get("__islocal"), 1)
 
     def test_submit_invoice_once_sanitizes_stale_child_row_name_and_preserves_live_name(self):
         live_draft = _make_draft_pos_invoice()
@@ -652,11 +987,13 @@ class TestStaleChildRowPersistence(unittest.TestCase):
             or (doctype == "POS Opening Shift" and name == SHIFT_NAME)
         )
         self.frappe.db.get_value = lambda *args, **kwargs: None
-        self.frappe.db.count = lambda doctype, filters: (
-            len(live_draft.items) if doctype == "POS Invoice Item" else 0
+        self.frappe.db.get_values = lambda doctype, filters=None, fieldname=None, **kwargs: (
+            tuple((f"row-{i}",) for i in range(len(live_draft.items)))
+            if doctype == "POS Invoice Item"
+            else ()
         )
 
-        def fake_get_doc(doctype, name=None):
+        def fake_get_doc(doctype, name=None, **kwargs):
             if doctype == "POS Opening Shift":
                 return shift_doc
             if doctype == "POS Invoice" and name == INVOICE_NAME:
@@ -723,40 +1060,62 @@ class TestStaleChildRowPersistence(unittest.TestCase):
         invoice_doc = _make_draft_pos_invoice()
         invoice_doc.save = lambda: invoice_doc
 
-        count_calls = []
+        get_values_calls = []
 
-        def fake_count(doctype, filters=None):
-            count_calls.append((doctype, dict(filters or {})))
-            return 0
+        def fake_get_values(doctype, filters=None, fieldname=None, **kwargs):
+            get_values_calls.append((doctype, dict(filters or {}), fieldname, dict(kwargs)))
+            return ()
 
-        self.frappe.db.count = fake_count
+        self.frappe.db.get_values = fake_get_values
 
         with self.assertRaises(self.ValidationError):
             self.creation._save_draft_with_latest_timestamp(invoice_doc)
 
         self.assertEqual(
-            count_calls,
-            [("POS Invoice Item", {"parent": INVOICE_NAME})],
+            get_values_calls,
+            [
+                (
+                    "POS Invoice Item",
+                    {
+                        "parent": INVOICE_NAME,
+                        "parenttype": "POS Invoice",
+                        "parentfield": "items",
+                    },
+                    "name",
+                    {"for_update": True},
+                )
+            ],
         )
 
     def test_save_draft_passes_when_db_item_count_matches(self):
         invoice_doc = _make_draft_pos_invoice()
         invoice_doc.save = lambda: invoice_doc
 
-        count_calls = []
+        get_values_calls = []
 
-        def fake_count(doctype, filters=None):
-            count_calls.append((doctype, dict(filters or {})))
-            return 1
+        def fake_get_values(doctype, filters=None, fieldname=None, **kwargs):
+            get_values_calls.append((doctype, dict(filters or {}), fieldname, dict(kwargs)))
+            return ((LIVE_ROW_NAME,),)
 
-        self.frappe.db.count = fake_count
+        self.frappe.db.get_values = fake_get_values
 
         result = self.creation._save_draft_with_latest_timestamp(invoice_doc)
 
         self.assertIs(result, invoice_doc)
         self.assertEqual(
-            count_calls,
-            [("POS Invoice Item", {"parent": INVOICE_NAME})],
+            get_values_calls,
+            [
+                (
+                    "POS Invoice Item",
+                    {
+                        "parent": INVOICE_NAME,
+                        "parenttype": "POS Invoice",
+                        "parentfield": "items",
+                    },
+                    "name",
+                    {"for_update": True},
+                )
+            ],
         )
 
     def test_submit_invoice_once_throws_validation_error_when_db_item_count_is_zero_on_submit(self):
@@ -772,16 +1131,16 @@ class TestStaleChildRowPersistence(unittest.TestCase):
         )
         self.frappe.db.get_value = lambda *args, **kwargs: None
 
-        count_calls = []
+        get_values_calls = []
 
-        def fake_count(doctype, filters=None):
-            count_calls.append((doctype, dict(filters or {})))
+        def fake_get_values(doctype, filters=None, fieldname=None, **kwargs):
+            get_values_calls.append((doctype, dict(filters or {}), fieldname, dict(kwargs)))
             if filters and filters.get("docstatus") == 1:
-                return 0
-            return len(live_draft.items)
+                return ()
+            return ((LIVE_ROW_NAME,),)
 
-        self.frappe.db.count = fake_count
-        self.frappe.get_doc = lambda doctype, name=None: (
+        self.frappe.db.get_values = fake_get_values
+        self.frappe.get_doc = lambda doctype, name=None, **kwargs: (
             shift_doc if doctype == "POS Opening Shift" else live_draft
         )
         self.frappe.get_value = lambda *args, **kwargs: 0
@@ -821,21 +1180,39 @@ class TestStaleChildRowPersistence(unittest.TestCase):
             )
 
         self.assertIn(
-            ("POS Invoice Item", {"parent": INVOICE_NAME, "docstatus": 1}),
-            count_calls,
+            (
+                "POS Invoice Item",
+                {
+                    "parent": INVOICE_NAME,
+                    "parenttype": "POS Invoice",
+                    "parentfield": "items",
+                    "docstatus": 1,
+                },
+                "name",
+                {"for_update": True},
+            ),
+            get_values_calls,
         )
 
-    def test_assert_persisted_invoice_items_enforces_non_empty_and_docstatus_on_submit(self):
+    def test_assert_persisted_invoice_items_enforces_non_empty_docstatus_and_sales_invoice_and_meta(
+        self,
+    ):
+        # Empty items allowed on draft save, rejected on submit
+        empty_draft = _make_draft_pos_invoice(docstatus=0, items=[])
+        self.frappe.db.get_values = lambda *args, **kwargs: ()
+        self.creation._assert_persisted_invoice_items(empty_draft, require_non_empty=False)
+
         empty_submitted = _make_draft_pos_invoice(docstatus=1, items=[])
-        self.frappe.db.count = lambda doctype, filters=None: 0
         with self.assertRaises(self.ValidationError):
             self.creation._assert_persisted_invoice_items(empty_submitted, require_non_empty=True)
 
+        # Unsubmitted docstatus rejected on submit
         unsubmitted_doc = _make_draft_pos_invoice(docstatus=0)
-        self.frappe.db.count = lambda doctype, filters=None: 1
+        self.frappe.db.get_values = lambda *args, **kwargs: ((LIVE_ROW_NAME,),)
         with self.assertRaises(self.ValidationError):
             self.creation._assert_persisted_invoice_items(unsubmitted_doc, require_non_empty=True)
 
+        # Partial persistence rejected on submit
         partial_submitted = _make_draft_pos_invoice(
             docstatus=1,
             items=[
@@ -843,12 +1220,66 @@ class TestStaleChildRowPersistence(unittest.TestCase):
                 AttrDict(name="row-2", item_code="B"),
             ],
         )
-        self.frappe.db.count = lambda doctype, filters=None: 1
+        self.frappe.db.get_values = lambda *args, **kwargs: (("row-1",),)
         with self.assertRaises(self.ValidationError):
             self.creation._assert_persisted_invoice_items(partial_submitted, require_non_empty=True)
 
-        self.frappe.db.count = lambda doctype, filters=None: 2 if (filters or {}).get("docstatus") == 1 else 0
-        self.creation._assert_persisted_invoice_items(partial_submitted, require_non_empty=True)
+        # Sales Invoice mode uses Sales Invoice Item + full filters + for_update=True
+        sales_inv = _make_draft_pos_invoice(
+            doctype="Sales Invoice",
+            name="ACC-SINV-2026-00001",
+            docstatus=1,
+            items=[AttrDict(name="si-row-1", item_code="A")],
+        )
+        calls = []
+
+        def capture_sales(doctype, filters=None, fieldname=None, **kwargs):
+            calls.append((doctype, dict(filters or {}), fieldname, dict(kwargs)))
+            return (("si-row-1",),)
+
+        self.frappe.db.get_values = capture_sales
+        self.creation._assert_persisted_invoice_items(sales_inv, require_non_empty=True)
+        self.assertEqual(
+            calls,
+            [
+                (
+                    "Sales Invoice Item",
+                    {
+                        "parent": "ACC-SINV-2026-00001",
+                        "parenttype": "Sales Invoice",
+                        "parentfield": "items",
+                        "docstatus": 1,
+                    },
+                    "name",
+                    {"for_update": True},
+                )
+            ],
+        )
+
+        # Custom child doctype resolved from meta.get_field("items").options
+        custom_meta_inv = _make_draft_pos_invoice(
+            doctype="POS Invoice",
+            name="ACC-PSINV-META-1",
+            docstatus=1,
+            items=[AttrDict(name="meta-row-1", item_code="A")],
+            meta=types.SimpleNamespace(
+                get_field=lambda fieldname: (
+                    types.SimpleNamespace(options="Custom POS Line Item")
+                    if fieldname == "items"
+                    else None
+                )
+            ),
+        )
+        meta_calls = []
+
+        def capture_meta(doctype, filters=None, fieldname=None, **kwargs):
+            meta_calls.append((doctype, dict(filters or {}), fieldname, dict(kwargs)))
+            return (("meta-row-1",),)
+
+        self.frappe.db.get_values = capture_meta
+        self.creation._assert_persisted_invoice_items(custom_meta_inv, require_non_empty=True)
+        self.assertEqual(meta_calls[0][0], "Custom POS Line Item")
+        self.assertEqual(meta_calls[0][3], {"for_update": True})
 
     def test_submit_in_background_job_rolls_back_when_persisted_item_count_is_zero(self):
         live_draft = _make_draft_pos_invoice()
@@ -860,10 +1291,10 @@ class TestStaleChildRowPersistence(unittest.TestCase):
 
         self.frappe.db.exists = lambda doctype, name: doctype == "POS Opening Shift" and name == SHIFT_NAME
         self.frappe.db.rollback = lambda: rollback_calls.append(True)
-        self.frappe.db.count = lambda doctype, filters=None: (
-            0 if (filters or {}).get("docstatus") == 1 else len(live_draft.items)
+        self.frappe.db.get_values = lambda doctype, filters=None, fieldname=None, **kwargs: (
+            () if (filters or {}).get("docstatus") == 1 else ((LIVE_ROW_NAME,),)
         )
-        self.frappe.get_doc = lambda doctype, name=None: (
+        self.frappe.get_doc = lambda doctype, name=None, **kwargs: (
             shift_doc if doctype == "POS Opening Shift" else live_draft
         )
 
