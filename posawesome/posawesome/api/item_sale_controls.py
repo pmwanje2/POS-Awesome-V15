@@ -26,6 +26,8 @@ SALE_FLOOR_POLICY_FIELDS = (
 )
 SALE_FLOOR_ACTIONS = {"Block", "POS Supervisor Override", "Warning Only"}
 MISSING_COST_ACTIONS = {"Allow", "Block"}
+# Floor errors that no below-cost action (Warning Only, supervisor override) relaxes.
+UNOVERRIDABLE_FLOOR_REASONS = {"missing_buying_price", "invalid_uom"}
 
 
 def item_control_fields():
@@ -422,11 +424,23 @@ def resolve_buying_floors(items, pos_profile=None, invoice_doc=None):
             continue
         selected_uom = row.get("uom") or stock_uoms.get(item_code)
         stock_uom = stock_uoms.get(item_code) or row.get("stock_uom") or selected_uom
-        # Only the Item master defines a UOM factor; the row's conversion_factor
-        # is client-supplied. An unknown UOM leaves the stock-UOM costs unusable.
-        factor = conversion_factors.get((item_code, selected_uom))
-        if factor is None and (selected_uom == stock_uom or not selected_uom):
-            factor = 1.0
+        if not selected_uom or selected_uom == stock_uom:
+            # StockController.reset_conversion_factor forces a stock-UOM row to 1.0.
+            master_factor = factor = 1.0
+        else:
+            # ERPNext's get_conversion_factor order: the Item, its variant template,
+            # then the global UOM Conversion Factor table.
+            master_factor = conversion_factors.get((item_code, selected_uom))
+            if master_factor is None:
+                from erpnext.stock.doctype.item.item import get_uom_conv_factor
+
+                master_factor = flt(get_uom_conv_factor(selected_uom, stock_uom))
+            if master_factor <= 0:
+                floors[index] = {"invalid_uom": True, "uom": selected_uom}
+                continue
+            # The stock ledger moves qty x the row's own conversion_factor, so never
+            # floor on fewer stock units than will actually leave the shelf.
+            factor = max(master_factor, flt(row.get("conversion_factor")))
 
         candidates_floors = []
 
@@ -445,10 +459,9 @@ def resolve_buying_floors(items, pos_profile=None, invoice_doc=None):
             None,
         )
         selected_price = exact or base
-        if selected_price and (exact or factor):
+        if selected_price:
             floor = flt(selected_price.get("price_list_rate"))
-            if not exact:
-                floor *= factor
+            floor *= factor / master_factor if exact else factor
             source_currency = (
                 selected_price.get("currency") or price_list_currency or invoice_currency
             )
@@ -482,7 +495,7 @@ def resolve_buying_floors(items, pos_profile=None, invoice_doc=None):
 
         # 2) Warehouse Bin.valuation_rate (stock items only, matching ERPNext validate_selling_price)
         warehouse = row.get("warehouse") or default_warehouse
-        if factor and is_stock_item and warehouse:
+        if is_stock_item and warehouse:
             bin_val = flt(bin_valuations.get((item_code, warehouse)))
             if bin_val > 0:
                 normalized_val = _convert_floor_to_invoice_currency(
@@ -511,7 +524,7 @@ def resolve_buying_floors(items, pos_profile=None, invoice_doc=None):
 
         # 3) Item.last_purchase_rate (matching ERPNext validate_selling_price)
         lpr = flt(meta.get("last_purchase_rate"))
-        if factor and lpr > 0:
+        if lpr > 0:
             normalized_lpr = _convert_floor_to_invoice_currency(
                 lpr * factor,
                 cost_currency,
@@ -542,9 +555,12 @@ def resolve_buying_floors(items, pos_profile=None, invoice_doc=None):
 
 
 def _applied_pricing_rule_names(value):
-    """Parse a row's ``pricing_rules`` as ERPNext stores it (JSON list or comma-separated)."""
+    """Parse a row's ``pricing_rules`` exactly as ERPNext's get_applied_pricing_rules does.
 
-    text = cstr(value).strip()
+    ERPNext compares rule names unstripped, so a padded name is not the rule it applied.
+    """
+
+    text = cstr(value)
     if not text:
         return set()
     if text.startswith("["):
@@ -554,7 +570,7 @@ def _applied_pricing_rule_names(value):
             return set()
     else:
         names = text.split(",")
-    return {cstr(name).strip() for name in names if cstr(name).strip()}
+    return {cstr(name) for name in names if cstr(name)}
 
 
 def _server_applied_free_row_indexes(item_rows, invoice_doc=None):
@@ -573,13 +589,15 @@ def _server_applied_free_row_indexes(item_rows, invoice_doc=None):
     if has_doc and cint(invoice_doc.get("ignore_pricing_rule")):
         return set()
 
+    # Raw value: ERPNext keys free rows on the unstripped Small Text, so a padded
+    # name escapes both remove_free_item and the free-row re-sizing.
     free_rules = {
-        index: cstr(row.get("pricing_rules")).strip()
+        index: cstr(row.get("pricing_rules"))
         for index, row in enumerate(item_rows)
         if hasattr(row, "get")
         and row.get("item_code")
         and cint(row.get("is_free_item"))
-        and cstr(row.get("pricing_rules")).strip()
+        and cstr(row.get("pricing_rules"))
     }
     if not free_rules:
         return set()
@@ -600,6 +618,10 @@ def _server_applied_free_row_indexes(item_rows, invoice_doc=None):
                 "company",
                 "valid_from",
                 "valid_upto",
+                "min_qty",
+                "max_qty",
+                "min_amt",
+                "max_amt",
             ],
             limit_page_length=0,
         )
@@ -607,8 +629,11 @@ def _server_applied_free_row_indexes(item_rows, invoice_doc=None):
         if rule.get("name")
     }
     paid_items_by_rule = {}
+    paid_qty = paid_amount = 0.0
     for row in item_rows:
         if hasattr(row, "get") and row.get("item_code") and not cint(row.get("is_free_item")):
+            paid_qty += flt(row.get("qty"))
+            paid_amount += flt(row.get("rate")) * flt(row.get("qty"))
             for rule_name in _applied_pricing_rule_names(row.get("pricing_rules")):
                 paid_items_by_rule.setdefault(rule_name, set()).add(row.get("item_code"))
 
@@ -631,7 +656,16 @@ def _server_applied_free_row_indexes(item_rows, invoice_doc=None):
         ):
             continue
         if rule.get("apply_on") == "Transaction":
-            gives_item = item_code == rule.get("free_item")
+            # ERPNext's own check (filter_pricing_rules_for_qty_amount) counts free
+            # rows in total_qty/total, so re-check the thresholds on paid rows only.
+            # A zero max_* is unbounded, as in ERPNext.
+            gives_item = (
+                item_code == rule.get("free_item")
+                and paid_qty >= flt(rule.get("min_qty"))
+                and (not flt(rule.get("max_qty")) or paid_qty <= flt(rule.get("max_qty")))
+                and paid_amount >= flt(rule.get("min_amt"))
+                and (not flt(rule.get("max_amt")) or paid_amount <= flt(rule.get("max_amt")))
+            )
         else:
             paid_items = paid_items_by_rule.get(rule_name) or set()
             gives_item = bool(paid_items) and (
@@ -692,6 +726,21 @@ def collect_below_buying_price_errors(
             continue
 
         floor_info = buying_floors.get(index) or {}
+        if floor_info.get("invalid_uom"):
+            item_name = row.get("item_name") or item_code
+            errors.append(
+                {
+                    "item_code": item_code,
+                    "item_name": item_name,
+                    "policy": "block",
+                    "reason": "invalid_uom",
+                    "uom": floor_info.get("uom"),
+                    "message": _(
+                        "Item {0} cannot be sold in UOM {1} because the Item has no conversion factor for it."
+                    ).format(item_name, floor_info.get("uom")),
+                }
+            )
+            continue
         floor = flt(floor_info.get("rate"))
         if floor <= 0:
             if policy.get("missing_cost_action") == "Block":
@@ -839,10 +888,10 @@ def validate_invoice_item_sale_controls(invoice_doc):
         policy=policy,
     )
     missing_cost_errors = [
-        error for error in floor_errors if error.get("reason") == "missing_buying_price"
+        error for error in floor_errors if error.get("reason") in UNOVERRIDABLE_FLOOR_REASONS
     ]
     below_cost_errors = [
-        error for error in floor_errors if error.get("reason") != "missing_buying_price"
+        error for error in floor_errors if error.get("reason") not in UNOVERRIDABLE_FLOOR_REASONS
     ]
     if not below_cost_errors or policy.get("action") != "POS Supervisor Override":
         _set_invoice_value(invoice_doc, "posa_below_cost_override", 0)

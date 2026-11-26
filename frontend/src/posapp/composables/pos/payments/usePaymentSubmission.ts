@@ -21,6 +21,7 @@ import { shouldApplyReturnRefundCap } from "../../../utils/paymentInitialization
 import {
 	findLossRiskItems,
 	getItemCostFloor,
+	isPricingRuleFreeLine,
 	resolveSaleFloorPolicy,
 } from "../../../utils/lossPrevention";
 
@@ -572,7 +573,7 @@ export function usePaymentSubmission(options: PaymentSubmissionOptions) {
 					(item: any) =>
 						!item?.is_return &&
 						!item?.posa_is_replace &&
-						!item?.is_free_item &&
+						!isPricingRuleFreeLine(item) &&
 						Number(item?.qty || 0) >= 0 &&
 						!getItemCostFloor(item),
 				)

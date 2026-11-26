@@ -193,6 +193,35 @@ export function getEffectiveSellingRate(
 	return Math.max(priceListRate - discountAmount, 0);
 }
 
+const hasMarker = (value: unknown) =>
+	Array.isArray(value) ? value.length > 0 : Boolean(value);
+
+/**
+ * Mirrors the server's `_strip_client_freebies_from_payload`: pricing-rule free
+ * lines are dropped on submit and re-derived by ERPNext, so they carry no floor.
+ * Other free rows (POS Offer give-aways, rows without a rule) are floor-checked.
+ */
+export function isPricingRuleFreeLine(
+	item: Record<string, unknown> | null | undefined,
+): boolean {
+	if (!item) {
+		return false;
+	}
+	if (hasMarker(item.auto_free_source)) {
+		return true;
+	}
+	const isFree =
+		item.is_free_item === true ||
+		item.is_free_item === 1 ||
+		item.is_free_item === "1";
+	return (
+		isFree &&
+		(hasMarker(item.source_rule) ||
+			hasMarker(item.pricing_rule) ||
+			hasMarker(item.pricing_rules))
+	);
+}
+
 export function getItemLossRisk(
 	item: Record<string, unknown> | null | undefined,
 	options: LossPreventionOptions = {},
@@ -201,9 +230,7 @@ export function getItemLossRisk(
 		!item ||
 		item.is_return ||
 		item.posa_is_replace ||
-		item.is_free_item === true ||
-		item.is_free_item === 1 ||
-		item.is_free_item === "1"
+		isPricingRuleFreeLine(item)
 	) {
 		return null;
 	}
