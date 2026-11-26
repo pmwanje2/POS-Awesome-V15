@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import frappe
@@ -158,7 +158,7 @@ def _fetch_bin_qty(warehouse: str, item_codes: Tuple[str, ...]):
 
     return frappe.get_all(
         "Bin",
-        fields=["item_code", "actual_qty"],
+        fields=["item_code", "actual_qty", "valuation_rate"],
         filters={"warehouse": warehouse, "item_code": ["in", item_codes]},
     )
 
@@ -487,6 +487,7 @@ class ItemLookupData:
     batch_map: Dict[str, List[Dict[str, Any]]]
     serial_map: Dict[str, List[Dict[str, Any]]]
     bom_map: Dict[str, Dict[str, Any]]
+    valuation_map: Dict[str, float] = field(default_factory=dict)
 
 
 def _select_price(
@@ -549,6 +550,9 @@ def merge_item_row(
     if meta.get("has_batch_no") and batch_rows:
         actual_qty = sum(flt(batch.get("batch_qty")) for batch in batch_rows if not batch.get("is_expired"))
 
+    warehouse_valuation = flt((lookup_data.valuation_map or {}).get(item_code) or 0)
+    effective_valuation = warehouse_valuation if warehouse_valuation > 0 else meta.get("valuation_rate")
+
     row = dict(item)
     row.update(
         {
@@ -560,7 +564,8 @@ def merge_item_row(
             "allow_negative_stock": meta.get("allow_negative_stock"),
             "purchase_uom": meta.get("purchase_uom"),
             "standard_rate": meta.get("standard_rate"),
-            "valuation_rate": meta.get("valuation_rate"),
+            "valuation_rate": effective_valuation,
+            "warehouse_valuation_rate": warehouse_valuation if warehouse_valuation > 0 else None,
             "last_purchase_rate": meta.get("last_purchase_rate"),
             "trade_price": buying_price_row.get("price_list_rate") if buying_price_row else None,
             "buying_rate": buying_price_row.get("price_list_rate") if buying_price_row else None,
@@ -794,6 +799,12 @@ class ItemDetailAggregator:
             buying_price_map.setdefault(row.item_code, {})[row.get("uom") or "None"] = row
 
         stock_map = {row.item_code: row.actual_qty for row in stock_rows}
+        valuation_map: Dict[str, float] = {}
+        for row in stock_rows:
+            raw_val = row.get("valuation_rate") if isinstance(row, dict) else getattr(row, "valuation_rate", 0)
+            val = flt(raw_val or 0)
+            if val > 0:
+                valuation_map[row.item_code] = val
         meta_map = {row.name: row for row in meta_rows}
 
         uom_map: Dict[str, List[Dict[str, object]]] = {}
@@ -842,6 +853,7 @@ class ItemDetailAggregator:
             batch_map=batch_map,
             serial_map=serial_map,
             bom_map=bom_map,
+            valuation_map=valuation_map,
         )
 
     def build_details(self, items_data: Sequence[Dict[str, object]]) -> List[Dict[str, object]]:

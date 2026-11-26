@@ -270,6 +270,54 @@ class TestItemFetchers(unittest.TestCase):
             for name, original in originals.items():
                 setattr(self.module, name, original)
 
+    def test_fetch_bin_qty_requests_valuation_rate_for_concrete_warehouse(self):
+        calls = []
+
+        def fake_get_all(doctype, **kwargs):
+            calls.append((doctype, kwargs))
+            return [AttrDict({"item_code": "QB-524", "actual_qty": 15, "valuation_rate": 4500})]
+
+        self.module.frappe.get_all = fake_get_all
+
+        rows = self.module._fetch_bin_qty("Shop Floor - JBS", ("QB-524",))
+
+        self.assertEqual(rows[0].valuation_rate, 4500)
+        self.assertEqual(calls[0][0], "Bin")
+        self.assertIn("valuation_rate", calls[0][1]["fields"])
+
+    def test_merge_item_row_prefers_warehouse_bin_valuation_over_zero_item_valuation(self):
+        lookup = self.module.ItemLookupData(
+            price_map={},
+            buying_price_map={},
+            stock_map={"QB-524": 15},
+            meta_map={
+                "QB-524": AttrDict(
+                    {
+                        "name": "QB-524",
+                        "stock_uom": "Nos",
+                        "valuation_rate": 0,
+                        "last_purchase_rate": 0,
+                    }
+                )
+            },
+            uom_map={},
+            barcode_map={},
+            batch_map={},
+            serial_map={},
+            bom_map={},
+            valuation_map={"QB-524": 4500.0},
+        )
+
+        row = self.module.merge_item_row(
+            {"item_code": "QB-524"},
+            lookup,
+            "UGX",
+            1,
+        )
+
+        self.assertEqual(row["valuation_rate"], 4500.0)
+        self.assertEqual(row["warehouse_valuation_rate"], 4500.0)
+
 
 if __name__ == "__main__":
     unittest.main()

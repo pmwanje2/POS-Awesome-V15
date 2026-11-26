@@ -42,7 +42,7 @@
 						<div class="below-cost-override__rates">
 							<span>{{ __("Sale") }} {{ formatRate(risk.sellingRate) }}</span>
 							<v-icon size="16">mdi-arrow-right</v-icon>
-							<strong>{{ __("Minimum") }} {{ formatRate(risk.costRate) }}</strong>
+							<strong>{{ risk.costLabel || __("Minimum") }} {{ formatRate(risk.costRate) }}</strong>
 						</div>
 					</div>
 				</div>

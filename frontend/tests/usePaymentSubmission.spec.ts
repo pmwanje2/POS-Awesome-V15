@@ -173,6 +173,118 @@ describe("usePaymentSubmission", () => {
 		);
 	});
 
+	it("requests a supervisor override for a below-cost POS Offer give-away", async () => {
+		const requestBelowCostOverride = vi.fn().mockResolvedValue({
+			approved: true,
+			reason: "Approved offer give-away",
+		});
+		const invoiceDoc = ref<any>({
+			is_return: 0,
+			items: [
+				{ item_code: "PAID", qty: 1, rate: 20, trade_price: 10 },
+				{
+					item_code: "GIFT",
+					qty: 1,
+					rate: 0,
+					trade_price: 10,
+					is_free_item: 1,
+					posa_is_offer: 1,
+				},
+			],
+			payments: [{ mode_of_payment: "Cash", amount: 20, type: "Cash" }],
+			rounded_total: 20,
+			grand_total: 20,
+		});
+		const { validateSubmission } = usePaymentSubmission({
+			invoiceDoc,
+			posProfile: ref({
+				posa_below_cost_action: "POS Supervisor Override",
+			}),
+			stockSettings: ref({}),
+			invoiceType: ref("Invoice"),
+			formatFloat: (value) => Number(value || 0),
+			requestBelowCostOverride,
+			diff_payment: ref(0) as any,
+			isCashback: ref(true),
+		});
+
+		await expect(validateSubmission(true)).resolves.toBe(true);
+		expect(requestBelowCostOverride).toHaveBeenCalledTimes(1);
+		expect(invoiceDoc.value.posa_below_cost_override).toBe(1);
+	});
+
+	it("blocks a POS Offer give-away with no buying floor when missing cost is Block", async () => {
+		const invoiceDoc = ref<any>({
+			is_return: 0,
+			items: [
+				{ item_code: "PAID", qty: 1, rate: 20, trade_price: 10 },
+				{
+					item_code: "GIFT",
+					item_name: "Offer Gift",
+					qty: 1,
+					rate: 0,
+					is_free_item: 1,
+					posa_is_offer: 1,
+				},
+			],
+			payments: [{ mode_of_payment: "Cash", amount: 20, type: "Cash" }],
+			rounded_total: 20,
+			grand_total: 20,
+		});
+		const { validateSubmission } = usePaymentSubmission({
+			invoiceDoc,
+			posProfile: ref({ posa_missing_cost_action: "Block" }),
+			stockSettings: ref({}),
+			invoiceType: ref("Invoice"),
+			formatFloat: (value) => Number(value || 0),
+			stores: { toastStore: { show: vi.fn() } },
+			diff_payment: ref(0) as any,
+			isCashback: ref(true),
+		});
+
+		await expect(validateSubmission(true)).rejects.toThrow(
+			/no valid buying floor is available for Offer Gift/i,
+		);
+	});
+
+	it("does not ask for an override on the till's pricing rule free lines", async () => {
+		const requestBelowCostOverride = vi.fn();
+		const invoiceDoc = ref<any>({
+			is_return: 0,
+			items: [
+				{ item_code: "PAID", qty: 1, rate: 20, trade_price: 10 },
+				{
+					item_code: "PROMO",
+					qty: 1,
+					rate: 0,
+					trade_price: 10,
+					is_free_item: 1,
+					source_rule: "PR-FREE",
+					auto_free_source: "PR-FREE::PAID::PROMO",
+				},
+			],
+			payments: [{ mode_of_payment: "Cash", amount: 20, type: "Cash" }],
+			rounded_total: 20,
+			grand_total: 20,
+		});
+		const { validateSubmission } = usePaymentSubmission({
+			invoiceDoc,
+			posProfile: ref({
+				posa_below_cost_action: "POS Supervisor Override",
+				posa_missing_cost_action: "Block",
+			}),
+			stockSettings: ref({}),
+			invoiceType: ref("Invoice"),
+			formatFloat: (value) => Number(value || 0),
+			requestBelowCostOverride,
+			diff_payment: ref(0) as any,
+			isCashback: ref(true),
+		});
+
+		await expect(validateSubmission(true)).resolves.toBe(true);
+		expect(requestBelowCostOverride).not.toHaveBeenCalled();
+	});
+
 	it("defers print and schedules background wait when invoice submission is queued", async () => {
 		const invoiceService = (
 			await import("../src/posapp/services/invoiceService")
