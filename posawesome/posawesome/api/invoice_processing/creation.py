@@ -113,6 +113,19 @@ FALLBACK_INVOICE_CHILD_TABLE_FIELDS = (
     "sales_team",
     "payment_schedule",
     "timesheets",
+    "gift_card_redemptions",
+    "posa_change_returns",
+)
+CHILD_ROW_IDENTITY_AND_AUDIT_FIELDS = (
+    "name",
+    "parent",
+    "parenttype",
+    "parentfield",
+    "docstatus",
+    "creation",
+    "owner",
+    "modified",
+    "modified_by",
 )
 DEADLOCK_RETRY_DELAYS = (0.08, 0.2)
 
@@ -1265,7 +1278,7 @@ def _build_fresh_invoice_payload(data, doctype):
     ):
         fresh_data.pop(fieldname, None)
 
-    return fresh_data
+    return _sanitize_new_invoice_child_rows(fresh_data, doctype=doctype)
 
 
 def _clear_stale_party_fields_in_payload(
@@ -1330,6 +1343,69 @@ def _clear_stale_party_fields_for_customer_change(
     return invoice_doc
 
 
+def _is_valid_child_row_name(value):
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return value != 0
+    if isinstance(value, str):
+        return bool(value.strip())
+    return False
+
+
+def _resolve_child_table_doctype(invoice_doc, fieldname, fallback=None):
+    doctype = (
+        invoice_doc.get("doctype")
+        if hasattr(invoice_doc, "get")
+        else getattr(invoice_doc, "doctype", None)
+    )
+    meta_candidates = [getattr(invoice_doc, "meta", None)]
+    get_meta = getattr(frappe, "get_meta", None)
+    if doctype and callable(get_meta):
+        try:
+            meta_candidates.append(get_meta(doctype))
+        except Exception:
+            pass
+
+    for meta_obj in meta_candidates:
+        get_field = getattr(meta_obj, "get_field", None)
+        if not callable(get_field):
+            continue
+        try:
+            df = get_field(fieldname)
+        except Exception:
+            df = None
+        if df:
+            options = df.get("options") if isinstance(df, dict) else getattr(df, "options", None)
+            if options:
+                return options
+    return fallback
+
+
+def _get_value_for_update(doctype, name, fieldname):
+    try:
+        return frappe.db.get_value(doctype, name, fieldname, for_update=True)
+    except TypeError:
+        return frappe.db.get_value(doctype, name, fieldname)
+
+
+def _get_values_for_update(doctype, filters, fieldname):
+    get_values_fn = getattr(getattr(frappe, "db", None), "get_values", None)
+    if not callable(get_values_fn):
+        return None
+    try:
+        return get_values_fn(doctype, filters, fieldname, for_update=True)
+    except TypeError:
+        return get_values_fn(doctype, filters, fieldname)
+
+
+def _get_doc_for_update(doctype, name):
+    try:
+        return frappe.get_doc(doctype, name, for_update=True)
+    except TypeError:
+        return frappe.get_doc(doctype, name)
+
+
 def _get_invoice_child_table_fields(invoice_doc):
     fields = []
     seen = set()
@@ -1353,7 +1429,7 @@ def _get_invoice_child_table_fields(invoice_doc):
                 fields.append(fieldname)
 
     _add_fields(getattr(invoice_doc, "meta", None))
-    if not fields:
+    if not fields and invoice_doc is not None:
         doctype = (
             invoice_doc.get("doctype")
             if hasattr(invoice_doc, "get")
@@ -1374,13 +1450,81 @@ def _get_invoice_child_table_fields(invoice_doc):
     return tuple(fields)
 
 
-def _collect_live_child_row_names(invoice_doc, fieldname):
+def _sanitize_new_invoice_child_rows(payload, doctype=None):
+    """Strip child row identity and audit fields for brand-new or recreated draft payloads."""
+    if not isinstance(payload, dict):
+        return payload
+
+    effective_doctype = doctype or payload.get("doctype")
+    sanitized_payload = dict(payload)
+    table_fields = _get_invoice_child_table_fields(
+        {"doctype": effective_doctype} if effective_doctype else None
+    )
+
+    for fieldname in table_fields:
+        incoming_rows = sanitized_payload.get(fieldname)
+        if not isinstance(incoming_rows, list) or not incoming_rows:
+            continue
+
+        cleaned_rows = []
+        for row in incoming_rows:
+            if isinstance(row, dict):
+                clean_row = dict(row)
+            elif hasattr(row, "as_dict") and callable(row.as_dict):
+                dict_cls = getattr(frappe, "_dict", dict)
+                clean_row = dict_cls(row.as_dict())
+            else:
+                cleaned_rows.append(row)
+                continue
+
+            for audit_field in CHILD_ROW_IDENTITY_AND_AUDIT_FIELDS:
+                clean_row.pop(audit_field, None)
+            clean_row["__islocal"] = 1
+            cleaned_rows.append(clean_row)
+
+        sanitized_payload[fieldname] = cleaned_rows
+
+    return sanitized_payload
+
+
+def _collect_live_child_row_names(invoice_doc, fieldname, *, lock_live_rows=False):
     live_names = set()
     parent_name = (
         invoice_doc.get("name")
         if hasattr(invoice_doc, "get")
         else getattr(invoice_doc, "name", None)
     )
+    parent_doctype = (
+        invoice_doc.get("doctype")
+        if hasattr(invoice_doc, "get")
+        else getattr(invoice_doc, "doctype", None)
+    )
+
+    if lock_live_rows and parent_name and parent_doctype:
+        fallback_dt = f"{parent_doctype} Item" if fieldname == "items" else None
+        child_doctype = _resolve_child_table_doctype(invoice_doc, fieldname, fallback=fallback_dt)
+        if child_doctype:
+            db_rows = _get_values_for_update(
+                child_doctype,
+                {
+                    "parent": parent_name,
+                    "parenttype": parent_doctype,
+                    "parentfield": fieldname,
+                },
+                "name",
+            )
+            if db_rows is not None:
+                for db_row in db_rows:
+                    if isinstance(db_row, dict):
+                        db_name = db_row.get("name")
+                    elif isinstance(db_row, (tuple, list)):
+                        db_name = db_row[0] if db_row else None
+                    else:
+                        db_name = db_row
+                    if _is_valid_child_row_name(db_name):
+                        live_names.add(db_name)
+                return live_names
+
     existing_rows = (
         invoice_doc.get(fieldname)
         if hasattr(invoice_doc, "get")
@@ -1395,7 +1539,7 @@ def _collect_live_child_row_names(invoice_doc, fieldname):
             row_name = getattr(row, "name", None)
             is_local = cint(getattr(row, "__islocal", 0))
             row_parent = getattr(row, "parent", None)
-        if not row_name or is_local:
+        if is_local or not _is_valid_child_row_name(row_name):
             continue
         if parent_name and row_parent and row_parent != parent_name:
             continue
@@ -1403,11 +1547,12 @@ def _collect_live_child_row_names(invoice_doc, fieldname):
     return live_names
 
 
-def _sanitize_stale_child_row_names(invoice_doc, payload):
+def _sanitize_stale_child_row_names(invoice_doc, payload, *, lock_live_rows=False):
     """Strip child row names not attached to invoice_doc so Frappe inserts instead of 0-row UPDATE."""
     if not invoice_doc or not isinstance(payload, dict):
         return payload
 
+    sanitized_payload = dict(payload)
     parent_name = (
         invoice_doc.get("name")
         if hasattr(invoice_doc, "get")
@@ -1420,17 +1565,21 @@ def _sanitize_stale_child_row_names(invoice_doc, payload):
     )
 
     for fieldname in _get_invoice_child_table_fields(invoice_doc):
-        incoming_rows = payload.get(fieldname)
+        incoming_rows = sanitized_payload.get(fieldname)
         if not isinstance(incoming_rows, list) or not incoming_rows:
             continue
 
-        live_names = _collect_live_child_row_names(invoice_doc, fieldname)
+        live_names = _collect_live_child_row_names(
+            invoice_doc,
+            fieldname,
+            lock_live_rows=lock_live_rows,
+        )
         seen_live_names = set()
         sanitized_rows = []
 
         for row in incoming_rows:
             if isinstance(row, dict):
-                clean_row = row
+                clean_row = dict(row)
             elif hasattr(row, "as_dict") and callable(row.as_dict):
                 dict_cls = getattr(frappe, "_dict", dict)
                 clean_row = dict_cls(row.as_dict())
@@ -1439,28 +1588,16 @@ def _sanitize_stale_child_row_names(invoice_doc, payload):
                 continue
 
             row_name = clean_row.get("name")
-            if row_name:
-                if row_name in live_names and row_name not in seen_live_names:
-                    seen_live_names.add(row_name)
-                    if parent_name and clean_row.get("parent") and clean_row.get("parent") != parent_name:
-                        clean_row.pop("parent", None)
-                    if (
-                        parent_doctype
-                        and clean_row.get("parenttype")
-                        and clean_row.get("parenttype") != parent_doctype
-                    ):
-                        clean_row.pop("parenttype", None)
-                    if clean_row.get("parentfield") and clean_row.get("parentfield") != fieldname:
-                        clean_row.pop("parentfield", None)
-                else:
-                    clean_row.pop("name", None)
-                    clean_row["__islocal"] = 1
-                    clean_row.pop("parent", None)
-                    clean_row.pop("parenttype", None)
-                    clean_row.pop("parentfield", None)
-            else:
-                if "name" in clean_row and not row_name:
-                    clean_row.pop("name", None)
+            is_local = bool(cint(clean_row.get("__islocal")))
+            is_valid_name = _is_valid_child_row_name(row_name)
+
+            if (
+                not is_local
+                and is_valid_name
+                and row_name in live_names
+                and row_name not in seen_live_names
+            ):
+                seen_live_names.add(row_name)
                 if parent_name and clean_row.get("parent") and clean_row.get("parent") != parent_name:
                     clean_row.pop("parent", None)
                 if (
@@ -1471,12 +1608,18 @@ def _sanitize_stale_child_row_names(invoice_doc, payload):
                     clean_row.pop("parenttype", None)
                 if clean_row.get("parentfield") and clean_row.get("parentfield") != fieldname:
                     clean_row.pop("parentfield", None)
+            else:
+                clean_row.pop("name", None)
+                clean_row["__islocal"] = 1
+                clean_row.pop("parent", None)
+                clean_row.pop("parenttype", None)
+                clean_row.pop("parentfield", None)
 
             sanitized_rows.append(clean_row)
 
-        payload[fieldname] = sanitized_rows
+        sanitized_payload[fieldname] = sanitized_rows
 
-    return payload
+    return sanitized_payload
 
 
 def _assert_persisted_invoice_items(invoice_doc, *, require_non_empty=False):
@@ -1490,8 +1633,10 @@ def _assert_persisted_invoice_items(invoice_doc, *, require_non_empty=False):
             )
         return
 
-    count_fn = getattr(getattr(frappe, "db", None), "count", None)
-    if not callable(count_fn):
+    db = getattr(frappe, "db", None)
+    get_values_fn = getattr(db, "get_values", None)
+    count_fn = getattr(db, "count", None)
+    if not callable(get_values_fn) and not callable(count_fn):
         return
 
     doctype = (
@@ -1539,12 +1684,25 @@ def _assert_persisted_invoice_items(invoice_doc, *, require_non_empty=False):
                 validation_error,
             )
 
-    item_doctype = f"{doctype} Item"
-    filters = {"parent": invoice_name}
+    item_doctype = _resolve_child_table_doctype(
+        invoice_doc,
+        "items",
+        fallback=f"{doctype} Item",
+    )
+    filters = {
+        "parent": invoice_name,
+        "parenttype": doctype,
+        "parentfield": "items",
+    }
     if require_non_empty:
         filters["docstatus"] = 1
 
-    persisted_count = cint(count_fn(item_doctype, filters))
+    if callable(get_values_fn):
+        rows = _get_values_for_update(item_doctype, filters, "name")
+        persisted_count = len(rows or ())
+    else:
+        persisted_count = cint(count_fn(item_doctype, filters))
+
     if (require_non_empty and persisted_count < 1) or persisted_count != expected_count:
         frappe.throw(
             _(
@@ -1567,9 +1725,14 @@ def _merge_draft_state_onto_latest_doc(invoice_doc, latest_doc):
         "doctype",
     ):
         current_state.pop(fieldname, None)
-    _sanitize_stale_child_row_names(latest_doc, current_state)
-    latest_doc.update(current_state)
+    sanitized_state = _sanitize_stale_child_row_names(
+        latest_doc,
+        current_state,
+        lock_live_rows=True,
+    )
+    latest_doc.update(sanitized_state)
     latest_doc.flags.ignore_permissions = getattr(invoice_doc.flags, "ignore_permissions", False)
+    latest_doc.flags.ignore_pricing_rule = getattr(invoice_doc.flags, "ignore_pricing_rule", False)
     return latest_doc
 
 
@@ -1621,11 +1784,11 @@ def _get_mutable_invoice_doc(data, doctype, pos_profile, company, opening_shift_
         opening_shift_doc=opening_shift_doc,
     )
 
-    _sanitize_stale_child_row_names(invoice_doc, data)
-    invoice_doc.update(data)
+    sanitized_data = _sanitize_stale_child_row_names(invoice_doc, data)
+    invoice_doc.update(sanitized_data)
     invoice_doc = _clear_stale_party_fields_for_customer_change(
         invoice_doc,
-        data,
+        sanitized_data,
         previous_customer,
         previous_values=previous_values,
     )
@@ -1635,7 +1798,8 @@ def _get_mutable_invoice_doc(data, doctype, pos_profile, company, opening_shift_
 def _new_till_draft(payload, pos_profile, company, opening_shift_doc):
     """Build a new till draft and pass it through the same gate before its first save."""
 
-    invoice_doc = frappe.get_doc(payload)
+    sanitized_payload = _sanitize_new_invoice_child_rows(payload)
+    invoice_doc = frappe.get_doc(sanitized_payload)
     return _assert_till_draft_authority(
         invoice_doc,
         pos_profile=pos_profile,
@@ -1650,18 +1814,18 @@ def _save_draft_with_latest_timestamp(invoice_doc, retries=2):
     while True:
         _enforce_return_pricing_invariant(invoice_doc)
         if invoice_doc.name and not invoice_doc.is_new():
-            latest_modified = frappe.db.get_value(invoice_doc.doctype, invoice_doc.name, "modified")
+            latest_modified = _get_value_for_update(
+                invoice_doc.doctype,
+                invoice_doc.name,
+                "modified",
+            )
             if latest_modified:
                 current_modified = invoice_doc.get("modified")
-                if current_modified and str(latest_modified) != str(current_modified):
-                    latest_doc = frappe.get_doc(invoice_doc.doctype, invoice_doc.name)
+                if not current_modified or str(latest_modified) != str(current_modified):
+                    latest_doc = _get_doc_for_update(invoice_doc.doctype, invoice_doc.name)
                     if latest_doc is not None:
                         invoice_doc = _merge_draft_state_onto_latest_doc(invoice_doc, latest_doc)
                         _enforce_return_pricing_invariant(invoice_doc)
-                    else:
-                        invoice_doc.modified = latest_modified
-                else:
-                    invoice_doc.modified = latest_modified
 
         try:
             invoice_doc.save()
@@ -1671,7 +1835,11 @@ def _save_draft_with_latest_timestamp(invoice_doc, retries=2):
             if attempts >= retries or not invoice_doc.name:
                 raise
             attempts += 1
-            latest_doc = frappe.get_doc(invoice_doc.doctype, invoice_doc.name)
+            latest_doc = _get_doc_for_update(invoice_doc.doctype, invoice_doc.name)
+            if latest_doc is None:
+                latest_doc = getattr(invoice_doc, "_doc_before_save", None)
+            if latest_doc is None:
+                raise
             invoice_doc = _merge_draft_state_onto_latest_doc(invoice_doc, latest_doc)
 
 
@@ -2413,7 +2581,7 @@ def _submit_invoice_once(invoice, data, submit_in_background=False):
             company=company,
             opening_shift_doc=opening_shift_doc,
         )
-        _sanitize_stale_child_row_names(invoice_doc, invoice)
+        invoice = _sanitize_stale_child_row_names(invoice_doc, invoice)
         invoice_doc.update(invoice)
 
     _validate_effective_return_reference(invoice_doc, doctype, company)
