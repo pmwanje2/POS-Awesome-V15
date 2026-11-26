@@ -67,6 +67,16 @@ class TestItemSaleControls(unittest.TestCase):
         self.frappe.db.get_value = lambda *args, **kwargs: None
         self.frappe.db.get_single_value = lambda *args, **kwargs: None
         self.frappe.db.exists = lambda *args, **kwargs: False
+        self.global_uom_factors = {}
+        self.global_uom_calls = []
+        item_module = types.ModuleType("erpnext.stock.doctype.item.item")
+
+        def get_uom_conv_factor(uom, stock_uom):
+            self.global_uom_calls.append((uom, stock_uom))
+            return self.global_uom_factors.get((uom, stock_uom))
+
+        item_module.get_uom_conv_factor = get_uom_conv_factor
+        sys.modules["erpnext.stock.doctype.item.item"] = item_module
 
     def _install_buying_price(self, rate=12.75, uom="Nos", currency="PKR"):
         self.frappe.db.get_single_value = lambda *args, **kwargs: "Standard Buying"
@@ -791,7 +801,7 @@ class TestItemSaleControls(unittest.TestCase):
         self._install_promotional_rule()
 
         errors = self.controls.collect_below_buying_price_errors(
-            [self._promo_trigger_row("PR-OTHER, PR-FREE"), self._promo_free_row()],
+            [self._promo_trigger_row("PR-OTHER,PR-FREE"), self._promo_free_row()],
             invoice_doc=dict(self.PROMO_INVOICE),
         )
 
@@ -856,6 +866,8 @@ class TestItemSaleControls(unittest.TestCase):
                 "PR-FREE",
                 "",
             ),
+            "paid row comma list pads the rule name": ({}, "PR-FREE", "PR-OTHER, PR-FREE"),
+            "paid row JSON list pads the rule name": ({}, "PR-FREE", '[" PR-FREE"]'),
         }
         for label, (overrides, free_rule, trigger_rules) in scenarios.items():
             with self.subTest(label):
@@ -953,7 +965,7 @@ class TestItemSaleControls(unittest.TestCase):
         )
 
         self.assertEqual(len(errors), 1)
-        self.assertEqual(errors[0]["reason"], "missing_buying_price")
+        self.assertEqual(errors[0]["reason"], "invalid_uom")
 
     def test_known_uom_ignores_client_conversion_factor(self):
         self._install_buying_price(rate=12.75, uom="Nos")
@@ -1116,6 +1128,255 @@ class TestItemSaleControls(unittest.TestCase):
             '"cost_source":"warehouse_valuation"',
             invoice["posa_below_cost_override_details"],
         )
+
+    def test_whitespace_padded_free_row_rule_name_is_not_exempt(self):
+        # ERPNext matches free rows on the raw pricing_rules string
+        # (remove_free_item, apply_pricing_rule_for_free_items) and Frappe does not
+        # strip Small Text, so a padded name escapes both and must not match here.
+        paddings = (" PR-FREE", "PR-FREE ", "\tPR-FREE", "\u00a0PR-FREE")
+        for apply_on, trigger_rules in (("Item Code", '["PR-FREE"]'), ("Transaction", "")):
+            for padded in paddings:
+                with self.subTest(apply_on=apply_on, pricing_rules=repr(padded)):
+                    self._install_promotional_rule(apply_on=apply_on)
+
+                    errors = self.controls.collect_below_buying_price_errors(
+                        [
+                            self._promo_trigger_row(trigger_rules),
+                            self._promo_free_row(padded, rate=1),
+                        ],
+                        invoice_doc=dict(self.PROMO_INVOICE),
+                    )
+
+                    self.assertEqual(len(errors), 1)
+                    self.assertEqual(errors[0]["item_code"], "LOW")
+                    self.assertEqual(errors[0]["reason"], "below_buying_price")
+
+    def test_forged_free_row_cannot_meet_transaction_rule_thresholds_alone(self):
+        # ERPNext counts free rows in total_qty/total before it matches Transaction
+        # rules, so a forged free row could qualify the rule by itself. The trigger
+        # row is the only paid row: qty 5, amount 2500. The free row sells at 1.
+        scenarios = {
+            "paid qty below min_qty": ({"min_qty": 10}, 1),
+            "paid amount below min_amt": ({"min_amt": 5000}, 1),
+            "paid qty above max_qty": ({"max_qty": 3}, 1),
+            "paid amount above max_amt": ({"max_amt": 1000}, 1),
+            "free row qty would meet min_qty": ({"min_qty": 10}, 5),
+            "free row amount would meet min_amt": ({"min_amt": 5000}, 2500),
+        }
+        for label, (thresholds, free_qty) in scenarios.items():
+            with self.subTest(label):
+                self._install_promotional_rule(apply_on="Transaction", **thresholds)
+                free_row = self._promo_free_row(rate=1)
+                free_row["qty"] = free_qty
+
+                errors = self.controls.collect_below_buying_price_errors(
+                    [self._promo_trigger_row(""), free_row],
+                    invoice_doc=dict(self.PROMO_INVOICE),
+                )
+
+                self.assertEqual(len(errors), 1)
+                self.assertEqual(errors[0]["item_code"], "LOW")
+                self.assertEqual(errors[0]["reason"], "below_buying_price")
+
+    def test_transaction_rule_thresholds_met_by_paid_rows_exempt_free_row(self):
+        self._install_promotional_rule(
+            apply_on="Transaction",
+            min_qty=5,
+            max_qty=10,
+            min_amt=2500,
+            max_amt=10000,
+        )
+
+        errors = self.controls.collect_below_buying_price_errors(
+            [self._promo_trigger_row(""), self._promo_free_row()],
+            invoice_doc=dict(self.PROMO_INVOICE),
+        )
+
+        self.assertEqual(errors, [])
+
+    def test_unknown_uom_is_refused_even_when_missing_cost_is_allowed(self):
+        # ERPNext moves qty x the row's own conversion_factor in stock, so a UOM
+        # with no master factor cannot be priced against any floor.
+        self._install_buying_price(rate=100, uom="Nos")
+
+        errors = self.controls.collect_below_buying_price_errors(
+            [
+                {
+                    "item_code": "LOW",
+                    "item_name": "Crated Item",
+                    "qty": 1,
+                    "rate": 1,
+                    "uom": "Crate",
+                    "conversion_factor": 1000,
+                }
+            ]
+        )
+
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(errors[0]["reason"], "invalid_uom")
+        self.assertEqual(errors[0]["policy"], "block")
+        self.assertEqual(self.global_uom_calls, [("Crate", "Nos")])
+
+    def test_invalid_uom_refusal_cannot_be_downgraded_or_overridden(self):
+        invalid_uom_error = {
+            "item_code": "LOW",
+            "policy": "block",
+            "reason": "invalid_uom",
+            "message": "invalid uom",
+        }
+        for action in ("Warning Only", "POS Supervisor Override"):
+            with self.subTest(action):
+                invoice = {
+                    "items": [{"item_code": "LOW", "qty": 1, "rate": 1, "uom": "Crate"}],
+                    "pos_profile": "Main POS",
+                    "posa_below_cost_override": 1,
+                    "posa_below_cost_override_reason": "Approved clearance",
+                }
+                authorize = Mock(return_value="supervisor@example.com")
+
+                with (
+                    patch.object(
+                        self.controls, "collect_item_sale_control_errors", return_value=[]
+                    ),
+                    patch.object(
+                        self.controls,
+                        "collect_below_buying_price_errors",
+                        return_value=[dict(invalid_uom_error)],
+                    ),
+                    patch.object(
+                        self.controls,
+                        "resolve_sale_floor_policy",
+                        return_value={"enabled": True, "action": action},
+                    ),
+                    patch.object(self.controls, "_authorize_below_cost_override", authorize),
+                ):
+                    with self.assertRaisesRegex(Exception, "invalid uom"):
+                        self.controls.validate_invoice_item_sale_controls(invoice)
+
+                authorize.assert_not_called()
+
+    def test_inflated_client_conversion_factor_raises_floor(self):
+        # Box is 10 Nos on the Item, but ERPNext would move 1000 Nos for this row.
+        self._install_buying_price(rate=100, uom="Nos")
+        base_get_all = self.frappe.get_all
+
+        def get_all(doctype, *args, **kwargs):
+            if doctype == "UOM Conversion Detail":
+                return [{"parent": "LOW", "uom": "Box", "conversion_factor": 10}]
+            return base_get_all(doctype, *args, **kwargs)
+
+        self.frappe.get_all = get_all
+
+        errors = self.controls.collect_below_buying_price_errors(
+            [
+                {
+                    "item_code": "LOW",
+                    "item_name": "Boxed Item",
+                    "qty": 1,
+                    "rate": 1000,
+                    "uom": "Box",
+                    "conversion_factor": 1000,
+                }
+            ]
+        )
+
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(errors[0]["reason"], "below_buying_price")
+        self.assertEqual(errors[0]["buying_rate"], 100000)
+
+    def test_inflated_client_conversion_factor_scales_exact_uom_price(self):
+        self._install_buying_price(rate=1000, uom="Box")
+        base_get_all = self.frappe.get_all
+
+        def get_all(doctype, *args, **kwargs):
+            if doctype == "UOM Conversion Detail":
+                return [{"parent": "LOW", "uom": "Box", "conversion_factor": 10}]
+            return base_get_all(doctype, *args, **kwargs)
+
+        self.frappe.get_all = get_all
+
+        errors = self.controls.collect_below_buying_price_errors(
+            [
+                {
+                    "item_code": "LOW",
+                    "item_name": "Boxed Item",
+                    "qty": 1,
+                    "rate": 1000,
+                    "uom": "Box",
+                    "conversion_factor": 1000,
+                }
+            ]
+        )
+
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(errors[0]["reason"], "below_buying_price")
+        self.assertEqual(errors[0]["buying_rate"], 100000)
+
+    def test_stock_uom_row_ignores_client_conversion_factor(self):
+        # StockController.reset_conversion_factor sets a stock-UOM row back to 1.0.
+        self._install_buying_price(rate=100, uom="Nos")
+
+        errors = self.controls.collect_below_buying_price_errors(
+            [
+                {
+                    "item_code": "LOW",
+                    "item_name": "Loose Item",
+                    "qty": 1,
+                    "rate": 100,
+                    "uom": "Nos",
+                    "conversion_factor": 5,
+                }
+            ]
+        )
+
+        self.assertEqual(errors, [])
+
+    def test_global_uom_conversion_factor_resolves_unlisted_uom(self):
+        # Same fallback as ERPNext's get_conversion_factor: the Item and template
+        # have no row for this UOM, so ERPNext's get_uom_conv_factor decides.
+        scenarios = {
+            "kilogram sold from gram stock": ("Gram", "Kg", 1000, 0.1, 50, 100),
+            "gram sold from kilogram stock": ("Kg", "Gram", 0.001, 1000, 0.5, 1),
+        }
+        for label, (stock_uom, uom, factor, stock_cost, rate, floor) in scenarios.items():
+            with self.subTest(label):
+                self._install_buying_price(rate=stock_cost, uom=stock_uom)
+                base_get_all = self.frappe.get_all
+
+                def get_all(doctype, *args, _stock_uom=stock_uom, _base=base_get_all, **kwargs):
+                    if doctype == "Item":
+                        return [
+                            {
+                                "item_code": "LOW",
+                                "stock_uom": _stock_uom,
+                                "is_stock_item": 1,
+                                "last_purchase_rate": 0,
+                                "valuation_rate": 0,
+                            }
+                        ]
+                    return _base(doctype, *args, **kwargs)
+
+                self.frappe.get_all = get_all
+                self.global_uom_factors = {(uom, stock_uom): factor}
+                self.global_uom_calls = []
+
+                errors = self.controls.collect_below_buying_price_errors(
+                    [
+                        {
+                            "item_code": "LOW",
+                            "item_name": "Weighed Item",
+                            "qty": 1,
+                            "rate": rate,
+                            "uom": uom,
+                            "conversion_factor": factor,
+                        }
+                    ]
+                )
+
+                self.assertEqual(self.global_uom_calls, [(uom, stock_uom)])
+                self.assertEqual(len(errors), 1)
+                self.assertEqual(errors[0]["reason"], "below_buying_price")
+                self.assertAlmostEqual(errors[0]["buying_rate"], floor)
 
 
 if __name__ == "__main__":

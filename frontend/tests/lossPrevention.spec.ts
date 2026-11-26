@@ -174,15 +174,93 @@ describe("loss prevention", () => {
 		expect(risk?.costRate).toBeCloseTo(40);
 	});
 
-	it("excludes free promotional items from below-cost risk", () => {
+	it("excludes ERPNext pricing rule free items from below-cost risk", () => {
 		expect(
 			getItemLossRisk({
 				item_code: "PROMO",
 				qty: 1,
 				rate: 0,
 				is_free_item: 1,
+				pricing_rules: "PR-FREE",
 				valuation_rate: 4500,
 			}),
 		).toBeNull();
+	});
+
+	it("excludes the till's own pricing rule free lines, which the server re-derives", () => {
+		expect(
+			getItemLossRisk({
+				item_code: "PROMO",
+				qty: 1,
+				rate: 0,
+				is_free_item: 1,
+				source_rule: "PR-FREE",
+				auto_free_source: "PR-FREE::TRIG::PROMO",
+				valuation_rate: 4500,
+			}),
+		).toBeNull();
+	});
+
+	it("excludes every pricing rule free line the server strips and re-derives", () => {
+		const markers = [
+			{ is_free_item: 1, auto_free_source: "PR-FREE::TRIG::PROMO" },
+			{ auto_free_source: "PR-FREE::TRIG::PROMO" },
+			{ is_free_item: 1, source_rule: "PR-FREE" },
+			{ is_free_item: 1, pricing_rule: "PR-FREE" },
+			{ is_free_item: 1, pricing_rules: ["PR-FREE"] },
+		];
+		for (const marker of markers) {
+			expect(
+				getItemLossRisk({
+					item_code: "PROMO",
+					qty: 1,
+					rate: 0,
+					valuation_rate: 4500,
+					...marker,
+				}),
+			).toBeNull();
+		}
+	});
+
+	it("still evaluates paid rows that carry a pricing rule", () => {
+		const risk = getItemLossRisk({
+			item_code: "DISC",
+			qty: 1,
+			rate: 9,
+			trade_price: 10,
+			pricing_rules: "PR-DISC",
+			source_rule: "PR-DISC",
+		});
+
+		expect(risk?.belowCost).toBe(true);
+	});
+
+	it("evaluates POS Offer give-aways for below-cost risk", () => {
+		const risk = getItemLossRisk({
+			item_code: "GIFT",
+			qty: 1,
+			rate: 0,
+			is_free_item: 1,
+			posa_is_offer: 1,
+			valuation_rate: 4500,
+		});
+
+		expect(risk?.belowCost).toBe(true);
+		expect(risk?.costRate).toBe(4500);
+	});
+
+	it("evaluates free rows without a pricing rule for below-cost risk", () => {
+		for (const pricingRules of [undefined, "", []]) {
+			const risk = getItemLossRisk({
+				item_code: "FORGED",
+				qty: 1,
+				rate: 0,
+				is_free_item: 1,
+				pricing_rules: pricingRules,
+				valuation_rate: 4500,
+			});
+
+			expect(risk?.belowCost).toBe(true);
+		}
 	});
 });
