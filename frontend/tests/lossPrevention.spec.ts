@@ -135,4 +135,54 @@ describe("loss prevention", () => {
 		expect(risk?.sellingRate).toBeCloseTo(94.5);
 		expect(risk?.costRate).toBe(100);
 	});
+
+	it("selects the highest cost floor across buying price, warehouse valuation and last purchase rate", () => {
+		const risk = getItemLossRisk({
+			item_code: "QB-524",
+			item_name: "RONG PLASTIC TOOTHPICKS WOODEN MED",
+			qty: 1,
+			rate: 2000,
+			uom: "Nos",
+			stock_uom: "Nos",
+			conversion_factor: 1,
+			conversion_rate: 1,
+			buying_rate: 1500,
+			valuation_rate: 4500,
+			last_purchase_rate: 3000,
+		});
+
+		expect(risk?.belowCost).toBe(true);
+		expect(risk?.costField).toBe("valuation_rate");
+		expect(risk?.costLabel).toBe("Warehouse Valuation");
+		expect(risk?.costRate).toBe(4500);
+	});
+
+	it("scales warehouse valuation_rate by conversion_factor and company currency", () => {
+		const risk = getItemLossRisk({
+			item_code: "BOXED",
+			qty: 1,
+			rate: 35,
+			uom: "Box",
+			stock_uom: "Nos",
+			conversion_factor: 10,
+			conversion_rate: 250,
+			valuation_rate: 1000,
+		});
+
+		expect(risk?.belowCost).toBe(true);
+		expect(risk?.costField).toBe("valuation_rate");
+		expect(risk?.costRate).toBeCloseTo(40);
+	});
+
+	it("excludes free promotional items from below-cost risk", () => {
+		expect(
+			getItemLossRisk({
+				item_code: "PROMO",
+				qty: 1,
+				rate: 0,
+				is_free_item: 1,
+				valuation_rate: 4500,
+			}),
+		).toBeNull();
+	});
 });

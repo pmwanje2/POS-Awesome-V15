@@ -490,6 +490,322 @@ class TestItemSaleControls(unittest.TestCase):
 
         validator.assert_not_called()
 
+    def test_warehouse_bin_valuation_blocks_pos_sale_without_buying_price(self):
+        self.frappe.db.get_value = lambda doctype, *args, **kwargs: (
+            "UGX"
+            if doctype == "Company"
+            else ("Shop Floor - JBS" if doctype == "POS Profile" else None)
+        )
+
+        def get_all(doctype, *args, **kwargs):
+            if doctype == "Item":
+                return [
+                    {
+                        "item_code": "QB-524",
+                        "stock_uom": "Nos",
+                        "is_stock_item": 1,
+                        "last_purchase_rate": 0,
+                        "valuation_rate": 0,
+                    }
+                ]
+            if doctype == "Bin":
+                return [
+                    {
+                        "item_code": "QB-524",
+                        "warehouse": "Shop Floor - JBS",
+                        "valuation_rate": 4500,
+                    }
+                ]
+            return []
+
+        self.frappe.get_all = get_all
+
+        errors = self.controls.collect_below_buying_price_errors(
+            [
+                {
+                    "item_code": "QB-524",
+                    "item_name": "RONG PLASTIC TOOTHPICKS WOODEN MED",
+                    "qty": 1,
+                    "rate": 2000,
+                    "uom": "Nos",
+                    "warehouse": "Shop Floor - JBS",
+                }
+            ],
+            pos_profile="REWARD ESSENTIALS POS",
+            invoice_doc={
+                "company": "Rewards Essential Ltd",
+                "currency": "UGX",
+                "conversion_rate": 1,
+                "posting_date": "2026-11-25",
+            },
+        )
+
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(errors[0]["reason"], "below_buying_price")
+        self.assertEqual(errors[0]["buying_rate"], 4500)
+        self.assertEqual(errors[0]["cost_source"], "warehouse_valuation")
+        self.assertEqual(errors[0]["cost_label"], "Warehouse Valuation")
+        self.assertIn("Shop Floor - JBS", errors[0]["message"])
+
+    def test_highest_authoritative_cost_floor_wins_over_lower_buying_price(self):
+        self._install_buying_price(rate=1500, uom="Nos", currency="UGX")
+        self.frappe.db.get_value = lambda doctype, *args, **kwargs: (
+            "UGX" if doctype in {"Price List", "Company"} else None
+        )
+        base_get_all = self.frappe.get_all
+
+        def get_all(doctype, *args, **kwargs):
+            if doctype == "Item":
+                return [
+                    {
+                        "item_code": "LOW",
+                        "stock_uom": "Nos",
+                        "is_stock_item": 1,
+                        "last_purchase_rate": 3200,
+                        "valuation_rate": 0,
+                    }
+                ]
+            if doctype == "Bin":
+                return [
+                    {
+                        "item_code": "LOW",
+                        "warehouse": "Shop Floor - JBS",
+                        "valuation_rate": 2800,
+                    }
+                ]
+            return base_get_all(doctype, *args, **kwargs)
+
+        self.frappe.get_all = get_all
+
+        errors = self.controls.collect_below_buying_price_errors(
+            [
+                {
+                    "item_code": "LOW",
+                    "item_name": "Below Cost",
+                    "qty": 1,
+                    "rate": 2500,
+                    "uom": "Nos",
+                    "warehouse": "Shop Floor - JBS",
+                }
+            ],
+            invoice_doc={
+                "company": "Rewards Essential Ltd",
+                "currency": "UGX",
+                "conversion_rate": 1,
+            },
+        )
+
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(errors[0]["buying_rate"], 3200)
+        self.assertEqual(errors[0]["cost_source"], "last_purchase_rate")
+        self.assertEqual(errors[0]["cost_label"], "Last Purchase Rate")
+
+    def test_warehouse_valuation_converts_uom_and_invoice_currency(self):
+        self.frappe.db.get_value = lambda doctype, *args, **kwargs: (
+            "PKR" if doctype == "Company" else None
+        )
+        erpnext_module = types.ModuleType("erpnext")
+        erpnext_setup = types.ModuleType("erpnext.setup")
+        erpnext_utils = types.ModuleType("erpnext.setup.utils")
+        erpnext_utils.get_exchange_rate = lambda *args, **kwargs: 250
+        sys.modules["erpnext"] = erpnext_module
+        sys.modules["erpnext.setup"] = erpnext_setup
+        sys.modules["erpnext.setup.utils"] = erpnext_utils
+
+        def get_all(doctype, *args, **kwargs):
+            if doctype == "Item":
+                return [
+                    {
+                        "item_code": "BOXED",
+                        "stock_uom": "Nos",
+                        "is_stock_item": 1,
+                        "last_purchase_rate": 0,
+                        "valuation_rate": 0,
+                    }
+                ]
+            if doctype == "UOM Conversion Detail":
+                return [{"parent": "BOXED", "uom": "Box", "conversion_factor": 10}]
+            if doctype == "Bin":
+                return [
+                    {
+                        "item_code": "BOXED",
+                        "warehouse": "Main Store",
+                        "valuation_rate": 1000,
+                    }
+                ]
+            return []
+
+        self.frappe.get_all = get_all
+
+        errors = self.controls.collect_below_buying_price_errors(
+            [
+                {
+                    "item_code": "BOXED",
+                    "item_name": "Boxed Item",
+                    "qty": 1,
+                    "rate": 35,
+                    "uom": "Box",
+                    "warehouse": "Main Store",
+                }
+            ],
+            invoice_doc={
+                "company": "Test Co",
+                "currency": "USD",
+                "conversion_rate": 250,
+                "posting_date": "2026-11-26",
+            },
+        )
+
+        self.assertEqual(len(errors), 1)
+        self.assertAlmostEqual(errors[0]["buying_rate"], 40.0)
+        self.assertEqual(errors[0]["cost_source"], "warehouse_valuation")
+
+    def test_non_stock_item_ignores_bin_valuation_rate(self):
+        def get_all(doctype, *args, **kwargs):
+            if doctype == "Item":
+                return [
+                    {
+                        "item_code": "SVC-1",
+                        "stock_uom": "Nos",
+                        "is_stock_item": 0,
+                        "last_purchase_rate": 0,
+                        "valuation_rate": 0,
+                    }
+                ]
+            if doctype == "Bin":
+                return [
+                    {
+                        "item_code": "SVC-1",
+                        "warehouse": "Shop Floor - JBS",
+                        "valuation_rate": 5000,
+                    }
+                ]
+            return []
+
+        self.frappe.get_all = get_all
+
+        errors = self.controls.collect_below_buying_price_errors(
+            [
+                {
+                    "item_code": "SVC-1",
+                    "item_name": "Service Fee",
+                    "qty": 1,
+                    "rate": 1000,
+                    "uom": "Nos",
+                    "warehouse": "Shop Floor - JBS",
+                }
+            ]
+        )
+
+        self.assertEqual(errors, [])
+
+    def test_free_promotional_item_is_excluded_from_below_cost_floor(self):
+        self._install_buying_price(rate=100)
+        errors = self.controls.collect_below_buying_price_errors(
+            [
+                {
+                    "item_code": "LOW",
+                    "item_name": "Promo Free Item",
+                    "qty": 1,
+                    "rate": 0,
+                    "uom": "Nos",
+                    "is_free_item": 1,
+                }
+            ]
+        )
+        self.assertEqual(errors, [])
+
+    def test_in_process_consolidated_sales_invoice_skips_pos_sale_controls(self):
+        validator = Mock()
+        invoice = types.SimpleNamespace(
+            doctype="Sales Invoice",
+            flags=types.SimpleNamespace(is_consolidated=True),
+            get=lambda key, default=None: {
+                "doctype": "Sales Invoice",
+                "is_pos": 1,
+                "is_consolidated": 1,
+                "pos_profile": "REWARD ESSENTIALS POS",
+                "items": [],
+            }.get(key, default),
+        )
+
+        with patch.object(
+            self.controls,
+            "validate_invoice_item_sale_controls",
+            validator,
+        ):
+            self.controls.validate_pos_invoice_item_sale_controls(invoice)
+
+        validator.assert_not_called()
+
+    def test_forged_consolidated_flag_absent_still_runs_pos_sale_controls(self):
+        validator = Mock()
+        invoice = types.SimpleNamespace(
+            doctype="Sales Invoice",
+            flags=types.SimpleNamespace(is_consolidated=False),
+            get=lambda key, default=None: {
+                "doctype": "Sales Invoice",
+                "is_pos": 1,
+                "is_consolidated": 1,
+                "pos_profile": "REWARD ESSENTIALS POS",
+                "items": [],
+            }.get(key, default),
+        )
+
+        with patch.object(
+            self.controls,
+            "validate_invoice_item_sale_controls",
+            validator,
+        ):
+            self.controls.validate_pos_invoice_item_sale_controls(invoice)
+
+        validator.assert_called_once_with(invoice)
+
+    def test_override_details_records_cost_source(self):
+        invoice = {
+            "items": [{"item_code": "QB-524", "qty": 1, "rate": 2000}],
+            "pos_profile": "REWARD ESSENTIALS POS",
+            "posa_below_cost_override": 1,
+            "posa_below_cost_override_reason": "Approved clearance",
+        }
+        floor_error = {
+            "item_code": "QB-524",
+            "selling_rate": 2000,
+            "buying_rate": 4500,
+            "minimum_selling_rate": 4500,
+            "minimum_margin_percentage": 0,
+            "buying_price_uom": "Nos",
+            "buying_price_currency": "UGX",
+            "cost_source": "warehouse_valuation",
+            "warehouse": "Shop Floor - JBS",
+            "message": "below floor",
+        }
+
+        with (
+            patch.object(self.controls, "collect_item_sale_control_errors", return_value=[]),
+            patch.object(
+                self.controls,
+                "collect_below_buying_price_errors",
+                return_value=[floor_error],
+            ),
+            patch.object(
+                self.controls,
+                "resolve_sale_floor_policy",
+                return_value={"enabled": True, "action": "POS Supervisor Override"},
+            ),
+            patch.object(
+                self.controls,
+                "_authorize_below_cost_override",
+                return_value="supervisor@example.com",
+            ),
+        ):
+            self.controls.validate_invoice_item_sale_controls(invoice)
+
+        self.assertIn(
+            '"cost_source":"warehouse_valuation"',
+            invoice["posa_below_cost_override_details"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
