@@ -699,21 +699,332 @@ class TestItemSaleControls(unittest.TestCase):
 
         self.assertEqual(errors, [])
 
-    def test_free_promotional_item_is_excluded_from_below_cost_floor(self):
+    PROMO_INVOICE = {"company": "Test Co", "posting_date": "2026-11-26"}
+
+    def _install_promotional_rule(self, **overrides):
+        """Install an active selling Product Pricing Rule that gives LOW free."""
+
+        rule = {
+            "name": "PR-FREE",
+            "disable": 0,
+            "selling": 1,
+            "price_or_product_discount": "Product",
+            "apply_on": "Item Code",
+            "same_item": 0,
+            "free_item": "LOW",
+            "company": "Test Co",
+            "valid_from": "2026-01-01",
+            "valid_upto": None,
+        }
+        rule.update(overrides)
         self._install_buying_price(rate=100)
+        base_get_all = self.frappe.get_all
+
+        def get_all(doctype, *args, **kwargs):
+            if doctype == "Pricing Rule":
+                return [dict(rule)]
+            return base_get_all(doctype, *args, **kwargs)
+
+        self.frappe.get_all = get_all
+        return rule
+
+    @staticmethod
+    def _promo_trigger_row(pricing_rules='["PR-FREE"]', item_code="TRIG", rate=500):
+        return {
+            "item_code": item_code,
+            "item_name": "Promo Trigger",
+            "qty": 5,
+            "rate": rate,
+            "uom": "Nos",
+            "pricing_rules": pricing_rules,
+        }
+
+    @staticmethod
+    def _promo_free_row(pricing_rules="PR-FREE", rate=0, item_code="LOW"):
+        return {
+            "item_code": item_code,
+            "item_name": "Promo Free Item",
+            "qty": 1,
+            "rate": rate,
+            "uom": "Nos",
+            "is_free_item": 1,
+            "pricing_rules": pricing_rules,
+        }
+
+    def test_free_promotional_item_is_excluded_from_below_cost_floor(self):
+        self._install_promotional_rule()
+
+        errors = self.controls.collect_below_buying_price_errors(
+            [self._promo_trigger_row(), self._promo_free_row()],
+            invoice_doc=dict(self.PROMO_INVOICE),
+        )
+
+        self.assertEqual(errors, [])
+
+    def test_same_item_promotional_free_row_is_excluded_from_below_cost_floor(self):
+        self._install_promotional_rule(name="PR-BOGO", same_item=1, free_item=None)
+
+        errors = self.controls.collect_below_buying_price_errors(
+            [
+                self._promo_trigger_row('["PR-BOGO"]', item_code="LOW", rate=150),
+                self._promo_free_row("PR-BOGO"),
+            ],
+            invoice_doc=dict(self.PROMO_INVOICE),
+        )
+
+        self.assertEqual(errors, [])
+
+    def test_transaction_promotional_free_row_is_excluded_from_below_cost_floor(self):
+        # ERPNext removes free rows of unmatched Transaction rules during validate
+        # (remove_free_item), so no paid row carries a transaction-level rule.
+        self._install_promotional_rule(apply_on="Transaction")
+
+        errors = self.controls.collect_below_buying_price_errors(
+            [self._promo_trigger_row(pricing_rules=""), self._promo_free_row()],
+            invoice_doc=dict(self.PROMO_INVOICE),
+        )
+
+        self.assertEqual(errors, [])
+
+    def test_comma_separated_paid_row_rules_authorize_free_row(self):
+        # ERPNext's get_applied_pricing_rules reads JSON lists and comma lists.
+        self._install_promotional_rule()
+
+        errors = self.controls.collect_below_buying_price_errors(
+            [self._promo_trigger_row("PR-OTHER, PR-FREE"), self._promo_free_row()],
+            invoice_doc=dict(self.PROMO_INVOICE),
+        )
+
+        self.assertEqual(errors, [])
+
+    def test_forged_free_item_without_pricing_rule_is_blocked_below_cost(self):
+        self._install_buying_price(rate=100)
+
         errors = self.controls.collect_below_buying_price_errors(
             [
                 {
                     "item_code": "LOW",
-                    "item_name": "Promo Free Item",
+                    "item_name": "Forged Free Item",
                     "qty": 1,
-                    "rate": 0,
+                    "rate": 1,
                     "uom": "Nos",
                     "is_free_item": 1,
                 }
+            ],
+            invoice_doc=dict(self.PROMO_INVOICE),
+        )
+
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(errors[0]["reason"], "below_buying_price")
+        self.assertEqual(errors[0]["buying_rate"], 100)
+
+    def test_forged_free_item_naming_invalid_pricing_rule_is_blocked_below_cost(self):
+        scenarios = {
+            "rule does not exist": ({}, "PR-GHOST", '["PR-GHOST"]'),
+            "rule disabled": ({"disable": 1}, "PR-FREE", '["PR-FREE"]'),
+            "price discount rule": (
+                {"price_or_product_discount": "Price"},
+                "PR-FREE",
+                '["PR-FREE"]',
+            ),
+            "buying-only rule": ({"selling": 0}, "PR-FREE", '["PR-FREE"]'),
+            "rule gives a different item": (
+                {"free_item": "OTHER"},
+                "PR-FREE",
+                '["PR-FREE"]',
+            ),
+            "rule expired": ({"valid_upto": "2026-06-30"}, "PR-FREE", '["PR-FREE"]'),
+            "rule not yet valid": (
+                {"valid_from": "2026-12-01"},
+                "PR-FREE",
+                '["PR-FREE"]',
+            ),
+            "rule for another company": (
+                {"company": "Other Co"},
+                "PR-FREE",
+                '["PR-FREE"]',
+            ),
+            "same-item rule for an item that did not trigger it": (
+                {"same_item": 1, "free_item": None},
+                "PR-FREE",
+                '["PR-FREE"]',
+            ),
+            "rule not applied to any paid row": ({}, "PR-FREE", ""),
+            "paid row pricing_rules is malformed": ({}, "PR-FREE", '["PR-FREE"'),
+            "transaction rule gives a different item": (
+                {"apply_on": "Transaction", "free_item": "OTHER"},
+                "PR-FREE",
+                "",
+            ),
+        }
+        for label, (overrides, free_rule, trigger_rules) in scenarios.items():
+            with self.subTest(label):
+                self._install_promotional_rule(**overrides)
+
+                errors = self.controls.collect_below_buying_price_errors(
+                    [
+                        self._promo_trigger_row(trigger_rules),
+                        self._promo_free_row(free_rule, rate=1),
+                    ],
+                    invoice_doc=dict(self.PROMO_INVOICE),
+                )
+
+                self.assertEqual(len(errors), 1)
+                self.assertEqual(errors[0]["item_code"], "LOW")
+                self.assertEqual(errors[0]["reason"], "below_buying_price")
+                self.assertEqual(errors[0]["buying_rate"], 100)
+
+    def test_free_item_is_not_exempt_when_invoice_ignores_pricing_rules(self):
+        # ERPNext neither applies free items nor rewrites paid-row pricing_rules
+        # when ignore_pricing_rule is set, so any free row is client-made.
+        self._install_promotional_rule()
+
+        errors = self.controls.collect_below_buying_price_errors(
+            [self._promo_trigger_row(), self._promo_free_row(rate=1)],
+            invoice_doc={**self.PROMO_INVOICE, "ignore_pricing_rule": 1},
+        )
+
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(errors[0]["reason"], "below_buying_price")
+
+    def test_only_one_free_row_per_rule_and_item_is_exempt(self):
+        # ERPNext keys free rows by (item_code, pricing_rules) and re-sizes only
+        # the first; a duplicate row is not a server-applied quantity.
+        self._install_promotional_rule()
+
+        errors = self.controls.collect_below_buying_price_errors(
+            [
+                self._promo_trigger_row(),
+                self._promo_free_row(),
+                self._promo_free_row(rate=1),
+            ],
+            invoice_doc=dict(self.PROMO_INVOICE),
+        )
+
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(errors[0]["reason"], "below_buying_price")
+        self.assertEqual(errors[0]["selling_rate"], 1)
+
+    def test_unknown_uom_client_conversion_factor_cannot_lower_floor(self):
+        self._install_buying_price(rate=100, uom="Nos")
+        base_get_all = self.frappe.get_all
+
+        def get_all(doctype, *args, **kwargs):
+            if doctype == "Item":
+                return [
+                    {
+                        "item_code": "LOW",
+                        "stock_uom": "Nos",
+                        "is_stock_item": 1,
+                        "last_purchase_rate": 100,
+                        "valuation_rate": 0,
+                    }
+                ]
+            if doctype == "Bin":
+                return [
+                    {
+                        "item_code": "LOW",
+                        "warehouse": "Shop Floor - JBS",
+                        "valuation_rate": 100,
+                    }
+                ]
+            return base_get_all(doctype, *args, **kwargs)
+
+        self.frappe.get_all = get_all
+
+        errors = self.controls.collect_below_buying_price_errors(
+            [
+                {
+                    "item_code": "LOW",
+                    "item_name": "Crated Item",
+                    "qty": 1,
+                    "rate": 1,
+                    "uom": "Crate",
+                    "conversion_factor": 0.01,
+                    "warehouse": "Shop Floor - JBS",
+                }
+            ],
+            policy={
+                "enabled": True,
+                "action": "Block",
+                "minimum_margin_percentage": 0,
+                "missing_cost_action": "Block",
+            },
+        )
+
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(errors[0]["reason"], "missing_buying_price")
+
+    def test_known_uom_ignores_client_conversion_factor(self):
+        self._install_buying_price(rate=12.75, uom="Nos")
+        base_get_all = self.frappe.get_all
+
+        def get_all(doctype, *args, **kwargs):
+            if doctype == "UOM Conversion Detail":
+                return [{"parent": "LOW", "uom": "Box", "conversion_factor": 10}]
+            return base_get_all(doctype, *args, **kwargs)
+
+        self.frappe.get_all = get_all
+
+        errors = self.controls.collect_below_buying_price_errors(
+            [
+                {
+                    "item_code": "LOW",
+                    "item_name": "Below Cost",
+                    "qty": 1,
+                    "rate": 100,
+                    "uom": "Box",
+                    "conversion_factor": 0.01,
+                }
             ]
         )
-        self.assertEqual(errors, [])
+
+        self.assertEqual(errors[0]["buying_rate"], 127.5)
+
+    def test_variant_uses_template_uom_conversion_not_client_factor(self):
+        self._install_buying_price(rate=10, uom="Nos")
+        base_get_all = self.frappe.get_all
+
+        def get_all(doctype, *args, **kwargs):
+            if doctype == "Item":
+                return [
+                    {
+                        "item_code": "LOW",
+                        "stock_uom": "Nos",
+                        "variant_of": "LOW-TEMPLATE",
+                        "is_stock_item": 1,
+                        "last_purchase_rate": 0,
+                        "valuation_rate": 0,
+                    }
+                ]
+            if doctype == "UOM Conversion Detail":
+                return [
+                    {
+                        "parent": "LOW-TEMPLATE",
+                        "uom": "Box",
+                        "conversion_factor": 12,
+                    }
+                ]
+            return base_get_all(doctype, *args, **kwargs)
+
+        self.frappe.get_all = get_all
+
+        errors = self.controls.collect_below_buying_price_errors(
+            [
+                {
+                    "item_code": "LOW",
+                    "item_name": "Variant Item",
+                    "qty": 1,
+                    "rate": 50,
+                    "uom": "Box",
+                    "conversion_factor": 0.01,
+                }
+            ]
+        )
+
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(errors[0]["reason"], "below_buying_price")
+        self.assertEqual(errors[0]["buying_rate"], 120)
 
     def test_in_process_consolidated_sales_invoice_skips_pos_sale_controls(self):
         validator = Mock()
