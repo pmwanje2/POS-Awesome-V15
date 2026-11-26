@@ -572,6 +572,7 @@ export function usePaymentSubmission(options: PaymentSubmissionOptions) {
 					(item: any) =>
 						!item?.is_return &&
 						!item?.posa_is_replace &&
+						!item?.is_free_item &&
 						Number(item?.qty || 0) >= 0 &&
 						!getItemCostFloor(item),
 				)
@@ -632,7 +633,7 @@ export function usePaymentSubmission(options: PaymentSubmissionOptions) {
 			} else {
 				throw new Error(
 					__(
-						"Cannot submit invoice because {0} is selling at {1}, below {2} {3}.",
+						"Cannot submit invoice because {0} is selling at {1}, below {2} {3}. Ask a Store Manager to update the selling price or review the item's valuation cost.",
 						[
 							first.itemName || first.itemCode,
 							formatFloat(first.sellingRate, prec),

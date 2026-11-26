@@ -210,7 +210,7 @@ def _is_price_row_valid(row, posting_date):
 
 
 def _get_item_uom_context(item_rows):
-    """Load authoritative stock UOMs and conversion factors for invoice items."""
+    """Load authoritative stock UOMs, conversion factors, and item cost metadata."""
 
     codes = sorted(
         {
@@ -220,19 +220,22 @@ def _get_item_uom_context(item_rows):
         }
     )
     if not codes:
-        return {}, {}
+        return {}, {}, {}
 
     item_meta = frappe.get_all(
         "Item",
         filters={"item_code": ["in", codes]},
-        fields=["item_code", "stock_uom"],
+        fields=["item_code", "stock_uom", "is_stock_item", "last_purchase_rate", "valuation_rate"],
         limit_page_length=len(codes),
     )
-    stock_uoms = {
-        row.get("item_code"): row.get("stock_uom")
-        for row in item_meta or []
-        if row.get("item_code")
-    }
+    item_info = {}
+    stock_uoms = {}
+    for row in item_meta or []:
+        code = row.get("item_code")
+        if not code:
+            continue
+        item_info[code] = row
+        stock_uoms[code] = row.get("stock_uom")
     conversions = frappe.get_all(
         "UOM Conversion Detail",
         filters={"parent": ["in", codes], "parenttype": "Item"},
@@ -247,7 +250,55 @@ def _get_item_uom_context(item_rows):
     for item_code, stock_uom in stock_uoms.items():
         if stock_uom:
             conversion_factors[(item_code, stock_uom)] = 1.0
-    return stock_uoms, conversion_factors
+    return stock_uoms, conversion_factors, item_info
+
+
+def _get_bin_valuation_map(item_rows, pos_profile=None, invoice_doc=None):
+    """Load authoritative warehouse Bin.valuation_rate (SAP VPRS / moving average)."""
+
+    codes = sorted(
+        {
+            str(row.get("item_code")).strip()
+            for row in item_rows
+            if hasattr(row, "get") and row.get("item_code")
+        }
+    )
+    if not codes:
+        return {}, None
+
+    default_warehouse = None
+    if invoice_doc and hasattr(invoice_doc, "get"):
+        default_warehouse = invoice_doc.get("set_warehouse") or invoice_doc.get("warehouse")
+    if not default_warehouse and pos_profile:
+        default_warehouse = frappe.db.get_value("POS Profile", pos_profile, "warehouse")
+
+    warehouses = sorted(
+        {
+            str(row.get("warehouse") or default_warehouse).strip()
+            for row in item_rows
+            if hasattr(row, "get") and (row.get("warehouse") or default_warehouse)
+        }
+    )
+    if not warehouses:
+        return {}, default_warehouse
+
+    bin_rows = frappe.get_all(
+        "Bin",
+        filters={
+            "item_code": ["in", codes],
+            "warehouse": ["in", warehouses],
+        },
+        fields=["item_code", "warehouse", "valuation_rate"],
+        limit_page_length=0,
+    )
+    bin_map = {}
+    for row in bin_rows or []:
+        code = row.get("item_code")
+        wh = row.get("warehouse")
+        val = flt(row.get("valuation_rate"))
+        if code and wh and val > 0:
+            bin_map[(code, wh)] = val
+    return bin_map, default_warehouse
 
 
 def _convert_floor_to_invoice_currency(
@@ -297,20 +348,22 @@ def _convert_floor_to_invoice_currency(
 
 
 def resolve_buying_floors(items, pos_profile=None, invoice_doc=None):
-    """Resolve authoritative per-line buying floors from Item Price master data.
+    """Resolve authoritative per-line cost floors across buying list, warehouse valuation, and LPR.
 
     Client-provided ``trade_price``/``buying_rate`` values are intentionally ignored.
-    Exact-UOM prices win; otherwise a stock-UOM/general price is converted using the
-    Item master conversion factor. All returned rates use the invoice currency.
+    Evaluates (1) active Buying Item Price, (2) warehouse Bin.valuation_rate (stock items,
+    matching SAP VPRS / ERPNext SellingController), and (3) Item.last_purchase_rate,
+    selecting the highest normalized floor in invoice currency.
     """
 
     item_rows = list(items or [])
+    if not item_rows:
+        return {}
+
     price_list, price_rows = _get_buying_price_rows(
         [row.get("item_code") for row in item_rows if hasattr(row, "get")],
         pos_profile=pos_profile,
     )
-    if not price_list or not price_rows:
-        return {}
 
     posting_date = (
         invoice_doc.get("posting_date") if invoice_doc and hasattr(invoice_doc, "get") else None
@@ -324,11 +377,19 @@ def resolve_buying_floors(items, pos_profile=None, invoice_doc=None):
         if invoice_doc and hasattr(invoice_doc, "get")
         else None
     )
-    price_list_currency = frappe.db.get_value("Price List", price_list, "currency")
-    stock_uoms, conversion_factors = _get_item_uom_context(item_rows)
+    company_currency = (
+        frappe.db.get_value("Company", company, "default_currency") if company else None
+    )
+    price_list_currency = (
+        frappe.db.get_value("Price List", price_list, "currency") if price_list else None
+    )
+    stock_uoms, conversion_factors, item_info = _get_item_uom_context(item_rows)
+    bin_valuations, default_warehouse = _get_bin_valuation_map(
+        item_rows, pos_profile=pos_profile, invoice_doc=invoice_doc
+    )
 
     rows_by_item = {}
-    for price_row in price_rows:
+    for price_row in price_rows or []:
         if flt(price_row.get("price_list_rate")) <= 0 or not _is_price_row_valid(
             price_row, posting_date
         ):
@@ -345,46 +406,124 @@ def resolve_buying_floors(items, pos_profile=None, invoice_doc=None):
         selected_uom = row.get("uom") or stock_uoms.get(item_code)
         stock_uom = stock_uoms.get(item_code) or row.get("stock_uom") or selected_uom
         factor = conversion_factors.get((item_code, selected_uom))
-        if factor is None and selected_uom == stock_uom:
-            factor = 1.0
+        if factor is None:
+            row_factor = flt(row.get("conversion_factor"))
+            if row_factor > 0:
+                factor = row_factor
+            elif selected_uom == stock_uom or not selected_uom:
+                factor = 1.0
 
-        candidates = rows_by_item.get(item_code, [])
-        exact = next((candidate for candidate in candidates if candidate.get("uom") == selected_uom), None)
+        candidates_floors = []
+
+        # 1) Authoritative Buying Price List
+        price_candidates = rows_by_item.get(item_code, [])
+        exact = next(
+            (candidate for candidate in price_candidates if candidate.get("uom") == selected_uom),
+            None,
+        )
         base = next(
             (
                 candidate
-                for candidate in candidates
+                for candidate in price_candidates
                 if candidate.get("uom") in (stock_uom, None, "")
             ),
             None,
         )
         selected_price = exact or base
-        if not selected_price or (not exact and not factor):
-            continue
+        if selected_price and (exact or factor):
+            floor = flt(selected_price.get("price_list_rate"))
+            if not exact:
+                floor *= factor
+            source_currency = (
+                selected_price.get("currency") or price_list_currency or invoice_currency
+            )
+            normalized_floor = _convert_floor_to_invoice_currency(
+                floor,
+                source_currency,
+                invoice_currency or source_currency,
+                company,
+                posting_date,
+                invoice_conversion_rate=invoice_conversion_rate,
+            )
+            if normalized_floor is not None and normalized_floor > 0:
+                candidates_floors.append(
+                    {
+                        "rate": normalized_floor,
+                        "source_rate": flt(selected_price.get("price_list_rate")),
+                        "source_currency": source_currency,
+                        "invoice_currency": invoice_currency or source_currency,
+                        "uom": selected_uom,
+                        "price_list": price_list,
+                        "item_price": selected_price.get("name"),
+                        "cost_source": "buying_price_list",
+                        "cost_label": "Buying Price",
+                        "warehouse": None,
+                    }
+                )
 
-        floor = flt(selected_price.get("price_list_rate"))
-        if not exact:
-            floor *= factor
-        source_currency = selected_price.get("currency") or price_list_currency or invoice_currency
-        normalized_floor = _convert_floor_to_invoice_currency(
-            floor,
-            source_currency,
-            invoice_currency or source_currency,
-            company,
-            posting_date,
-            invoice_conversion_rate=invoice_conversion_rate,
-        )
-        if normalized_floor is None or normalized_floor <= 0:
-            continue
-        floors[index] = {
-            "rate": normalized_floor,
-            "source_rate": flt(selected_price.get("price_list_rate")),
-            "source_currency": source_currency,
-            "invoice_currency": invoice_currency or source_currency,
-            "uom": selected_uom,
-            "price_list": price_list,
-            "item_price": selected_price.get("name"),
-        }
+        meta = item_info.get(item_code) or {}
+        is_stock_item = bool(cint(meta.get("is_stock_item", 1)))
+        effective_factor = factor or 1.0
+        cost_currency = company_currency or invoice_currency
+
+        # 2) Warehouse Bin.valuation_rate (stock items only, matching ERPNext validate_selling_price)
+        warehouse = row.get("warehouse") or default_warehouse
+        if is_stock_item and warehouse:
+            bin_val = flt(bin_valuations.get((item_code, warehouse)))
+            if bin_val > 0:
+                normalized_val = _convert_floor_to_invoice_currency(
+                    bin_val * effective_factor,
+                    cost_currency,
+                    invoice_currency or cost_currency,
+                    company,
+                    posting_date,
+                    invoice_conversion_rate=invoice_conversion_rate,
+                )
+                if normalized_val is not None and normalized_val > 0:
+                    candidates_floors.append(
+                        {
+                            "rate": normalized_val,
+                            "source_rate": bin_val,
+                            "source_currency": cost_currency,
+                            "invoice_currency": invoice_currency or cost_currency,
+                            "uom": selected_uom,
+                            "price_list": None,
+                            "item_price": None,
+                            "cost_source": "warehouse_valuation",
+                            "cost_label": "Warehouse Valuation",
+                            "warehouse": warehouse,
+                        }
+                    )
+
+        # 3) Item.last_purchase_rate (matching ERPNext validate_selling_price)
+        lpr = flt(meta.get("last_purchase_rate"))
+        if lpr > 0:
+            normalized_lpr = _convert_floor_to_invoice_currency(
+                lpr * effective_factor,
+                cost_currency,
+                invoice_currency or cost_currency,
+                company,
+                posting_date,
+                invoice_conversion_rate=invoice_conversion_rate,
+            )
+            if normalized_lpr is not None and normalized_lpr > 0:
+                candidates_floors.append(
+                    {
+                        "rate": normalized_lpr,
+                        "source_rate": lpr,
+                        "source_currency": cost_currency,
+                        "invoice_currency": invoice_currency or cost_currency,
+                        "uom": selected_uom,
+                        "price_list": None,
+                        "item_price": None,
+                        "cost_source": "last_purchase_rate",
+                        "cost_label": "Last Purchase Rate",
+                        "warehouse": warehouse,
+                    }
+                )
+
+        if candidates_floors:
+            floors[index] = max(candidates_floors, key=lambda entry: flt(entry.get("rate")))
     return floors
 
 
@@ -427,7 +566,7 @@ def collect_below_buying_price_errors(
         item_code = row.get("item_code") if hasattr(row, "get") else None
         if not item_code:
             continue
-        if row.get("posa_is_replace") or flt(row.get("qty")) < 0:
+        if row.get("posa_is_replace") or row.get("is_free_item") or flt(row.get("qty")) < 0:
             continue
 
         floor_info = buying_floors.get(index) or {}
@@ -460,6 +599,23 @@ def collect_below_buying_price_errors(
             continue
 
         item_name = row.get("item_name") or item_code
+        cost_source = floor_info.get("cost_source") or "buying_price_list"
+        cost_label = floor_info.get("cost_label") or "Buying Price"
+        warehouse = floor_info.get("warehouse")
+        if cost_source == "warehouse_valuation" and warehouse:
+            message = _(
+                "Item {0} cannot be sold at {1}; below Warehouse Valuation ({2}) minimum rate {3}. "
+                "Contact Store Manager to verify selling price or stock valuation."
+            ).format(item_name, selling_rate, warehouse, minimum_selling_rate)
+        elif cost_source == "last_purchase_rate":
+            message = _(
+                "Item {0} cannot be sold at {1}; below Last Purchase Rate minimum rate {2}. "
+                "Contact Store Manager to verify selling price or stock valuation."
+            ).format(item_name, selling_rate, minimum_selling_rate)
+        else:
+            message = _(
+                "Item {0} cannot be sold at {1}; the minimum permitted rate is {2}."
+            ).format(item_name, selling_rate, minimum_selling_rate)
         errors.append(
             {
                 "item_code": item_code,
@@ -473,9 +629,10 @@ def collect_below_buying_price_errors(
                 "buying_price_list": floor_info.get("price_list"),
                 "buying_price_uom": floor_info.get("uom"),
                 "buying_price_currency": floor_info.get("invoice_currency"),
-                "message": _(
-                    "Item {0} cannot be sold at {1}; the minimum permitted rate is {2}."
-                ).format(item_name, selling_rate, minimum_selling_rate),
+                "cost_source": cost_source,
+                "cost_label": cost_label,
+                "warehouse": warehouse,
+                "message": message,
             }
         )
 
@@ -528,6 +685,8 @@ def _apply_below_cost_override(invoice_doc, errors):
             "minimum_margin_percentage": error.get("minimum_margin_percentage"),
             "uom": error.get("buying_price_uom"),
             "currency": error.get("buying_price_currency"),
+            "cost_source": error.get("cost_source"),
+            "warehouse": error.get("warehouse"),
         }
         for error in errors
     ]
@@ -590,6 +749,16 @@ def validate_invoice_item_sale_controls(invoice_doc):
 def validate_pos_invoice_item_sale_controls(invoice_doc):
     """Apply POS sale controls from document hooks without affecting non-POS invoices."""
     doctype = getattr(invoice_doc, "doctype", None) or invoice_doc.get("doctype")
+    # SAP WPUUMS / POSDM rule: already-paid POS Invoices being consolidated by
+    # ERPNext's POSInvoiceMergeLog carry both is_consolidated=1 and the in-process
+    # flags.is_consolidated=True marker; never block end-of-day shift close.
+    flags = getattr(invoice_doc, "flags", None)
+    if (
+        doctype == "Sales Invoice"
+        and cint(invoice_doc.get("is_consolidated"))
+        and bool(getattr(flags, "is_consolidated", False))
+    ):
+        return
     is_pos_document = (
         doctype == "POS Invoice"
         or bool(invoice_doc.get("is_pos"))

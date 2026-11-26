@@ -27,14 +27,34 @@ export type LossPreventionOptions = {
 	invoiceDiscountPercentage?: number;
 };
 
-const COST_CANDIDATES = [
+const COST_CANDIDATES: Array<{
+	field: string;
+	label: string;
+	baseCurrency?: boolean;
+	stockUomRate?: boolean;
+}> = [
 	{ field: "trade_price", label: "Trade Price" },
 	{ field: "buying_price", label: "Buying Price" },
 	{ field: "buying_rate", label: "Buying Rate" },
 	{ field: "last_buying_rate", label: "Last Buying Rate" },
-	{ field: "last_purchase_rate", label: "Last Purchase Rate" },
-	{ field: "valuation_rate", label: "Valuation Rate" },
-	{ field: "manufacturing_cost", label: "Manufacturing Cost" },
+	{
+		field: "valuation_rate",
+		label: "Warehouse Valuation",
+		baseCurrency: true,
+		stockUomRate: true,
+	},
+	{
+		field: "last_purchase_rate",
+		label: "Last Purchase Rate",
+		baseCurrency: true,
+		stockUomRate: true,
+	},
+	{
+		field: "manufacturing_cost",
+		label: "Manufacturing Cost",
+		baseCurrency: true,
+		stockUomRate: true,
+	},
 ];
 
 const EPSILON = 0.0001;
@@ -82,6 +102,17 @@ export function getItemCostFloor(
 	if (!item) {
 		return null;
 	}
+	const rawCurrencyRate = toFiniteNumber(item.conversion_rate);
+	const currencyConversionRate =
+		rawCurrencyRate !== null && rawCurrencyRate > EPSILON
+			? rawCurrencyRate
+			: 1;
+	const rawUomFactor = toFiniteNumber(item.conversion_factor);
+	const uomConversionFactor =
+		rawUomFactor !== null && rawUomFactor > EPSILON ? rawUomFactor : 1;
+
+	const resolvedCandidates: LossCostFloor[] = [];
+
 	const pricesByUom = item._buying_prices_by_uom;
 	if (pricesByUom && typeof pricesByUom === "object") {
 		const prices = pricesByUom as Record<
@@ -95,27 +126,51 @@ export function getItemCostFloor(
 		const selected = exact || fallback;
 		const baseRate = toFiniteNumber(selected?.base_price_list_rate);
 		if (baseRate !== null && baseRate > EPSILON) {
-			const conversionFactor = exact
-				? 1
-				: toFiniteNumber(item.conversion_factor) || 1;
-			return {
+			const conversionFactor = exact ? 1 : uomConversionFactor;
+			resolvedCandidates.push({
 				field: "_buying_prices_by_uom",
 				label: "Trade Price",
 				rate: baseRate * conversionFactor,
 				baseCurrency: true,
-			};
+			});
 		}
 	}
+
 	for (const candidate of COST_CANDIDATES) {
-		const rate = toFiniteNumber(item[candidate.field]);
-		if (rate !== null && rate > EPSILON) {
-			return {
-				...candidate,
-				rate,
-			};
+		const rawRate = toFiniteNumber(item[candidate.field]);
+		if (rawRate !== null && rawRate > EPSILON) {
+			const scaledRate = candidate.stockUomRate
+				? rawRate * uomConversionFactor
+				: rawRate;
+			resolvedCandidates.push({
+				field: candidate.field,
+				label: candidate.label,
+				rate: scaledRate,
+				baseCurrency: candidate.baseCurrency,
+			});
 		}
 	}
-	return null;
+
+	if (!resolvedCandidates.length) {
+		return null;
+	}
+
+	let highest = resolvedCandidates[0]!;
+	let highestBaseRate = highest.baseCurrency
+		? highest.rate
+		: highest.rate * currencyConversionRate;
+
+	for (const candidate of resolvedCandidates.slice(1)) {
+		const candidateBaseRate = candidate.baseCurrency
+			? candidate.rate
+			: candidate.rate * currencyConversionRate;
+		if (candidateBaseRate > highestBaseRate + EPSILON) {
+			highest = candidate;
+			highestBaseRate = candidateBaseRate;
+		}
+	}
+
+	return highest;
 }
 
 export function getEffectiveSellingRate(
@@ -142,7 +197,14 @@ export function getItemLossRisk(
 	item: Record<string, unknown> | null | undefined,
 	options: LossPreventionOptions = {},
 ): LossRisk | null {
-	if (!item || item.is_return || item.posa_is_replace) {
+	if (
+		!item ||
+		item.is_return ||
+		item.posa_is_replace ||
+		item.is_free_item === true ||
+		item.is_free_item === 1 ||
+		item.is_free_item === "1"
+	) {
 		return null;
 	}
 	const qty = toFiniteNumber(item.qty);
