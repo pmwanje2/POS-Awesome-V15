@@ -9,6 +9,19 @@ from unittest.mock import Mock, patch
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
 
 
+class PrecisionDoc(dict):
+    """Frappe Document stand-in: dict access plus currency field precision()."""
+
+    def precision(self, fieldname, parentfield=None):
+        return 2
+
+
+class AttrDict(dict):
+    """frappe._dict stand-in: any missing attribute, precision included, is None."""
+
+    __getattr__ = dict.get
+
+
 class FakeMeta:
     def has_field(self, fieldname):
         return fieldname in {
@@ -37,7 +50,9 @@ def _install_frappe_stub():
     sys.modules["frappe"] = frappe_module
 
     frappe_utils = types.ModuleType("frappe.utils")
-    frappe_utils.flt = lambda value, precision=None: float(value or 0)
+    frappe_utils.flt = lambda value, precision=None: (
+        float(value or 0) if precision is None else round(float(value or 0), int(precision))
+    )
     frappe_utils.cint = lambda value: int(value or 0)
     frappe_utils.cstr = lambda value: str(value or "")
     frappe_utils.nowdate = lambda: "2026-07-17"
@@ -732,7 +747,9 @@ class TestItemSaleControls(unittest.TestCase):
 
         def get_all(doctype, *args, **kwargs):
             if doctype == "Pricing Rule":
-                return [dict(rule)]
+                # Like frappe.get_all, return only the fields the query asks for.
+                fields = kwargs.get("fields") or list(rule)
+                return [{field: rule.get(field) for field in fields}]
             return base_get_all(doctype, *args, **kwargs)
 
         self.frappe.get_all = get_all
@@ -1377,6 +1394,75 @@ class TestItemSaleControls(unittest.TestCase):
                 self.assertEqual(len(errors), 1)
                 self.assertEqual(errors[0]["reason"], "below_buying_price")
                 self.assertAlmostEqual(errors[0]["buying_rate"], floor)
+
+    def test_conditional_pricing_rule_never_exempts_a_free_row(self):
+        # ERPNext evaluates a rule's condition with safe_eval over doc.as_dict(),
+        # forged free rows and the totals they inflate included, and treats any
+        # non-empty string as a condition.
+        for apply_on, trigger_rules in (("Item Code", '["PR-FREE"]'), ("Transaction", "")):
+            for condition in ("total_qty >= 10", "   "):
+                with self.subTest(apply_on=apply_on, condition=repr(condition)):
+                    self._install_promotional_rule(apply_on=apply_on, condition=condition)
+
+                    errors = self.controls.collect_below_buying_price_errors(
+                        [
+                            self._promo_trigger_row(trigger_rules),
+                            self._promo_free_row(rate=1),
+                        ],
+                        invoice_doc=dict(self.PROMO_INVOICE),
+                    )
+
+                    self.assertEqual(len(errors), 1)
+                    self.assertEqual(errors[0]["item_code"], "LOW")
+                    self.assertEqual(errors[0]["reason"], "below_buying_price")
+
+    def test_transaction_amount_thresholds_use_erpnext_currency_rounding(self):
+        # ERPNext compares doc.total, the rounded sum of rounded line amounts
+        # (flt(rate * qty, precision)); raw floats drift (33.30 * 3 == 99.8999...).
+        scenarios = {
+            "one paid row 33.30 x 3 meets min_amt 99.90": (
+                {"min_amt": 99.90},
+                [(33.30, 3)],
+            ),
+            "three paid rows of 33.30 meet min_amt 99.90": (
+                {"min_amt": 99.90},
+                [(33.30, 1), (33.30, 1), (33.30, 1)],
+            ),
+            "0.10 + 0.20 stays within max_amt 0.30": (
+                {"max_amt": 0.30},
+                [(0.10, 1), (0.20, 1)],
+            ),
+            "each 0.335 line rounds to 0.34 before summing to min_amt 0.68": (
+                {"min_amt": 0.68},
+                [(0.335, 1), (0.335, 1)],
+            ),
+        }
+        for label, (thresholds, lines) in scenarios.items():
+            with self.subTest(label):
+                self._install_promotional_rule(apply_on="Transaction", **thresholds)
+                paid_rows = [
+                    PrecisionDoc(item_code=f"PAID-{index}", qty=qty, rate=rate, uom="Nos")
+                    for index, (rate, qty) in enumerate(lines)
+                ]
+
+                errors = self.controls.collect_below_buying_price_errors(
+                    [*paid_rows, self._promo_free_row()],
+                    invoice_doc=PrecisionDoc(self.PROMO_INVOICE),
+                )
+
+                self.assertEqual(errors, [])
+
+    def test_transaction_amount_threshold_accepts_frappe_dict_rows(self):
+        # frappe._dict answers every missing attribute with None, so a row's
+        # "precision" is not callable there.
+        self._install_promotional_rule(apply_on="Transaction", min_amt=2500)
+
+        errors = self.controls.collect_below_buying_price_errors(
+            [AttrDict(self._promo_trigger_row("")), AttrDict(self._promo_free_row())],
+            invoice_doc=AttrDict(self.PROMO_INVOICE),
+        )
+
+        self.assertEqual(errors, [])
 
 
 if __name__ == "__main__":
