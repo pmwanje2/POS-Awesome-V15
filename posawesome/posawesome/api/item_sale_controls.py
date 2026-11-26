@@ -573,6 +573,13 @@ def _applied_pricing_rule_names(value):
     return {cstr(name) for name in names if cstr(name)}
 
 
+def _field_precision(doc, fieldname):
+    """Frappe's field precision when ``doc`` is a Document, else no rounding."""
+
+    precision = getattr(doc, "precision", None)
+    return precision(fieldname) if callable(precision) else None
+
+
 def _server_applied_free_row_indexes(item_rows, invoice_doc=None):
     """Return the free rows ERPNext itself applied from an active promotional rule.
 
@@ -622,6 +629,7 @@ def _server_applied_free_row_indexes(item_rows, invoice_doc=None):
                 "max_qty",
                 "min_amt",
                 "max_amt",
+                "condition",
             ],
             limit_page_length=0,
         )
@@ -633,9 +641,13 @@ def _server_applied_free_row_indexes(item_rows, invoice_doc=None):
     for row in item_rows:
         if hasattr(row, "get") and row.get("item_code") and not cint(row.get("is_free_item")):
             paid_qty += flt(row.get("qty"))
-            paid_amount += flt(row.get("rate")) * flt(row.get("qty"))
+            # ERPNext's doc.total: rounded line amounts, then a rounded sum.
+            paid_amount += flt(
+                flt(row.get("rate")) * flt(row.get("qty")), _field_precision(row, "amount")
+            )
             for rule_name in _applied_pricing_rule_names(row.get("pricing_rules")):
                 paid_items_by_rule.setdefault(rule_name, set()).add(row.get("item_code"))
+    paid_amount = flt(paid_amount, _field_precision(invoice_doc, "total"))
 
     posting_date = invoice_doc.get("posting_date") if has_doc else None
     company = invoice_doc.get("company") if has_doc else None
@@ -653,6 +665,9 @@ def _server_applied_free_row_indexes(item_rows, invoice_doc=None):
             or (rule.get("company") and rule.get("company") != company)
             # Pricing Rule shares Item Price's valid_from/valid_upto window.
             or not _is_price_row_valid(rule, posting_date)
+            # ERPNext evaluates a condition over doc.as_dict(), forged free rows and
+            # the totals they inflate included, so a conditional rule fails closed.
+            or cstr(rule.get("condition"))
         ):
             continue
         if rule.get("apply_on") == "Transaction":
