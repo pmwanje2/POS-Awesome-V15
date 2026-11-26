@@ -225,20 +225,30 @@ def _get_item_uom_context(item_rows):
     item_meta = frappe.get_all(
         "Item",
         filters={"item_code": ["in", codes]},
-        fields=["item_code", "stock_uom", "is_stock_item", "last_purchase_rate", "valuation_rate"],
+        fields=[
+            "item_code",
+            "stock_uom",
+            "variant_of",
+            "is_stock_item",
+            "last_purchase_rate",
+            "valuation_rate",
+        ],
         limit_page_length=len(codes),
     )
     item_info = {}
     stock_uoms = {}
+    templates = {}
     for row in item_meta or []:
         code = row.get("item_code")
         if not code:
             continue
         item_info[code] = row
         stock_uoms[code] = row.get("stock_uom")
+        if row.get("variant_of"):
+            templates[code] = row.get("variant_of")
     conversions = frappe.get_all(
         "UOM Conversion Detail",
-        filters={"parent": ["in", codes], "parenttype": "Item"},
+        filters={"parent": ["in", sorted({*codes, *templates.values()})], "parenttype": "Item"},
         fields=["parent", "uom", "conversion_factor"],
         limit_page_length=0,
     )
@@ -247,6 +257,12 @@ def _get_item_uom_context(item_rows):
         for row in conversions or []
         if row.get("parent") and row.get("uom") and flt(row.get("conversion_factor")) > 0
     }
+    # A variant without its own UOM row uses its template's, as ERPNext's
+    # get_conversion_factor does.
+    for item_code, template in templates.items():
+        for (parent, uom), factor in list(conversion_factors.items()):
+            if parent == template:
+                conversion_factors.setdefault((item_code, uom), factor)
     for item_code, stock_uom in stock_uoms.items():
         if stock_uom:
             conversion_factors[(item_code, stock_uom)] = 1.0
@@ -350,7 +366,8 @@ def _convert_floor_to_invoice_currency(
 def resolve_buying_floors(items, pos_profile=None, invoice_doc=None):
     """Resolve authoritative per-line cost floors across buying list, warehouse valuation, and LPR.
 
-    Client-provided ``trade_price``/``buying_rate`` values are intentionally ignored.
+    Client-provided ``trade_price``/``buying_rate``/``conversion_factor`` values are
+    intentionally ignored.
     Evaluates (1) active Buying Item Price, (2) warehouse Bin.valuation_rate (stock items,
     matching SAP VPRS / ERPNext SellingController), and (3) Item.last_purchase_rate,
     selecting the highest normalized floor in invoice currency.
@@ -405,13 +422,11 @@ def resolve_buying_floors(items, pos_profile=None, invoice_doc=None):
             continue
         selected_uom = row.get("uom") or stock_uoms.get(item_code)
         stock_uom = stock_uoms.get(item_code) or row.get("stock_uom") or selected_uom
+        # Only the Item master defines a UOM factor; the row's conversion_factor
+        # is client-supplied. An unknown UOM leaves the stock-UOM costs unusable.
         factor = conversion_factors.get((item_code, selected_uom))
-        if factor is None:
-            row_factor = flt(row.get("conversion_factor"))
-            if row_factor > 0:
-                factor = row_factor
-            elif selected_uom == stock_uom or not selected_uom:
-                factor = 1.0
+        if factor is None and (selected_uom == stock_uom or not selected_uom):
+            factor = 1.0
 
         candidates_floors = []
 
@@ -463,16 +478,15 @@ def resolve_buying_floors(items, pos_profile=None, invoice_doc=None):
 
         meta = item_info.get(item_code) or {}
         is_stock_item = bool(cint(meta.get("is_stock_item", 1)))
-        effective_factor = factor or 1.0
         cost_currency = company_currency or invoice_currency
 
         # 2) Warehouse Bin.valuation_rate (stock items only, matching ERPNext validate_selling_price)
         warehouse = row.get("warehouse") or default_warehouse
-        if is_stock_item and warehouse:
+        if factor and is_stock_item and warehouse:
             bin_val = flt(bin_valuations.get((item_code, warehouse)))
             if bin_val > 0:
                 normalized_val = _convert_floor_to_invoice_currency(
-                    bin_val * effective_factor,
+                    bin_val * factor,
                     cost_currency,
                     invoice_currency or cost_currency,
                     company,
@@ -497,9 +511,9 @@ def resolve_buying_floors(items, pos_profile=None, invoice_doc=None):
 
         # 3) Item.last_purchase_rate (matching ERPNext validate_selling_price)
         lpr = flt(meta.get("last_purchase_rate"))
-        if lpr > 0:
+        if factor and lpr > 0:
             normalized_lpr = _convert_floor_to_invoice_currency(
-                lpr * effective_factor,
+                lpr * factor,
                 cost_currency,
                 invoice_currency or cost_currency,
                 company,
@@ -525,6 +539,109 @@ def resolve_buying_floors(items, pos_profile=None, invoice_doc=None):
         if candidates_floors:
             floors[index] = max(candidates_floors, key=lambda entry: flt(entry.get("rate")))
     return floors
+
+
+def _applied_pricing_rule_names(value):
+    """Parse a row's ``pricing_rules`` as ERPNext stores it (JSON list or comma-separated)."""
+
+    text = cstr(value).strip()
+    if not text:
+        return set()
+    if text.startswith("["):
+        try:
+            names = json.loads(text)
+        except ValueError:
+            return set()
+    else:
+        names = text.split(",")
+    return {cstr(name).strip() for name in names if cstr(name).strip()}
+
+
+def _server_applied_free_row_indexes(item_rows, invoice_doc=None):
+    """Return the free rows ERPNext itself applied from an active promotional rule.
+
+    ERPNext marks a promotional free row with ``is_free_item`` and the single
+    applying rule name (``get_product_discount_rule``). Unless the invoice ignores
+    pricing rules, every validate rewrites each paid row's ``pricing_rules`` from
+    ERPNext's own evaluation, re-sizes the first free row per (item, rule) and
+    removes free rows of unmatched Transaction rules. A client can forge a free
+    row, but not an active selling Product rule for that item nor the rule's
+    application to a paid row, so only those free rows skip the cost floor.
+    """
+
+    has_doc = invoice_doc and hasattr(invoice_doc, "get")
+    if has_doc and cint(invoice_doc.get("ignore_pricing_rule")):
+        return set()
+
+    free_rules = {
+        index: cstr(row.get("pricing_rules")).strip()
+        for index, row in enumerate(item_rows)
+        if hasattr(row, "get")
+        and row.get("item_code")
+        and cint(row.get("is_free_item"))
+        and cstr(row.get("pricing_rules")).strip()
+    }
+    if not free_rules:
+        return set()
+
+    rules = {
+        rule.get("name"): rule
+        for rule in frappe.get_all(
+            "Pricing Rule",
+            filters={"name": ["in", sorted(set(free_rules.values()))]},
+            fields=[
+                "name",
+                "disable",
+                "selling",
+                "price_or_product_discount",
+                "apply_on",
+                "same_item",
+                "free_item",
+                "company",
+                "valid_from",
+                "valid_upto",
+            ],
+            limit_page_length=0,
+        )
+        or []
+        if rule.get("name")
+    }
+    paid_items_by_rule = {}
+    for row in item_rows:
+        if hasattr(row, "get") and row.get("item_code") and not cint(row.get("is_free_item")):
+            for rule_name in _applied_pricing_rule_names(row.get("pricing_rules")):
+                paid_items_by_rule.setdefault(rule_name, set()).add(row.get("item_code"))
+
+    posting_date = invoice_doc.get("posting_date") if has_doc else None
+    company = invoice_doc.get("company") if has_doc else None
+    authorized = set()
+    seen = set()
+    for index, rule_name in free_rules.items():
+        item_code = item_rows[index].get("item_code")
+        rule = rules.get(rule_name)
+        if (
+            not rule
+            or (item_code, rule_name) in seen
+            or cint(rule.get("disable"))
+            or not cint(rule.get("selling"))
+            or rule.get("price_or_product_discount") != "Product"
+            or (rule.get("company") and rule.get("company") != company)
+            # Pricing Rule shares Item Price's valid_from/valid_upto window.
+            or not _is_price_row_valid(rule, posting_date)
+        ):
+            continue
+        if rule.get("apply_on") == "Transaction":
+            gives_item = item_code == rule.get("free_item")
+        else:
+            paid_items = paid_items_by_rule.get(rule_name) or set()
+            gives_item = bool(paid_items) and (
+                item_code == rule.get("free_item")
+                or (cint(rule.get("same_item")) and item_code in paid_items)
+            )
+        if gives_item:
+            seen.add((item_code, rule_name))
+            authorized.add(index)
+    return authorized
 
 
 def collect_below_buying_price_errors(
@@ -561,12 +678,17 @@ def collect_below_buying_price_errors(
         and not item.get("posa_is_replace")
         and flt(item.get("qty")) > 0
     )
+    promotional_free_rows = _server_applied_free_row_indexes(item_rows, invoice_doc)
 
     for index, row in enumerate(item_rows):
         item_code = row.get("item_code") if hasattr(row, "get") else None
         if not item_code:
             continue
-        if row.get("posa_is_replace") or row.get("is_free_item") or flt(row.get("qty")) < 0:
+        if (
+            row.get("posa_is_replace")
+            or index in promotional_free_rows
+            or flt(row.get("qty")) < 0
+        ):
             continue
 
         floor_info = buying_floors.get(index) or {}
