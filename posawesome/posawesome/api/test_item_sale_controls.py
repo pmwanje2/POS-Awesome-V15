@@ -3439,7 +3439,6 @@ class TestItemSaleControls(unittest.TestCase):
             self._install_promotional_rule(
                 is_recursive=1,
                 min_qty=2,
-                uom="Box",
                 recurse_for=1,
                 free_qty=1,
                 round_free_qty=1,
@@ -3452,6 +3451,10 @@ class TestItemSaleControls(unittest.TestCase):
                     return [
                         {"item_code": "TRIG", "stock_uom": "Nos", "is_stock_item": 1},
                         {"item_code": "LOW", "stock_uom": "Nos", "is_stock_item": 1},
+                    ]
+                if doctype == "Pricing Rule Item Code":
+                    return [
+                        {"parent": "PR-FREE", "item_code": "TRIG", "uom": "Box"},
                     ]
                 if doctype == "UOM Conversion Detail":
                     return [
@@ -3527,6 +3530,345 @@ class TestItemSaleControls(unittest.TestCase):
             invoice_doc=invoice_doc,
         )
         self.assertEqual(errors, [])
+
+    def test_promotional_rule_query_rejects_nonexistent_parent_uom_and_reads_child_uom(self):
+        # Pinned ERPNext v16.60.0 tabPricing Rule parent schema does NOT have a `uom` column;
+        # uom lives on Pricing Rule Item Code / Item Group / Brand child tables.
+        valid_parent_columns = {
+            "name",
+            "disable",
+            "selling",
+            "buying",
+            "price_or_product_discount",
+            "apply_on",
+            "mixed_conditions",
+            "is_cumulative",
+            "same_item",
+            "free_item",
+            "free_qty",
+            "is_recursive",
+            "recurse_for",
+            "apply_recursion_over",
+            "round_free_qty",
+            "free_item_uom",
+            "currency",
+            "applicable_for",
+            "customer",
+            "customer_group",
+            "territory",
+            "sales_partner",
+            "campaign",
+            "company",
+            "valid_from",
+            "valid_upto",
+            "min_qty",
+            "max_qty",
+            "min_amt",
+            "max_amt",
+            "condition",
+        }
+
+        def install_strict_rule(child_doctype=None, child_rows=None, item_extra=None, **overrides):
+            self._install_promotional_rule(**overrides)
+            base_get_all = self.frappe.get_all
+
+            def strict_get_all(doctype, *args, **kwargs):
+                if doctype == "Pricing Rule":
+                    fields = kwargs.get("fields") or []
+                    unknown = [field for field in fields if field not in valid_parent_columns]
+                    if unknown:
+                        raise Exception(f"OperationalError: Unknown column '{unknown[0]}' in 'field list'")
+                    return base_get_all(doctype, *args, **kwargs)
+                if doctype == "Item":
+                    trig = {"item_code": "TRIG", "stock_uom": "Nos", "is_stock_item": 1}
+                    if item_extra:
+                        trig.update(item_extra)
+                    return [
+                        trig,
+                        {"item_code": "LOW", "stock_uom": "Nos", "is_stock_item": 1},
+                    ]
+                if doctype == "UOM Conversion Detail":
+                    return [
+                        {"parent": "TRIG", "uom": "Box", "conversion_factor": 3.0},
+                        {"parent": "TRIG", "uom": "Case", "conversion_factor": 6.0},
+                    ]
+                if child_doctype and doctype == child_doctype:
+                    return list(child_rows or [])
+                return base_get_all(doctype, *args, **kwargs)
+
+            self.frappe.get_all = strict_get_all
+
+        with self.subTest("non-recursive promotion queries only real Pricing Rule parent columns"):
+            install_strict_rule(is_recursive=0, free_qty=1)
+            self.assertEqual(
+                self.controls.collect_below_buying_price_errors(
+                    [self._promo_trigger_row(), self._promo_free_row(rate=0)],
+                    invoice_doc=dict(self.PROMO_INVOICE),
+                ),
+                [],
+            )
+
+        for label, apply_on, child_dt, child_row, item_extra in (
+            (
+                "Pricing Rule Item Code child uom",
+                "Item Code",
+                "Pricing Rule Item Code",
+                {"parent": "PR-FREE", "item_code": "TRIG", "uom": "Box"},
+                None,
+            ),
+            (
+                "Pricing Rule Item Group child uom",
+                "Item Group",
+                "Pricing Rule Item Group",
+                {"parent": "PR-FREE", "item_group": "Beverages", "uom": "Box"},
+                {"item_group": "Beverages"},
+            ),
+            (
+                "Pricing Rule Brand child uom",
+                "Brand",
+                "Pricing Rule Brand",
+                {"parent": "PR-FREE", "brand": "Acme", "uom": "Box"},
+                {"brand": "Acme"},
+            ),
+        ):
+            with self.subTest(label):
+                install_strict_rule(
+                    child_doctype=child_dt,
+                    child_rows=[child_row],
+                    item_extra=item_extra,
+                    apply_on=apply_on,
+                    is_recursive=1,
+                    min_qty=2,
+                    recurse_for=1,
+                    free_qty=1,
+                    round_free_qty=1,
+                    free_item_uom="Nos",
+                )
+                five_nos = self._promo_trigger_row()
+                five_nos["qty"] = 5
+                five_nos["uom"] = "Nos"
+                five_nos["stock_uom"] = "Nos"
+                five_nos["stock_qty"] = 5.0
+                if item_extra:
+                    five_nos.update(item_extra)
+                free_one = self._promo_free_row(rate=0)
+                free_one["qty"] = 1
+                self.assertEqual(
+                    len(
+                        self.controls.collect_below_buying_price_errors(
+                            [five_nos, free_one],
+                            invoice_doc=dict(self.PROMO_INVOICE),
+                        )
+                    ),
+                    1,
+                )
+
+                one_case = self._promo_trigger_row()
+                one_case["qty"] = 1
+                one_case["uom"] = "Case"
+                one_case["stock_uom"] = "Nos"
+                one_case["conversion_factor"] = 6.0
+                one_case["stock_qty"] = 6.0
+                if item_extra:
+                    one_case.update(item_extra)
+                self.assertEqual(
+                    self.controls.collect_below_buying_price_errors(
+                        [one_case, free_one],
+                        invoice_doc=dict(self.PROMO_INVOICE),
+                    ),
+                    [],
+                )
+
+    def test_reconciled_multi_unit_line_honors_native_rounded_net_rate_cross_currency(self):
+        self._install_bin_valuation(valuation_rate=3700.0, company_currency="UGX")
+        erpnext_pkg = types.ModuleType("erpnext")
+        erpnext_setup = types.ModuleType("erpnext.setup")
+        erpnext_utils = types.ModuleType("erpnext.setup.utils")
+        erpnext_utils.get_exchange_rate = (
+            lambda from_curr, to_curr, *_args, **_kwargs: 3700.0
+            if (from_curr, to_curr) == ("USD", "UGX")
+            else 1.0
+        )
+
+        # 3 units at USD 1.00 sharing 0.01 Net Total discount -> ERPNext sets
+        # net_amount=2.99, net_rate=1.00, base_net_amount=11063.00, base_net_rate=3700.00.
+        valid_row = PrecisionDoc(
+            item_code="LOW",
+            item_name="Three Unit Rounded Net Rate",
+            qty=3,
+            rate=1.00,
+            amount=3.00,
+            net_amount=2.99,
+            net_rate=1.00,
+            base_net_amount=11063.00,
+            base_net_rate=3700.00,
+            uom="Nos",
+            warehouse="Shop Floor - JBS",
+            precision_value=2,
+        )
+        invoice_doc = PrecisionDoc(
+            company="Test Co",
+            currency="USD",
+            conversion_rate=3700.0,
+            apply_discount_on="Net Total",
+            discount_amount=0.01,
+            precision_value=2,
+        )
+        with patch.dict(
+            sys.modules,
+            {
+                "erpnext": erpnext_pkg,
+                "erpnext.setup": erpnext_setup,
+                "erpnext.setup.utils": erpnext_utils,
+            },
+        ):
+            self.assertEqual(
+                self.controls.collect_below_buying_price_errors(
+                    [valid_row],
+                    invoice_doc=invoice_doc,
+                ),
+                [],
+            )
+
+            # Forged inflated net_rate inconsistent with net_amount must still be rejected.
+            forged_row = PrecisionDoc(
+                item_code="LOW",
+                item_name="Forged Net Rate Row",
+                qty=3,
+                rate=1.00,
+                amount=3.00,
+                net_amount=2.50,
+                net_rate=1.00,
+                base_net_amount=9250.00,
+                base_net_rate=3700.00,
+                uom="Nos",
+                warehouse="Shop Floor - JBS",
+                precision_value=2,
+            )
+            forged_invoice = PrecisionDoc(
+                company="Test Co",
+                currency="USD",
+                conversion_rate=3700.0,
+                apply_discount_on="Net Total",
+                discount_amount=0.50,
+                precision_value=2,
+            )
+            self.assertEqual(
+                len(
+                    self.controls.collect_below_buying_price_errors(
+                        [forged_row],
+                        invoice_doc=forged_invoice,
+                    )
+                ),
+                1,
+            )
+
+    def test_non_mixed_recursive_pricing_rule_evaluates_min_max_qty_per_paid_line(self):
+        with self.subTest("two 3-unit lines qualify independently under max_qty=4 and award 6 free units"):
+            self._install_promotional_rule(
+                apply_on="Item Code",
+                mixed_conditions=0,
+                is_cumulative=0,
+                is_recursive=1,
+                min_qty=1,
+                max_qty=4,
+                recurse_for=1,
+                free_qty=1,
+                round_free_qty=1,
+            )
+            line_a = self._promo_trigger_row()
+            line_a["qty"] = 3
+            line_b = self._promo_trigger_row()
+            line_b["qty"] = 3
+
+            free_six = self._promo_free_row(rate=0)
+            free_six["qty"] = 6
+            self.assertEqual(
+                self.controls.collect_below_buying_price_errors(
+                    [line_a, line_b, free_six],
+                    invoice_doc=dict(self.PROMO_INVOICE),
+                ),
+                [],
+            )
+
+            free_seven = self._promo_free_row(rate=0)
+            free_seven["qty"] = 7
+            self.assertEqual(
+                len(
+                    self.controls.collect_below_buying_price_errors(
+                        [line_a, line_b, free_seven],
+                        invoice_doc=dict(self.PROMO_INVOICE),
+                    )
+                ),
+                1,
+            )
+
+        with self.subTest("non-mixed rule excludes a second line exceeding max_qty=4"):
+            self._install_promotional_rule(
+                apply_on="Item Code",
+                mixed_conditions=0,
+                is_cumulative=0,
+                is_recursive=1,
+                min_qty=1,
+                max_qty=4,
+                recurse_for=1,
+                free_qty=1,
+                round_free_qty=1,
+            )
+            line_ok = self._promo_trigger_row()
+            line_ok["qty"] = 3
+            line_over = self._promo_trigger_row()
+            line_over["qty"] = 5
+
+            free_three = self._promo_free_row(rate=0)
+            free_three["qty"] = 3
+            self.assertEqual(
+                self.controls.collect_below_buying_price_errors(
+                    [line_ok, line_over, free_three],
+                    invoice_doc=dict(self.PROMO_INVOICE),
+                ),
+                [],
+            )
+
+            free_four = self._promo_free_row(rate=0)
+            free_four["qty"] = 4
+            self.assertEqual(
+                len(
+                    self.controls.collect_below_buying_price_errors(
+                        [line_ok, line_over, free_four],
+                        invoice_doc=dict(self.PROMO_INVOICE),
+                    )
+                ),
+                1,
+            )
+
+        with self.subTest("mixed_conditions=1 still aggregates lines and rejects 3+3=6 > max_qty=4"):
+            self._install_promotional_rule(
+                apply_on="Item Code",
+                mixed_conditions=1,
+                is_cumulative=0,
+                is_recursive=1,
+                min_qty=1,
+                max_qty=4,
+                recurse_for=1,
+                free_qty=1,
+                round_free_qty=1,
+            )
+            line_a = self._promo_trigger_row()
+            line_a["qty"] = 3
+            line_b = self._promo_trigger_row()
+            line_b["qty"] = 3
+            free_six = self._promo_free_row(rate=0)
+            free_six["qty"] = 6
+            self.assertEqual(
+                len(
+                    self.controls.collect_below_buying_price_errors(
+                        [line_a, line_b, free_six],
+                        invoice_doc=dict(self.PROMO_INVOICE),
+                    )
+                ),
+                1,
+            )
 
 
 if __name__ == "__main__":

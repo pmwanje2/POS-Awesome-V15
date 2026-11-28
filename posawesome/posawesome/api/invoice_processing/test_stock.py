@@ -318,6 +318,103 @@ class TestStripClientFreebies(unittest.TestCase):
         self.assertAlmostEqual(all_a, 0.32, places=6)
         self.assertAlmostEqual(all_b, 0.0, places=6)
 
+    def test_merge_duplicate_taxes_distinguishes_on_previous_row_total_vs_amount_when_dropping_duplicate(
+        self,
+    ):
+        class InvoiceStub(dict):
+            def set(self, key, value):
+                self[key] = value
+
+            def calculate_taxes_and_totals(self):
+                return None
+
+        taxes = [
+            {
+                "idx": 1,
+                "charge_type": "On Net Total",
+                "account_head": "Tax A - CO",
+                "rate": 10.0,
+                "included_in_print_rate": 0,
+            },
+            {
+                "idx": 2,
+                "charge_type": "On Net Total",
+                "account_head": "Tax B - CO",
+                "rate": 20.0,
+                "included_in_print_rate": 0,
+            },
+            {
+                "idx": 3,
+                "charge_type": "On Net Total",
+                "account_head": "Tax A - CO",
+                "rate": 10.0,
+                "included_in_print_rate": 0,
+            },
+            {
+                "idx": 4,
+                "charge_type": "On Previous Row Total",
+                "account_head": "Tax C - CO",
+                "row_id": "3",
+                "rate": 10.0,
+                "included_in_print_rate": 0,
+            },
+            {
+                "idx": 5,
+                "charge_type": "On Previous Row Amount",
+                "account_head": "Tax D - CO",
+                "row_id": "3",
+                "rate": 10.0,
+                "included_in_print_rate": 0,
+            },
+        ]
+        invoice_doc = InvoiceStub(
+            company="Test Co",
+            currency="USD",
+            conversion_rate=1.0,
+            taxes=[dict(row) for row in taxes],
+        )
+
+        self.stock._merge_duplicate_taxes(invoice_doc, recalculate=False)
+
+        merged = invoice_doc["taxes"]
+        self.assertEqual(len(merged), 4)
+        self.assertEqual(
+            [row.get("account_head") for row in merged],
+            ["Tax A - CO", "Tax B - CO", "Tax C - CO", "Tax D - CO"],
+        )
+        self.assertEqual([row.get("idx") for row in merged], [1, 2, 3, 4])
+        # On Previous Row Total of dropped row 3 must point to last surviving row before 3 (row 2: B, total=130 -> 13.00).
+        self.assertEqual(merged[2].get("row_id"), "2")
+        # On Previous Row Amount of dropped row 3 must point to surviving duplicate of A (row 1: A, amount=10 -> 1.00).
+        self.assertEqual(merged[3].get("row_id"), "1")
+
+        controls_path = REPO_ROOT / "posawesome" / "posawesome" / "api" / "item_sale_controls.py"
+        spec = importlib.util.spec_from_file_location(
+            "posawesome.posawesome.api.item_sale_controls", controls_path
+        )
+        controls = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(controls)
+
+        total_only_doc = InvoiceStub(
+            company="Test Co",
+            currency="USD",
+            conversion_rate=1.0,
+            taxes=merged[:3],
+        )
+        _incl_a, _incl_b, total_only_a, _total_only_b = controls._row_tax_params(
+            {"item_code": "ITEM-1"},
+            total_only_doc,
+        )
+        # On 100 net: A=10 + B=20 + C=10% of 130 (13.00) = 43.00
+        self.assertAlmostEqual(total_only_a, 0.43, places=6)
+
+        _incl_a, _incl_b, full_a, _full_b = controls._row_tax_params(
+            {"item_code": "ITEM-1"},
+            invoice_doc,
+        )
+        # Adding D=10% of A (1.00) -> 44.00
+        self.assertAlmostEqual(full_a, 0.44, places=6)
+
 
 if __name__ == "__main__":
     unittest.main()

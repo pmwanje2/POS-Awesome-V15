@@ -944,4 +944,97 @@ describe("loss prevention", () => {
 		expect(below?.belowCost).toBe(true);
 		expect(below?.sellingRate).toBeCloseTo(100);
 	});
+
+	it("returns null floor on merge_item_row output with unresolved foreign _buying_prices_by_uom despite lower USD valuation", () => {
+		const mergedItem = {
+			item_code: "EUR-MERGE-ROW",
+			item_name: "EUR Cost Merged Item",
+			qty: 1,
+			rate: 8,
+			price_list_rate: 8,
+			currency: "USD",
+			price_list_currency: "USD",
+			conversion_rate: 1,
+			plc_conversion_rate: 1,
+			uom: "Nos",
+			stock_uom: "Nos",
+			conversion_factor: 1,
+			base_buying_rate: null,
+			trade_price: null,
+			buying_rate: null,
+			buying_rate_currency: null,
+			buying_price_currency: "EUR",
+			buying_exchange_rate: null,
+			valuation_rate: 5,
+			_buying_prices_by_uom: {
+				Nos: {
+					price_list_rate: 10,
+					base_price_list_rate: null,
+					currency: "EUR",
+					price_list: "Standard Buying",
+				},
+			},
+		};
+
+		expect(getItemCostFloor(mergedItem)).toBeNull();
+	});
+
+	it("honors native rounded net_rate on reconciled multi-unit line (3 x 1.00 with 0.01 discount)", () => {
+		const items = [
+			{
+				item_code: "MULTI-UNIT",
+				qty: 3,
+				rate: 1.0,
+				net_amount: 2.99,
+				net_rate: 1.0,
+				base_net_rate: 1.0,
+				trade_price: 1.0,
+			},
+		];
+		const doc = {
+			apply_discount_on: "Net Total",
+			discount_amount: 0.01,
+			items,
+		};
+		const invoiceDiscountPercentage = resolveInvoiceDiscountPercentage(
+			doc,
+			items,
+		);
+		expect(
+			findLossRiskItems(items, {
+				invoiceDiscountPercentage,
+				applyDiscountOn: "Net Total",
+				currencyPrecision: 2,
+			}),
+		).toEqual([]);
+
+		// Forged inflated net_rate inconsistent with net_amount must still be flagged.
+		const forgedItems = [
+			{
+				item_code: "MULTI-UNIT-FORGED",
+				qty: 3,
+				rate: 1.0,
+				net_amount: 2.5,
+				net_rate: 1.0,
+				base_net_rate: 1.0,
+				trade_price: 1.0,
+			},
+		];
+		const forgedPct = resolveInvoiceDiscountPercentage(
+			{
+				apply_discount_on: "Net Total",
+				discount_amount: 0.5,
+				items: forgedItems,
+			},
+			forgedItems,
+		);
+		const forgedRisks = findLossRiskItems(forgedItems, {
+			invoiceDiscountPercentage: forgedPct,
+			applyDiscountOn: "Net Total",
+			currencyPrecision: 2,
+		});
+		expect(forgedRisks.map((risk) => risk.itemCode)).toEqual([
+			"MULTI-UNIT-FORGED",
+		]);
+	});
 });

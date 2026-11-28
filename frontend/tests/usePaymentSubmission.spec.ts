@@ -660,6 +660,239 @@ describe("usePaymentSubmission", () => {
 		await expect(submission.validateSubmission(true)).resolves.toBe(true);
 	});
 
+	it("blocks checkout under Block policy on merge_item_row output with unresolved foreign _buying_prices_by_uom despite lower USD valuation", async () => {
+		const invoiceDoc = ref<any>({
+			is_return: 0,
+			currency: "USD",
+			items: [
+				{
+					item_code: "EUR-MERGE-ROW",
+					item_name: "EUR Cost Merged Item",
+					qty: 1,
+					rate: 8,
+					price_list_rate: 8,
+					currency: "USD",
+					price_list_currency: "USD",
+					conversion_rate: 1,
+					plc_conversion_rate: 1,
+					uom: "Nos",
+					stock_uom: "Nos",
+					conversion_factor: 1,
+					base_buying_rate: null,
+					trade_price: null,
+					buying_rate: null,
+					buying_rate_currency: null,
+					buying_price_currency: "EUR",
+					buying_exchange_rate: null,
+					valuation_rate: 5,
+					_buying_prices_by_uom: {
+						Nos: {
+							price_list_rate: 10,
+							base_price_list_rate: null,
+							currency: "EUR",
+							price_list: "Standard Buying",
+						},
+					},
+				},
+			],
+			payments: [{ mode_of_payment: "Cash", amount: 8, type: "Cash" }],
+			rounded_total: 8,
+			grand_total: 8,
+		});
+
+		const submission = usePaymentSubmission({
+			invoiceDoc,
+			posProfile: ref({ posa_missing_cost_action: "Block" }),
+			stockSettings: ref({}),
+			invoiceType: ref("Invoice"),
+			formatFloat: (value) => Number(value || 0),
+			stores: { toastStore: { show: vi.fn() } },
+			diff_payment: ref(0) as any,
+			isCashback: ref(true),
+		});
+
+		await expect(submission.validateSubmission(true)).rejects.toThrow(
+			/no valid buying floor is available for EUR Cost Merged Item/i,
+		);
+	});
+
+	it("does not overturn reconciled invoiceDoc.items when invoiceStore cart rows lack calculated net fields", async () => {
+		const invoiceDoc = ref<any>({
+			is_return: 0,
+			currency: "USD",
+			apply_discount_on: "Net Total",
+			discount_amount: 0.02,
+			items: [
+				{
+					item_code: "ITEM-1",
+					item_name: "Line 1",
+					qty: 1,
+					rate: 1.0,
+					net_rate: 0.99,
+					net_amount: 0.99,
+					trade_price: 0.99,
+				},
+				{
+					item_code: "ITEM-2",
+					item_name: "Line 2",
+					qty: 1,
+					rate: 1.0,
+					net_rate: 1.0,
+					net_amount: 1.0,
+					trade_price: 1.0,
+				},
+				{
+					item_code: "ITEM-3",
+					item_name: "Line 3",
+					qty: 1,
+					rate: 1.0,
+					net_rate: 0.99,
+					net_amount: 0.99,
+					trade_price: 0.99,
+				},
+			],
+			payments: [{ mode_of_payment: "Cash", amount: 2.98, type: "Cash" }],
+			rounded_total: 2.98,
+			grand_total: 2.98,
+		});
+
+		const cartItems = ref([
+			{
+				item_code: "ITEM-1",
+				item_name: "Line 1",
+				qty: 1,
+				rate: 1.0,
+				trade_price: 0.99,
+			},
+			{
+				item_code: "ITEM-2",
+				item_name: "Line 2",
+				qty: 1,
+				rate: 1.0,
+				trade_price: 1.0,
+			},
+			{
+				item_code: "ITEM-3",
+				item_name: "Line 3",
+				qty: 1,
+				rate: 1.0,
+				trade_price: 0.99,
+			},
+		]);
+
+		const submission = usePaymentSubmission({
+			invoiceDoc,
+			posProfile: ref({ posa_below_cost_action: "Block" }),
+			stockSettings: ref({}),
+			invoiceType: ref("Invoice"),
+			formatFloat: (value) => Number(value || 0),
+			stores: {
+				toastStore: { show: vi.fn() },
+				invoiceStore: {
+					invoiceDoc: invoiceDoc.value,
+					items: cartItems,
+				},
+			},
+			diff_payment: ref(0) as any,
+			isCashback: ref(true),
+		});
+
+		await expect(submission.validateSubmission(true)).resolves.toBe(true);
+	});
+
+	it("accepts reconciled 3-unit line at 1.00 with 0.01 discount and native net_rate 1.00", async () => {
+		const invoiceDoc = ref<any>({
+			is_return: 0,
+			currency: "USD",
+			apply_discount_on: "Net Total",
+			discount_amount: 0.01,
+			items: [
+				{
+					item_code: "MULTI-3",
+					item_name: "Three Unit Item",
+					qty: 3,
+					rate: 1.0,
+					net_amount: 2.99,
+					net_rate: 1.0,
+					base_net_rate: 1.0,
+					trade_price: 1.0,
+				},
+			],
+			payments: [{ mode_of_payment: "Cash", amount: 2.99, type: "Cash" }],
+			rounded_total: 2.99,
+			grand_total: 2.99,
+		});
+
+		const submission = usePaymentSubmission({
+			invoiceDoc,
+			posProfile: ref({ posa_below_cost_action: "Block" }),
+			stockSettings: ref({}),
+			invoiceType: ref("Invoice"),
+			formatFloat: (value) => Number(value || 0),
+			stores: { toastStore: { show: vi.fn() } },
+			currencyPrecision: ref(2),
+			diff_payment: ref(0) as any,
+			isCashback: ref(true),
+		});
+
+		await expect(submission.validateSubmission(true)).resolves.toBe(true);
+	});
+
+	it("preserves configured currencyPrecision 0 for zero-decimal UGX rounding reconciliation", async () => {
+		const invoiceDoc = ref<any>({
+			is_return: 0,
+			currency: "UGX",
+			apply_discount_on: "Net Total",
+			discount_amount: 2,
+			items: [
+				{
+					item_code: "UGX-1",
+					item_name: "UGX Line 1",
+					qty: 1,
+					rate: 100,
+					net_rate: 99,
+					net_amount: 99,
+					trade_price: 99,
+				},
+				{
+					item_code: "UGX-2",
+					item_name: "UGX Line 2",
+					qty: 1,
+					rate: 100,
+					net_rate: 100,
+					net_amount: 100,
+					trade_price: 100,
+				},
+				{
+					item_code: "UGX-3",
+					item_name: "UGX Line 3",
+					qty: 1,
+					rate: 100,
+					net_rate: 99,
+					net_amount: 99,
+					trade_price: 99,
+				},
+			],
+			payments: [{ mode_of_payment: "Cash", amount: 298, type: "Cash" }],
+			rounded_total: 298,
+			grand_total: 298,
+		});
+
+		const submission = usePaymentSubmission({
+			invoiceDoc,
+			posProfile: ref({ posa_below_cost_action: "Block" }),
+			stockSettings: ref({}),
+			invoiceType: ref("Invoice"),
+			formatFloat: (value) => Number(value || 0),
+			stores: { toastStore: { show: vi.fn() } },
+			currencyPrecision: ref(0),
+			diff_payment: ref(0) as any,
+			isCashback: ref(true),
+		});
+
+		await expect(submission.validateSubmission(true)).resolves.toBe(true);
+	});
+
 	it("defers print and schedules background wait when invoice submission is queued", async () => {
 		const invoiceService = (
 			await import("../src/posapp/services/invoiceService")
