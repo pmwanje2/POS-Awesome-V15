@@ -243,6 +243,8 @@ def _get_item_uom_context(item_rows):
             "item_code",
             "stock_uom",
             "variant_of",
+            "item_group",
+            "brand",
             "is_stock_item",
             "last_purchase_rate",
             "valuation_rate",
@@ -422,11 +424,11 @@ def _convert_floor_to_invoice_currency(
 
 
 def _resolve_buying_floors_with_uom_context(items, pos_profile=None, invoice_doc=None):
-    """Resolve authoritative per-line cost floors, item stock UOMs, and UOM conversion factors."""
+    """Resolve authoritative per-line cost floors, item stock UOMs, conversion factors, and item metadata."""
 
     item_rows = list(items or [])
     if not item_rows:
-        return {}, {}, {}
+        return {}, {}, {}, {}
 
     price_list, price_rows = _get_buying_price_rows(
         [row.get("item_code") for row in item_rows if hasattr(row, "get")],
@@ -619,13 +621,13 @@ def _resolve_buying_floors_with_uom_context(items, pos_profile=None, invoice_doc
 
         if candidates_floors:
             floors[index] = max(candidates_floors, key=lambda entry: flt(entry.get("base_rate")))
-    return floors, stock_uoms, conversion_factors
+    return floors, stock_uoms, conversion_factors, item_info
 
 
 def _resolve_buying_floors_with_context(items, pos_profile=None, invoice_doc=None):
     """Resolve authoritative per-line cost floors and item stock UOM context."""
 
-    floors, stock_uoms, _conversion_factors = _resolve_buying_floors_with_uom_context(
+    floors, stock_uoms, _conversion_factors, _item_info = _resolve_buying_floors_with_uom_context(
         items,
         pos_profile=pos_profile,
         invoice_doc=invoice_doc,
@@ -856,7 +858,7 @@ def _rule_matches_invoice_party(rule, invoice_doc, has_doc):
 
 
 def _server_applied_free_row_indexes(
-    item_rows, invoice_doc=None, stock_uoms=None, conversion_factors=None
+    item_rows, invoice_doc=None, stock_uoms=None, conversion_factors=None, item_info=None
 ):
     """Return the free rows ERPNext itself applied from an active promotional rule.
 
@@ -897,6 +899,8 @@ def _server_applied_free_row_indexes(
                 "selling",
                 "price_or_product_discount",
                 "apply_on",
+                "mixed_conditions",
+                "is_cumulative",
                 "same_item",
                 "free_item",
                 "free_qty",
@@ -905,7 +909,6 @@ def _server_applied_free_row_indexes(
                 "apply_recursion_over",
                 "round_free_qty",
                 "free_item_uom",
-                "uom",
                 "currency",
                 "applicable_for",
                 "customer",
@@ -929,6 +932,124 @@ def _server_applied_free_row_indexes(
     }
     stock_uoms_map = stock_uoms or {}
     conversion_factors_map = conversion_factors or {}
+    item_info_map = item_info or {}
+
+    # ERPNext v16.60.0 stores `uom` on the Pricing Rule child tables
+    # (`Pricing Rule Item Code`, `Pricing Rule Item Group`, `Pricing Rule Brand`),
+    # not on `tabPricing Rule` (`pricing_rule/utils.py:175`).
+    rule_item_uoms = {}
+    rule_item_group_rows = {}
+    rule_brand_uoms = {}
+    item_code_rule_names = sorted(
+        {
+            name
+            for name, rule in rules.items()
+            if cstr(rule.get("apply_on")).strip() == "Item Code"
+        }
+    )
+    if item_code_rule_names:
+        for child in (
+            frappe.get_all(
+                "Pricing Rule Item Code",
+                filters={"parent": ["in", item_code_rule_names]},
+                fields=["parent", "item_code", "uom"],
+                limit_page_length=0,
+            )
+            or []
+        ):
+            if hasattr(child, "get") and child.get("parent") and child.get("item_code"):
+                rule_item_uoms.setdefault(
+                    (child.get("parent"), cstr(child.get("item_code")).strip()), []
+                ).append(cstr(child.get("uom")).strip())
+
+    item_group_rule_names = sorted(
+        {
+            name
+            for name, rule in rules.items()
+            if cstr(rule.get("apply_on")).strip() == "Item Group"
+        }
+    )
+    if item_group_rule_names:
+        for child in (
+            frappe.get_all(
+                "Pricing Rule Item Group",
+                filters={"parent": ["in", item_group_rule_names]},
+                fields=["parent", "item_group", "uom"],
+                limit_page_length=0,
+            )
+            or []
+        ):
+            if hasattr(child, "get") and child.get("parent") and child.get("item_group"):
+                rule_item_group_rows.setdefault(child.get("parent"), []).append(
+                    (cstr(child.get("item_group")).strip(), cstr(child.get("uom")).strip())
+                )
+
+    brand_rule_names = sorted(
+        {
+            name
+            for name, rule in rules.items()
+            if cstr(rule.get("apply_on")).strip() == "Brand"
+        }
+    )
+    if brand_rule_names:
+        for child in (
+            frappe.get_all(
+                "Pricing Rule Brand",
+                filters={"parent": ["in", brand_rule_names]},
+                fields=["parent", "brand", "uom"],
+                limit_page_length=0,
+            )
+            or []
+        ):
+            if hasattr(child, "get") and child.get("parent") and child.get("brand"):
+                rule_brand_uoms.setdefault(
+                    (child.get("parent"), cstr(child.get("brand")).strip()), []
+                ).append(cstr(child.get("uom")).strip())
+
+    def _pick_child_uom(candidates, preferred_uom):
+        if not candidates:
+            return ""
+        if preferred_uom and preferred_uom in candidates:
+            return preferred_uom
+        for candidate in candidates:
+            if candidate:
+                return candidate
+        return ""
+
+    def _matched_rule_uom(rule, code, preferred_uom, paid_row):
+        apply_on = cstr(rule.get("apply_on")).strip()
+        rule_name = rule.get("name")
+        meta = item_info_map.get(code) or {}
+        if apply_on == "Item Code":
+            candidates = rule_item_uoms.get((rule_name, code)) or []
+            if not candidates and meta.get("variant_of"):
+                candidates = rule_item_uoms.get(
+                    (rule_name, cstr(meta.get("variant_of")).strip())
+                ) or []
+            return _pick_child_uom(candidates, preferred_uom)
+        if apply_on == "Item Group":
+            item_group = cstr(meta.get("item_group") or paid_row.get("item_group")).strip()
+            if not item_group:
+                return ""
+            exact = [
+                uom
+                for group, uom in rule_item_group_rows.get(rule_name, [])
+                if group == item_group
+            ]
+            if exact:
+                return _pick_child_uom(exact, preferred_uom)
+            descendants = [
+                uom
+                for group, uom in rule_item_group_rows.get(rule_name, [])
+                if _is_descendant_tree_node("Item Group", item_group, group)
+            ]
+            return _pick_child_uom(descendants, preferred_uom)
+        if apply_on == "Brand":
+            brand = cstr(meta.get("brand") or paid_row.get("brand")).strip()
+            if not brand:
+                return ""
+            return _pick_child_uom(rule_brand_uoms.get((rule_name, brand)) or [], preferred_uom)
+        return ""
 
     def _authoritative_uom_factor(code, uom, stock_uom):
         if not uom or not stock_uom or uom == stock_uom:
@@ -947,8 +1068,6 @@ def _server_applied_free_row_indexes(
         return 0.0
 
     paid_items_by_rule = {}
-    paid_qty_by_rule = {}
-    paid_qty_by_rule_item = {}
     paid_rows_by_rule = {}
     paid_rows_by_rule_item = {}
     paid_qty = paid_amount = 0.0
@@ -972,10 +1091,8 @@ def _server_applied_free_row_indexes(
             )
             for rule_name in _applied_pricing_rule_names(row.get("pricing_rules")):
                 paid_items_by_rule.setdefault(rule_name, set()).add(row_code)
-                paid_qty_by_rule[rule_name] = paid_qty_by_rule.get(rule_name, 0.0) + row_qty
                 key = (rule_name, row_code)
-                paid_qty_by_rule_item[key] = paid_qty_by_rule_item.get(key, 0.0) + row_qty
-                entry = (row_code, row_stock_uom, row_stock_qty)
+                entry = (row_code, row_uom, row_stock_uom, row_qty, row_stock_qty, row)
                 paid_rows_by_rule.setdefault(rule_name, []).append(entry)
                 paid_rows_by_rule_item.setdefault(key, []).append(entry)
     paid_amount = flt(paid_amount, _field_precision(invoice_doc, "total"))
@@ -1026,18 +1143,12 @@ def _server_applied_free_row_indexes(
                 and paid_amount >= flt(rule.get("min_amt"))
                 and (not flt(rule.get("max_amt")) or paid_amount <= flt(rule.get("max_amt")))
             )
-            qualifying_qty = paid_qty
             qualifying_rows = []
         else:
             paid_items = paid_items_by_rule.get(rule_name) or set()
             is_same_item_award = bool(cint(rule.get("same_item")) and item_code in paid_items)
             gives_item = bool(paid_items) and (
                 item_code == rule.get("free_item") or is_same_item_award
-            )
-            qualifying_qty = (
-                paid_qty_by_rule_item.get((rule_name, item_code), 0.0)
-                if is_same_item_award
-                else paid_qty_by_rule.get(rule_name, 0.0)
             )
             qualifying_rows = (
                 paid_rows_by_rule_item.get((rule_name, item_code), [])
@@ -1053,23 +1164,48 @@ def _server_applied_free_row_indexes(
             if recurse_for <= 0:
                 continue
             # ERPNext pricing_rule/utils.py:312-332, 423-441 evaluates min_qty/max_qty
-            # against stock_qty (scaled by rule.uom conversion when rule.uom is set),
-            # while get_product_discount_rule:845-866 awards recursively from row.qty.
-            rule_uom = cstr(rule.get("uom")).strip()
-            qualifying_threshold_qty = 0.0
-            for q_code, q_stock_uom, q_stock_qty in qualifying_rows:
-                if not rule_uom or rule_uom == q_stock_uom:
-                    qualifying_threshold_qty += q_stock_qty
-                else:
-                    rule_uom_cf = _authoritative_uom_factor(q_code, rule_uom, q_stock_uom)
-                    if rule_uom_cf > 0:
-                        qualifying_threshold_qty += q_stock_qty / rule_uom_cf
+            # per paid line when mixed_conditions=0 and is_cumulative=0 (or aggregated
+            # when mixed_conditions/is_cumulative is enabled), using child-table uom
+            # conversion against stock_qty, then awards from qualifying row.qty (845-866).
             min_qty = flt(rule.get("min_qty"))
-            if min_qty > 0 and qualifying_threshold_qty < min_qty - 1e-9:
-                continue
             max_qty = flt(rule.get("max_qty"))
-            if max_qty > 0 and qualifying_threshold_qty > max_qty + 1e-9:
-                continue
+            is_mixed = bool(cint(rule.get("mixed_conditions")))
+            is_cumulative = bool(cint(rule.get("is_cumulative")))
+
+            def _row_threshold_qty(entry):
+                q_code, q_uom, q_stock_uom, _q_qty, q_stock_qty, q_row = entry
+                child_uom = _matched_rule_uom(rule, q_code, q_uom, q_row)
+                if not child_uom or child_uom == q_stock_uom:
+                    return q_stock_qty
+                child_cf = _authoritative_uom_factor(q_code, child_uom, q_stock_uom)
+                return (q_stock_qty / child_cf) if child_cf > 0 else None
+
+            if is_mixed or is_cumulative:
+                threshold_values = [_row_threshold_qty(entry) for entry in qualifying_rows]
+                valid_thresholds = [val for val in threshold_values if val is not None]
+                if not valid_thresholds:
+                    continue
+                total_threshold_qty = sum(valid_thresholds)
+                if min_qty > 0 and not is_cumulative and total_threshold_qty < min_qty - 1e-9:
+                    continue
+                if max_qty > 0 and total_threshold_qty > max_qty + 1e-9:
+                    continue
+                eligible_rows = qualifying_rows
+            else:
+                eligible_rows = []
+                for entry in qualifying_rows:
+                    row_threshold = _row_threshold_qty(entry)
+                    if row_threshold is None:
+                        continue
+                    if min_qty > 0 and row_threshold < min_qty - 1e-9:
+                        continue
+                    if max_qty > 0 and row_threshold > max_qty + 1e-9:
+                        continue
+                    eligible_rows.append(entry)
+                if not eligible_rows:
+                    continue
+
+            qualifying_qty = sum(entry[3] for entry in eligible_rows)
             recursion_over = flt(rule.get("apply_recursion_over"))
             transaction_qty = qualifying_qty - recursion_over
             if transaction_qty > 0:
@@ -1176,7 +1312,7 @@ def collect_below_buying_price_errors(
     policy = policy or resolve_sale_floor_policy(pos_profile)
     if not policy.get("enabled"):
         return []
-    buying_floors, stock_uoms, conversion_factors = _resolve_buying_floors_with_uom_context(
+    buying_floors, stock_uoms, conversion_factors, item_info = _resolve_buying_floors_with_uom_context(
         item_rows,
         pos_profile=pos_profile,
         invoice_doc=invoice_doc,
@@ -1200,6 +1336,7 @@ def collect_below_buying_price_errors(
         invoice_doc,
         stock_uoms=stock_uoms,
         conversion_factors=conversion_factors,
+        item_info=item_info,
     )
 
     row_tax_params = {}
@@ -1368,11 +1505,29 @@ def collect_below_buying_price_errors(
         net_rate_precision = _resolve_currency_precision(row, invoice_doc, "net_rate")
         base_precision = _resolve_currency_precision(row, invoice_doc, "base_net_rate")
 
+        honored_native_net_rate = False
         if reconciled_native_nets:
-            if _has_populated_net_field(row, "net_amount", gross_rate) and row_qty > 0:
-                selling_rate = abs(flt(row.get("net_amount"))) / row_qty
-            elif _has_populated_net_field(row, "net_rate", gross_rate):
-                selling_rate = abs(flt(row.get("net_rate")))
+            has_net_amount = _has_populated_net_field(row, "net_amount", gross_rate) and row_qty > 0
+            has_net_rate = _has_populated_net_field(row, "net_rate", gross_rate)
+            row_net_from_amount = (
+                abs(flt(row.get("net_amount"))) / row_qty if has_net_amount else None
+            )
+            row_net_rate = abs(flt(row.get("net_rate"))) if has_net_rate else None
+            half_ulp = (
+                0.5 * (10.0 ** (-net_rate_precision))
+                if net_rate_precision is not None
+                else 1e-9
+            )
+            # ERPNext taxes_and_totals.py:1118-1123 sets net_rate = flt(net_amount / qty, prec).
+            # Honor native net_rate when it is consistent with net_amount / qty within 0.5 ULP.
+            if row_net_rate is not None and (
+                row_net_from_amount is None
+                or abs(row_net_rate - row_net_from_amount) <= half_ulp + 1e-9
+            ):
+                selling_rate = row_net_rate
+                honored_native_net_rate = True
+            elif row_net_from_amount is not None:
+                selling_rate = row_net_from_amount
             else:
                 selling_rate = computed_net_rate
         else:
@@ -1397,7 +1552,11 @@ def collect_below_buying_price_errors(
                     selling_rate = row_net_rate
 
         base_selling_rate = selling_rate * invoice_to_company
-        if _has_populated_net_field(row, "base_net_amount", gross_rate) and row_qty > 0:
+        if (
+            not honored_native_net_rate
+            and _has_populated_net_field(row, "base_net_amount", gross_rate)
+            and row_qty > 0
+        ):
             row_base_from_amount = abs(flt(row.get("base_net_amount"))) / row_qty
             if base_precision is not None:
                 if flt(row_base_from_amount, base_precision) < flt(

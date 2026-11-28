@@ -293,7 +293,8 @@ def _merge_duplicate_taxes(invoice_doc, recalculate=True):
     """
     taxes = invoice_doc.get("taxes", [])
     seen_key_to_new_idx = {}
-    old_idx_to_new_idx = {}
+    amount_idx_map = {}
+    total_idx_map = {}
     unique = []
     for pos, tax in enumerate(taxes):
         orig_pos = pos + 1
@@ -303,10 +304,14 @@ def _merge_duplicate_taxes(invoice_doc, recalculate=True):
         charge_type = cstr(_tax_row_field(tax, "charge_type")).strip()
         raw_row_id = cstr(_tax_row_field(tax, "row_id")).strip()
         effective_row_id = raw_row_id
-        if charge_type in ("On Previous Row Amount", "On Previous Row Total") and raw_row_id:
+        if charge_type == "On Previous Row Amount" and raw_row_id:
             ref_idx = cint(raw_row_id)
-            if ref_idx > 0 and ref_idx in old_idx_to_new_idx:
-                effective_row_id = str(old_idx_to_new_idx[ref_idx])
+            if ref_idx > 0 and ref_idx in amount_idx_map:
+                effective_row_id = str(amount_idx_map[ref_idx])
+        elif charge_type == "On Previous Row Total" and raw_row_id:
+            ref_idx = cint(raw_row_id)
+            if ref_idx > 0 and ref_idx in total_idx_map:
+                effective_row_id = str(total_idx_map[ref_idx])
         included_in_print_rate = cint(_tax_row_field(tax, "included_in_print_rate"))
         actual_amount = flt(_tax_row_field(tax, "tax_amount")) if charge_type == "Actual" else 0.0
         cost_center = cstr(_tax_row_field(tax, "cost_center")).strip()
@@ -325,15 +330,24 @@ def _merge_duplicate_taxes(invoice_doc, recalculate=True):
         )
         if key in seen_key_to_new_idx:
             surviving_idx = seen_key_to_new_idx[key]
-            old_idx_to_new_idx[orig_pos] = surviving_idx
+            # For On Previous Row Amount, reference the surviving duplicate row.
+            # For On Previous Row Total, reference the last surviving row prior to
+            # this position so the cumulative running total (taxes_and_totals.py:765)
+            # preserves all unique rows accumulated before the dropped duplicate.
+            last_prior_surviving_idx = len(unique)
+            amount_idx_map[orig_pos] = surviving_idx
+            total_idx_map[orig_pos] = last_prior_surviving_idx
             if orig_explicit_idx > 0:
-                old_idx_to_new_idx[orig_explicit_idx] = surviving_idx
+                amount_idx_map[orig_explicit_idx] = surviving_idx
+                total_idx_map[orig_explicit_idx] = last_prior_surviving_idx
             continue
         new_idx = len(unique) + 1
         seen_key_to_new_idx[key] = new_idx
-        old_idx_to_new_idx[orig_pos] = new_idx
+        amount_idx_map[orig_pos] = new_idx
+        total_idx_map[orig_pos] = new_idx
         if orig_explicit_idx > 0:
-            old_idx_to_new_idx[orig_explicit_idx] = new_idx
+            amount_idx_map[orig_explicit_idx] = new_idx
+            total_idx_map[orig_explicit_idx] = new_idx
         if effective_row_id != raw_row_id:
             _set_tax_row_field(tax, "row_id", effective_row_id)
         unique.append(tax)

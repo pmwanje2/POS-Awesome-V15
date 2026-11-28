@@ -82,6 +82,92 @@ export interface SubmissionCallbacks {
 	}) => void;
 }
 
+const COST_METADATA_FIELDS = [
+	"_buying_prices_by_uom",
+	"_company_buying_price",
+	"base_buying_rate",
+	"trade_price",
+	"buying_price",
+	"buying_rate",
+	"last_buying_rate",
+	"valuation_rate",
+	"last_purchase_rate",
+	"manufacturing_cost",
+] as const;
+
+const COST_FALLBACK_COPY_FIELDS = [
+	...COST_METADATA_FIELDS,
+	"buying_rate_currency",
+	"buying_price_currency",
+	"buying_exchange_rate",
+	"company_currency",
+] as const;
+
+function resolveCurrencyPrecision(value: unknown): number {
+	const raw = unref(value as any);
+	if (raw === null || raw === undefined || raw === "") {
+		return 2;
+	}
+	const numeric = Number(raw);
+	return Number.isInteger(numeric) && numeric >= 0 ? numeric : 2;
+}
+
+function hasAnyCostField(item: Record<string, unknown> | null | undefined): boolean {
+	if (!item || typeof item !== "object") {
+		return false;
+	}
+	return COST_METADATA_FIELDS.some((field) => {
+		const val = item[field];
+		if (val === null || val === undefined || val === "") {
+			return false;
+		}
+		if (typeof val === "object") {
+			return Object.keys(val as Record<string, unknown>).length > 0;
+		}
+		return Number(val) > 0;
+	});
+}
+
+function mergeDocItemsWithCartCostFallback(
+	docItems: Array<Record<string, any>>,
+	liveCartItems: Array<Record<string, any>>,
+): Array<Record<string, any>> {
+	if (!docItems.length) {
+		return liveCartItems;
+	}
+	if (!liveCartItems.length) {
+		return docItems;
+	}
+	return docItems.map((docItem, index) => {
+		if (!docItem || typeof docItem !== "object" || hasAnyCostField(docItem)) {
+			return docItem;
+		}
+		const sameIndex = liveCartItems[index];
+		const matched =
+			(sameIndex && sameIndex.item_code === docItem.item_code
+				? sameIndex
+				: null) ||
+			liveCartItems.find(
+				(cartItem) =>
+					cartItem &&
+					((docItem.posa_row_id &&
+						cartItem.posa_row_id === docItem.posa_row_id) ||
+						(docItem.name && cartItem.name === docItem.name) ||
+						(docItem.item_code && cartItem.item_code === docItem.item_code)),
+			);
+		if (!matched) {
+			return docItem;
+		}
+		const merged: Record<string, any> = { ...docItem };
+		for (const field of COST_FALLBACK_COPY_FIELDS) {
+			if (merged[field] === undefined && matched[field] !== undefined) {
+				merged[field] = matched[field];
+			}
+		}
+		return merged;
+	});
+}
+
 export function usePaymentSubmission(options: PaymentSubmissionOptions) {
 	const {
 		invoiceDoc,
@@ -442,7 +528,7 @@ export function usePaymentSubmission(options: PaymentSubmissionOptions) {
 	};
 
 	const getLoyaltyRedemptionForSubmission = (doc: any) => {
-		const prec = unref(options.currencyPrecision) || 2;
+		const prec = resolveCurrencyPrecision(options.currencyPrecision);
 		const hasExplicitLoyaltyAmount = Object.prototype.hasOwnProperty.call(
 			options,
 			"loyaltyAmount",
@@ -492,7 +578,7 @@ export function usePaymentSubmission(options: PaymentSubmissionOptions) {
 	const validateSubmission = async (payment_received = false) => {
 		const doc = unref(invoiceDoc);
 		const profile = unref(posProfile);
-		const prec = unref(options.currencyPrecision) || 2;
+		const prec = resolveCurrencyPrecision(options.currencyPrecision);
 		const {
 			isCashback,
 			paidChange,
@@ -548,14 +634,14 @@ export function usePaymentSubmission(options: PaymentSubmissionOptions) {
 			taxes: Array.isArray(doc?.taxes) ? doc.taxes : [],
 			currencyPrecision: prec,
 		};
-		const docLossRiskItems = saleFloorPolicy.enabled
-			? findLossRiskItems(doc?.items || [], lossOptions)
+		const docItems = Array.isArray(doc?.items) ? doc.items : [];
+		const effectiveItems = mergeDocItemsWithCartCostFallback(
+			docItems,
+			liveCartItems,
+		);
+		const lossRiskItems = saleFloorPolicy.enabled
+			? findLossRiskItems(effectiveItems, lossOptions)
 			: [];
-		const lossRiskItems = docLossRiskItems.length
-			? docLossRiskItems
-			: saleFloorPolicy.enabled
-				? findLossRiskItems(liveCartItems, lossOptions)
-				: [];
 		const missingCostItems = saleFloorPolicy.enabled
 			? (doc?.items || []).filter(
 					(item: any) =>
@@ -970,7 +1056,7 @@ export function usePaymentSubmission(options: PaymentSubmissionOptions) {
 		const doc = unref(invoiceDoc);
 		const profile = unref(posProfile);
 		const type = unref(invoiceType);
-		const prec = unref(options.currencyPrecision) || 2;
+		const prec = resolveCurrencyPrecision(options.currencyPrecision);
 		const {
 			isCashback,
 			paidChange,
@@ -1364,7 +1450,7 @@ export function usePaymentSubmission(options: PaymentSubmissionOptions) {
 				const exchangeSummary = r.message?.exchange_summary;
 				const exchangeDifference = formatFloat(
 					exchangeSummary?.difference_amount || 0,
-					unref(options.currencyPrecision) || 2,
+					resolveCurrencyPrecision(options.currencyPrecision),
 				);
 				const exchangeDetail =
 					exchangeDifference > 0
