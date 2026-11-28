@@ -3,10 +3,13 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const offlineMocks = vi.hoisted(() => ({
 	getCachedExchangeRate: vi.fn(() => null),
 	saveExchangeRateCache: vi.fn(),
+	isOffline: vi.fn(() => false),
 }));
 const repositoryMocks = vi.hoisted(() => ({
 	currencyRateRepository: {
 		findLatestOnOrBefore: vi.fn().mockResolvedValue(null),
+		findDirectLatestOnOrBefore: vi.fn().mockResolvedValue(null),
+		findInverseLatestOnOrBefore: vi.fn().mockResolvedValue(null),
 		getExchangeSettings: vi.fn().mockResolvedValue(null),
 	},
 }));
@@ -24,8 +27,14 @@ describe("exchange rate resolver", () => {
 		vi.clearAllMocks();
 		offlineMocks.getCachedExchangeRate.mockReset();
 		offlineMocks.getCachedExchangeRate.mockReturnValue(null);
+		offlineMocks.isOffline.mockReset();
+		offlineMocks.isOffline.mockReturnValue(false);
 		repositoryMocks.currencyRateRepository.findLatestOnOrBefore.mockReset();
 		repositoryMocks.currencyRateRepository.findLatestOnOrBefore.mockResolvedValue(null);
+		repositoryMocks.currencyRateRepository.findDirectLatestOnOrBefore.mockReset();
+		repositoryMocks.currencyRateRepository.findDirectLatestOnOrBefore.mockResolvedValue(null);
+		repositoryMocks.currencyRateRepository.findInverseLatestOnOrBefore.mockReset();
+		repositoryMocks.currencyRateRepository.findInverseLatestOnOrBefore.mockResolvedValue(null);
 		repositoryMocks.currencyRateRepository.getExchangeSettings.mockReset();
 		repositoryMocks.currencyRateRepository.getExchangeSettings.mockResolvedValue(null);
 		clearExchangeRateResolverCache();
@@ -93,7 +102,7 @@ describe("exchange rate resolver", () => {
 			date: "2026-08-20",
 			exchange_rate: 3700,
 		});
-		repositoryMocks.currencyRateRepository.findLatestOnOrBefore.mockResolvedValue({
+		repositoryMocks.currencyRateRepository.findDirectLatestOnOrBefore.mockResolvedValue({
 			name: "FX-BUY-4050",
 			from_currency: "USD",
 			to_currency: "UGX",
@@ -118,7 +127,7 @@ describe("exchange rate resolver", () => {
 			source: "offline_cache",
 		});
 		expect(
-			repositoryMocks.currencyRateRepository.findLatestOnOrBefore,
+			repositoryMocks.currencyRateRepository.findDirectLatestOnOrBefore,
 		).toHaveBeenCalledWith(
 			expect.objectContaining({
 				fromCurrency: "USD",
@@ -188,7 +197,8 @@ describe("exchange rate resolver", () => {
 		expect((globalThis as any).frappe.call).not.toHaveBeenCalled();
 	});
 
-	it("derives opposite-purpose inverse exchange rate from warm cache when direct purpose rate is absent", async () => {
+	it("derives opposite-purpose inverse exchange rate from warm cache when offline and direct purpose rate is absent", async () => {
+		offlineMocks.isOffline.mockReturnValue(true);
 		offlineMocks.getCachedExchangeRate.mockImplementation((query: any) => {
 			if (
 				query.fromCurrency === "UGX" &&
@@ -218,5 +228,132 @@ describe("exchange rate resolver", () => {
 		expect(result.rate).toBeCloseTo(4050, 2);
 		expect(result.source).toBe("derived_inverse");
 		expect((globalThis as any).frappe.call).not.toHaveBeenCalled();
+	});
+
+	it("prefers persistent direct and online direct rates over warm or in-memory inverse rates matching ERPNext setup/utils.py:124-134", async () => {
+		// Warm cache holds opposite-purpose reverse rate UGX->USD = 1/4050 (for_buying),
+		// while persistent repository holds direct USD->UGX = 3700 (for_selling).
+		offlineMocks.getCachedExchangeRate.mockImplementation((query: any) => {
+			if (
+				query.fromCurrency === "UGX" &&
+				query.toCurrency === "USD" &&
+				query.purpose === "for_buying"
+			) {
+				return {
+					fromCurrency: "UGX",
+					toCurrency: "USD",
+					date: "2026-11-25",
+					purpose: "for_buying",
+					exchange_rate: 1 / 4050,
+				};
+			}
+			return null;
+		});
+		repositoryMocks.currencyRateRepository.findDirectLatestOnOrBefore.mockResolvedValue({
+			name: "FX-USD-UGX-SELL-DIRECT",
+			from_currency: "USD",
+			to_currency: "UGX",
+			date: "2026-11-25",
+			for_buying: 0,
+			for_selling: 1,
+			exchange_rate: 3700,
+		});
+		repositoryMocks.currencyRateRepository.findLatestOnOrBefore.mockResolvedValue({
+			name: "FX-USD-UGX-SELL-DIRECT",
+			from_currency: "USD",
+			to_currency: "UGX",
+			date: "2026-11-25",
+			for_buying: 0,
+			for_selling: 1,
+			exchange_rate: 3700,
+		});
+
+		const persistentDirect = await resolveExchangeRate({
+			profileName: "POS-1",
+			company: "Example Co",
+			fromCurrency: "USD",
+			toCurrency: "UGX",
+			effectiveDate: "2026-11-28",
+			purpose: "for_selling",
+		});
+		expect(persistentDirect).toMatchObject({
+			found: true,
+			rate: 3700,
+			source: "offline_cache",
+		});
+
+		// Online lookup with no local direct rate must still consult server direct before warm inverse.
+		clearExchangeRateResolverCache();
+		repositoryMocks.currencyRateRepository.findDirectLatestOnOrBefore.mockResolvedValue(null);
+		repositoryMocks.currencyRateRepository.findLatestOnOrBefore.mockResolvedValue(null);
+		(globalThis as any).frappe.call.mockResolvedValue({
+			message: {
+				found: true,
+				exchange_rate: 3700,
+				date: "2026-11-28",
+				source: "currency_exchange",
+			},
+		});
+
+		const onlineDirect = await resolveExchangeRate({
+			profileName: "POS-1",
+			company: "Example Co",
+			fromCurrency: "USD",
+			toCurrency: "UGX",
+			effectiveDate: "2026-11-28",
+			purpose: "for_selling",
+		});
+		expect(onlineDirect).toMatchObject({
+			found: true,
+			rate: 3700,
+			source: "currency_exchange",
+		});
+		expect((globalThis as any).frappe.call).toHaveBeenCalledTimes(1);
+	});
+
+	it("re-validates in-memory resolvedRates when stale policy tightens to allow_stale=0, stale_days=30", async () => {
+		// Step 1: Resolve Oct 29 rate for Nov 28 under allow_stale=1 -> populates in-memory resolvedRates.
+		repositoryMocks.currencyRateRepository.getExchangeSettings.mockResolvedValue({
+			allowStale: 1,
+			staleDays: 30,
+		});
+		offlineMocks.getCachedExchangeRate.mockReturnValue({
+			fromCurrency: "USD",
+			toCurrency: "UGX",
+			date: "2026-10-29",
+			purpose: "for_buying",
+			exchange_rate: 4050,
+		});
+
+		const first = await resolveExchangeRate({
+			profileName: "POS-1",
+			company: "Example Co",
+			fromCurrency: "USD",
+			toCurrency: "UGX",
+			effectiveDate: "2026-11-28",
+			purpose: "for_buying",
+		});
+		expect(first).toMatchObject({ found: true, rate: 4050, rateDate: "2026-10-29" });
+
+		// Step 2: Policy tightens to allow_stale=0, stale_days=30 (ERPNext strict > excludes Oct 29 for Nov 28).
+		// Calling resolveExchangeRate WITHOUT forceRefresh or cache clear MUST NOT return stale cached 4050.
+		repositoryMocks.currencyRateRepository.getExchangeSettings.mockResolvedValue({
+			allowStale: 0,
+			staleDays: 30,
+		});
+		(globalThis as any).frappe.call.mockResolvedValue({
+			message: { found: false },
+		});
+
+		const second = await resolveExchangeRate({
+			profileName: "POS-1",
+			company: "Example Co",
+			fromCurrency: "USD",
+			toCurrency: "UGX",
+			effectiveDate: "2026-11-28",
+			purpose: "for_buying",
+		});
+		expect(second.found).toBe(false);
+		expect(second.rate).toBeNull();
 	});
 });

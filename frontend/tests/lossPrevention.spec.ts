@@ -2065,4 +2065,71 @@ describe("loss prevention", () => {
 			findLossRiskItems(forgedFractional, { taxes, currencyPrecision: 2 }),
 		).toHaveLength(1);
 	});
+
+	it("preserves ERPNext unit net_rate on valid weighed sales (0.10 kg x $1.03/kg vs $1.02/kg floor) without dividing rounded net_amount by qty", () => {
+		// ERPNext taxes_and_totals.py:275-291: with no inclusive tax and no header discount,
+		// amount = net_amount = flt(1.03 * 0.10, 2) = 0.10 while net_rate stays 1.03.
+		const validWeighed = [
+			{
+				item_code: "WEIGHED-OK",
+				qty: 0.1,
+				rate: 1.03,
+				amount: 0.1,
+				net_amount: 0.1,
+				net_rate: 1.03,
+				base_net_amount: 0.1,
+				base_net_rate: 1.03,
+				currency: "USD",
+				company_currency: "USD",
+				conversion_rate: 1,
+				valuation_rate: 1.02,
+			},
+		];
+		expect(
+			findLossRiskItems(validWeighed, { currencyPrecision: 2 }),
+		).toEqual([]);
+		expect(
+			getItemLossRisk(validWeighed[0], { currencyPrecision: 2 }),
+		).toBeNull();
+
+		// Below-floor weighed sale ($1.01/kg vs $1.02/kg floor) must still block.
+		const belowCostWeighed = [
+			{
+				...validWeighed[0],
+				item_code: "WEIGHED-BELOW",
+				rate: 1.01,
+				net_rate: 1.01,
+				base_net_rate: 1.01,
+			},
+		];
+		expect(
+			findLossRiskItems(belowCostWeighed, { currencyPrecision: 2 }),
+		).toHaveLength(1);
+
+		// Tampered lower net_amount ($0.05 instead of rounded $0.10) claiming net_rate=$1.03 must still block.
+		const tamperedAmount = [
+			{
+				...validWeighed[0],
+				item_code: "WEIGHED-TAMPERED-AMT",
+				net_amount: 0.05,
+			},
+		];
+		expect(
+			findLossRiskItems(tamperedAmount, { currencyPrecision: 2 }),
+		).toHaveLength(1);
+
+		// Forged inflated net_rate ($1.50 > gross $1.03) against $1.05 floor must still block.
+		const forgedRate = [
+			{
+				...validWeighed[0],
+				item_code: "WEIGHED-FORGED-RATE",
+				net_rate: 1.5,
+				base_net_rate: 1.5,
+				valuation_rate: 1.05,
+			},
+		];
+		expect(
+			findLossRiskItems(forgedRate, { currencyPrecision: 2 }),
+		).toHaveLength(1);
+	});
 });

@@ -17,6 +17,7 @@ import {
 } from "../src/posapp/utils/lossPrevention";
 import { useItemDetailFetcher } from "../src/posapp/composables/pos/items/useItemDetailFetcher";
 import { useItemCurrency } from "../src/posapp/composables/pos/items/useItemCurrency";
+import { syncCurrencyMatrixResource } from "../src/offline/sync/adapters/currencyMatrix";
 
 async function clearOfflineDb() {
 	if (!db.isOpen()) {
@@ -1089,5 +1090,144 @@ describe("offline buying floor cache reconstruction", () => {
 		expect(
 			staleInverse.cached[0]._buying_prices_by_uom.Nos.unresolved_fx,
 		).toBe(true);
+	});
+
+	it("emits unresolved_fx and clears stale buying floor after currency sync acknowledges deletion of the last FX rate", async () => {
+		const profile = {
+			name: "POS-DELETED-FX",
+			company: "Test Co",
+			currency: "USD",
+			company_currency: "UGX",
+			selling_price_list: "USD Selling",
+			buying_price_list: "USD Buying",
+		};
+		await setProfileBuyingPriceList(profile, "USD Buying");
+		await db.table("items").put({
+			item_code: "ITEM-DEL-FX",
+			item_name: "Deleted FX Item",
+			stock_uom: "Nos",
+			valuation_rate: 100,
+		});
+		await db.table("item_price_records").bulkPut([
+			{
+				name: "IP-DEL-1",
+				price_list: "USD Buying",
+				item_code: "ITEM-DEL-FX",
+				uom: "Nos",
+				currency: "USD",
+				price_list_rate: 10,
+				buying: 1,
+				selling: 0,
+				valid_from: "2025-01-01",
+				modified: "2025-04-01T10:00:00",
+			},
+		]);
+		saveItemDetailsCache("POS-DELETED-FX", "USD Selling", [
+			{
+				item_code: "ITEM-DEL-FX",
+				stock_uom: "Nos",
+				rate: 10.5,
+				price_list_rate: 10.5,
+				company_currency: "UGX",
+				buying_price_list: "USD Buying",
+				buying_price_currency: "USD",
+				buying_exchange_rate: 4050,
+				base_buying_rate: 40500,
+				trade_price: 40500 / 3700,
+				buying_rate: 40500 / 3700,
+				_company_buying_price: 40500,
+				_buying_prices_by_uom: {
+					Nos: {
+						price_list_rate: 10,
+						base_price_list_rate: 40500,
+						currency: "USD",
+						price_list: "USD Buying",
+						price_not_uom_dependent: 0,
+					},
+				},
+			},
+		]);
+
+		// Step 1: Initial currency_matrix sync populates the USD->UGX buying rate.
+		await syncCurrencyMatrixResource({
+			posProfile: profile,
+			currencyPairs: [
+				{ from_currency: "USD", to_currency: "UGX" },
+				{ from_currency: "UGX", to_currency: "USD" },
+			],
+			watermark: null,
+			fetcher: async () => ({
+				schema_version: "2026-04-09",
+				next_watermark: "2026-04-09T10:00:00",
+				changes: [
+					{
+						key: "currency_rate::FX-USD-UGX-LAST",
+						modified: "2026-04-09T10:00:00",
+						data: {
+							name: "FX-USD-UGX-LAST",
+							from_currency: "USD",
+							to_currency: "UGX",
+							exchange_rate: 4050,
+							date: "2026-04-09",
+							for_buying: 1,
+							for_selling: 0,
+							modified: "2026-04-09T10:00:00",
+						},
+					},
+				],
+				deleted: [],
+				has_more: false,
+			}),
+		});
+
+		// Step 2: Delta sync acknowledges deletion of that last USD->UGX buying rate -> 0 rate records remain.
+		await syncCurrencyMatrixResource({
+			posProfile: profile,
+			currencyPairs: [
+				{ from_currency: "USD", to_currency: "UGX" },
+				{ from_currency: "UGX", to_currency: "USD" },
+			],
+			watermark: "2026-04-09T10:00:00",
+			fetcher: async () => ({
+				schema_version: "2026-04-09",
+				next_watermark: "2026-04-09T10:05:00",
+				changes: [],
+				deleted: [{ key: "currency_rate::FX-USD-UGX-LAST" }],
+				has_more: false,
+			}),
+		});
+
+		const remainingRates = await db.table("currency_rate_records").toArray();
+		expect(remainingRates).toHaveLength(0);
+
+		// Step 3: getCachedItemDetails must NOT fall back to the stale 40,500 server floor;
+		// it must mark unresolved_fx: true and clear stale buying floor fields.
+		const afterDelete = await getCachedItemDetails(
+			"POS-DELETED-FX",
+			"USD Selling",
+			["ITEM-DEL-FX"],
+		);
+		expect(afterDelete.cached).toHaveLength(1);
+		expect(
+			afterDelete.cached[0]._buying_prices_by_uom.Nos.unresolved_fx,
+		).toBe(true);
+		expect(
+			afterDelete.cached[0]._buying_prices_by_uom.Nos.base_price_list_rate,
+		).toBeNull();
+		expect(afterDelete.cached[0].base_buying_rate).toBeNull();
+		expect(afterDelete.cached[0].buying_exchange_rate).toBe(0);
+		expect(afterDelete.cached[0]._company_buying_price).toBeUndefined();
+		expect(
+			getItemCostFloor({
+				...afterDelete.cached[0],
+				qty: 1,
+				rate: 10.5,
+				uom: "Nos",
+				currency: "USD",
+				company_currency: "UGX",
+				conversion_rate: 3700,
+				valuation_rate: 100,
+			}),
+		).toBeNull();
 	});
 });

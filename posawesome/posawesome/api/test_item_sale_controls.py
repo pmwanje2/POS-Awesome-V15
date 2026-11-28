@@ -5088,6 +5088,113 @@ class TestItemSaleControls(unittest.TestCase):
                 1,
             )
 
+    def test_weighed_sale_without_inclusive_tax_or_discount_preserves_unit_net_rate(self):
+        # ERPNext taxes_and_totals.py:275-291: 0.10 kg x $1.03/kg -> amount=net_amount=flt(0.103, 2)=0.10,
+        # while net_rate stays 1.03 (not 0.10 / 0.10 = 1.00). Floor $1.02/kg must pass!
+        def fake_get_all(doctype, **kwargs):
+            if doctype == "Item":
+                return [
+                    {"name": "ITEM-WEIGH-OK", "stock_uom": "Kg", "is_stock_item": 1, "valuation_rate": 0},
+                    {"name": "ITEM-WEIGH-105", "stock_uom": "Kg", "is_stock_item": 1, "valuation_rate": 0},
+                ]
+            if doctype == "Bin":
+                return [
+                    {"item_code": "ITEM-WEIGH-OK", "warehouse": "Shop Floor - JBS", "valuation_rate": 1.02},
+                    {"item_code": "ITEM-WEIGH-105", "warehouse": "Shop Floor - JBS", "valuation_rate": 1.05},
+                ]
+            return []
+
+        self.frappe.get_all = fake_get_all
+        self.frappe.db.get_value = lambda doctype, name, fieldname=None: (
+            "USD" if doctype == "Company" and fieldname == "default_currency" else None
+        )
+
+        invoice = PrecisionDoc(
+            company="Test Co",
+            currency="USD",
+            conversion_rate=1.0,
+            taxes=[],
+            precision_value=2,
+        )
+        valid_row = PrecisionDoc(
+            item_code="ITEM-WEIGH-OK",
+            item_name="Weighed Produce",
+            qty=0.10,
+            rate=1.03,
+            amount=0.10,
+            net_amount=0.10,
+            net_rate=1.03,
+            base_net_amount=0.10,
+            base_net_rate=1.03,
+            uom="Kg",
+            warehouse="Shop Floor - JBS",
+            precision_value=2,
+        )
+        self.assertEqual(
+            self.controls.collect_below_buying_price_errors([valid_row], invoice_doc=invoice),
+            [],
+        )
+
+        # Below-floor weighed sale ($1.01/kg vs $1.02/kg) still blocks.
+        below_row = PrecisionDoc(
+            item_code="ITEM-WEIGH-OK",
+            item_name="Weighed Below Cost",
+            qty=0.10,
+            rate=1.01,
+            amount=0.10,
+            net_amount=0.10,
+            net_rate=1.01,
+            base_net_amount=0.10,
+            base_net_rate=1.01,
+            uom="Kg",
+            warehouse="Shop Floor - JBS",
+            precision_value=2,
+        )
+        self.assertEqual(
+            len(self.controls.collect_below_buying_price_errors([below_row], invoice_doc=invoice)),
+            1,
+        )
+
+        # Tampered net_amount ($0.05 vs rounded $0.10) claiming net_rate=$1.03 still blocks.
+        tampered_amt = PrecisionDoc(
+            item_code="ITEM-WEIGH-OK",
+            item_name="Weighed Tampered Amount",
+            qty=0.10,
+            rate=1.03,
+            amount=0.10,
+            net_amount=0.05,
+            net_rate=1.03,
+            base_net_amount=0.05,
+            base_net_rate=1.03,
+            uom="Kg",
+            warehouse="Shop Floor - JBS",
+            precision_value=2,
+        )
+        self.assertEqual(
+            len(self.controls.collect_below_buying_price_errors([tampered_amt], invoice_doc=invoice)),
+            1,
+        )
+
+        # Forged inflated net_rate ($1.50 > gross $1.03) against $1.05 floor still blocks.
+        forged_rate = PrecisionDoc(
+            item_code="ITEM-WEIGH-105",
+            item_name="Weighed Forged Rate",
+            qty=0.10,
+            rate=1.03,
+            amount=0.10,
+            net_amount=0.10,
+            net_rate=1.50,
+            base_net_amount=0.10,
+            base_net_rate=1.50,
+            uom="Kg",
+            warehouse="Shop Floor - JBS",
+            precision_value=2,
+        )
+        self.assertEqual(
+            len(self.controls.collect_below_buying_price_errors([forged_rate], invoice_doc=invoice)),
+            1,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

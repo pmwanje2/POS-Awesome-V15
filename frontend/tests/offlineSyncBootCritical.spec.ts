@@ -361,4 +361,43 @@ describe("boot-critical offline sync adapters", () => {
 			}),
 		);
 	});
+
+	it("persists canonical syncedCurrencyPairs only after currency_matrix succeeds and forwards backfillPairs", async () => {
+		const fetcher = vi.fn(async () => ({
+			schema_version: "2026-04-09",
+			next_watermark: "2026-04-09T10:15:00",
+			changes: [],
+			deleted: [],
+			synced_pairs: [
+				{ from_currency: "USD", to_currency: "UGX" },
+				{ from_currency: "EUR", to_currency: "UGX" },
+			],
+			has_more: false,
+		}));
+
+		await syncCurrencyMatrixResource({
+			posProfile: { name: "POS-1", company: "Uganda Co" },
+			currencyPairs: [
+				{ from_currency: "USD", to_currency: "UGX" },
+				{ from_currency: "EUR", to_currency: "UGX" },
+			],
+			backfillPairs: [{ from_currency: "EUR", to_currency: "UGX" }],
+			syncedCurrencyPairs: ["USD::UGX"],
+			watermark: "2026-04-09T10:10:00",
+			fetcher,
+		} as any);
+
+		expect(fetcher).toHaveBeenCalledWith(
+			expect.objectContaining({
+				backfillPairs: [{ from_currency: "EUR", to_currency: "UGX" }],
+			}),
+		);
+		expect(syncStateMocks.setSyncResourceState).toHaveBeenCalledWith(
+			expect.objectContaining({
+				resourceId: "currency_matrix",
+				status: "fresh",
+				syncedCurrencyPairs: ["EUR::UGX", "USD::UGX"],
+			}),
+		);
+	});
 });

@@ -392,4 +392,92 @@ describe("offline sync resource runner", () => {
 			}),
 		);
 	});
+
+	it("passes newly discovered buying-currency pairs in backfillPairs when watermark already advanced on a smaller pair set", async () => {
+		if (!db.isOpen()) {
+			await db.open();
+		}
+		await db.table("pos_profiles").clear();
+		await db.table("item_price_records").clear();
+		await db.table("pos_profiles").put({
+			name: "POS-EXPAND",
+			company: "Uganda Co",
+			currency: "USD",
+			company_currency: "UGX",
+			selling_price_list: "USD Selling",
+			buying_price_list: "EUR Buying",
+		});
+		// EUR buying price arrived AFTER the initial USD<->UGX sync advanced the watermark.
+		await db.table("item_price_records").put({
+			name: "IP-EUR-LATE",
+			price_list: "EUR Buying",
+			item_code: "ITEM-EUR",
+			uom: "Nos",
+			currency: "EUR",
+			price_list_rate: 8,
+			buying: 1,
+			selling: 0,
+		});
+
+		const callOfflineSyncMethod = vi.fn(async () => ({
+			changes: [],
+			deleted: [],
+			has_more: false,
+			next_watermark: "2026-04-09T10:10:00",
+		}));
+
+		await runSupportedOfflineSyncResource({
+			resource: { id: "currency_matrix" } as any,
+			posProfile: {
+				name: "POS-EXPAND",
+				company: "Uganda Co",
+				currency: "USD",
+				selling_price_list: "USD Selling",
+			},
+			schemaVersion: "2026-04-09",
+			getPersistedState: vi.fn(async () => ({
+				resourceId: "currency_matrix",
+				status: "fresh",
+				lastSyncedAt: "2026-04-09T10:10:00",
+				watermark: "2026-04-09T10:10:00",
+				lastSuccessHash: null,
+				lastError: null,
+				consecutiveFailures: 0,
+				scopeSignature: null,
+				schemaVersion: "2026-04-09",
+				syncedCurrencyPairs: ["UGX::USD", "USD::UGX"],
+			})) as any,
+			callOfflineSyncMethod,
+		});
+
+		const syncCall = adapterMocks.syncCurrencyMatrixResource.mock.calls[0]?.[0];
+		expect(syncCall?.backfillPairs).toEqual(
+			expect.arrayContaining([
+				{ from_currency: "EUR", to_currency: "UGX" },
+				{ from_currency: "UGX", to_currency: "EUR" },
+			]),
+		);
+		expect(syncCall?.backfillPairs).not.toEqual(
+			expect.arrayContaining([{ from_currency: "USD", to_currency: "UGX" }]),
+		);
+
+		await syncCall.fetcher({
+			posProfile: { name: "POS-EXPAND", company: "Uganda Co" },
+			currencyPairs: syncCall.currencyPairs,
+			backfillPairs: syncCall.backfillPairs,
+			watermark: "2026-04-09T10:10:00",
+			offset: 0,
+			schemaVersion: "2026-04-09",
+		});
+		expect(callOfflineSyncMethod).toHaveBeenCalledWith(
+			"posawesome.posawesome.api.offline_sync.currencies.sync_currency_scope",
+			expect.objectContaining({
+				watermark: "2026-04-09T10:10:00",
+				backfill_pairs: expect.arrayContaining([
+					{ from_currency: "EUR", to_currency: "UGX" },
+					{ from_currency: "UGX", to_currency: "EUR" },
+				]),
+			}),
+		);
+	});
 });

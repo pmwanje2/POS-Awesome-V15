@@ -3962,4 +3962,50 @@ describe("usePaymentSubmission", () => {
 
 		await expect(submission.validateSubmission(true)).resolves.toBe(true);
 	});
+
+	it("accepts valid weighed sale (0.10 kg x $1.03/kg vs $1.02/kg floor) in validateSubmission", async () => {
+		const invoiceDoc = ref<any>({
+			is_return: 0,
+			currency: "USD",
+			company_currency: "USD",
+			conversion_rate: 1,
+			taxes: [],
+			items: [
+				{
+					item_code: "SUB-WEIGHED-OK",
+					item_name: "Weighed Item",
+					qty: 0.1,
+					rate: 1.03,
+					amount: 0.1,
+					net_amount: 0.1,
+					net_rate: 1.03,
+					base_net_amount: 0.1,
+					base_net_rate: 1.03,
+					currency: "USD",
+					company_currency: "USD",
+					conversion_rate: 1,
+					valuation_rate: 1.02,
+				},
+			],
+			payments: [{ mode_of_payment: "Cash", amount: 0.1, type: "Cash" }],
+			rounded_total: 0.1,
+			grand_total: 0.1,
+		});
+
+		const submission = usePaymentSubmission({
+			invoiceDoc,
+			posProfile: ref({
+				posa_below_cost_action: "Block",
+				currency_precision: 2,
+			}),
+			stockSettings: ref({}),
+			invoiceType: ref("Invoice"),
+			formatFloat: (value) => Number(value || 0),
+			stores: { toastStore: { show: vi.fn() } },
+			diff_payment: ref(0) as any,
+			isCashback: ref(true),
+		});
+
+		await expect(submission.validateSubmission(true)).resolves.toBe(true);
+	});
 });

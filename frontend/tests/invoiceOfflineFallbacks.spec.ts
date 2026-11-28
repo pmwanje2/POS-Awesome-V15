@@ -1,5 +1,7 @@
 // @vitest-environment jsdom
 
+import "fake-indexeddb/auto";
+
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createPinia, setActivePinia } from "pinia";
 import { ref } from "vue";
@@ -118,6 +120,7 @@ describe("invoice offline fallbacks", () => {
 			fromCurrency: "USD",
 			toCurrency: "EUR",
 			date: "2026-04-09",
+			purpose: "for_selling",
 			exchange_rate: 1.5,
 		});
 		offlineCache.saveExchangeRateCache({
@@ -126,6 +129,7 @@ describe("invoice offline fallbacks", () => {
 			fromCurrency: "EUR",
 			toCurrency: "PKR",
 			date: "2026-04-09",
+			purpose: "for_selling",
 			exchange_rate: 300,
 		});
 
@@ -346,5 +350,164 @@ describe("invoice offline fallbacks", () => {
 		expect(invoiceStore.items[0].base_buying_rate).toBeUndefined();
 		expect(invoiceStore.items[0].buying_exchange_rate).toBe(0);
 		expect(getItemCostFloor(invoiceStore.items[0])).toBeNull();
+	});
+
+	it("preserves company_currency and selling conversion_rate on a foreign till when companyDoc is unloaded", async () => {
+		const { db } = await import("../src/offline/db");
+		if (!db.isOpen()) await db.open();
+		await db.table("currency_rate_records").clear();
+		await db.table("currency_rate_records").bulkPut([
+			{
+				name: "FX-USD-UGX-SELL-UNLOADED",
+				profile_name: "POS-USD-UNLOADED",
+				company: "Uganda Co",
+				from_currency: "USD",
+				to_currency: "UGX",
+				exchange_rate: 3700,
+				date: "2026-04-09",
+				for_buying: 0,
+				for_selling: 1,
+				modified: "2026-04-09T10:00:00",
+			},
+		]);
+
+		const { useUIStore } = await import("../src/posapp/stores/uiStore");
+		const { useInvoiceStore } = await import("../src/posapp/stores/invoiceStore");
+		const { useInvoiceCurrency } = await import(
+			"../src/posapp/composables/pos/invoice/useInvoiceCurrency"
+		);
+		const { getItemLossRisk } = await import(
+			"../src/posapp/utils/lossPrevention"
+		);
+
+		const uiStore = useUIStore();
+		// Company doc intentionally unloaded (null), while profile & cart row carry company_currency = UGX.
+		uiStore.setCompanyDoc(null);
+		uiStore.setPosProfile({
+			name: "POS-USD-UNLOADED",
+			company: "Uganda Co",
+			currency: "USD",
+			company_currency: "UGX",
+			selling_price_list: "USD Selling",
+			posa_decimal_precision: "2",
+		} as any);
+
+		const invoiceStore = useInvoiceStore();
+		invoiceStore.addItem({
+			item_code: "ITEM-UNLOADED-CO",
+			qty: 1,
+			rate: 10.5,
+			price_list_rate: 10.5,
+			original_rate: 10.5,
+			original_currency: "USD",
+			currency: "USD",
+			company_currency: "UGX",
+			conversion_rate: 3700,
+			buying_price_list: "USD Buying",
+			buying_price_currency: "USD",
+			buying_exchange_rate: 4050,
+			base_buying_rate: 40500,
+			_buying_prices_by_uom: {
+				Nos: {
+					price_list_rate: 10,
+					base_price_list_rate: 40500,
+					currency: "USD",
+					price_list: "USD Buying",
+				},
+			},
+			uom: "Nos",
+			stock_uom: "Nos",
+			conversion_factor: 1,
+			discount_amount: 0,
+			base_discount_amount: 0,
+			amount: 10.5,
+			posa_row_id: "row-unloaded-co",
+		} as any);
+
+		const invoiceCurrency = useInvoiceCurrency();
+		invoiceCurrency.selected_currency.value = "USD";
+		invoiceCurrency.price_list_currency.value = "USD";
+		await invoiceCurrency.update_currency_and_rate();
+		await invoiceCurrency.update_item_rates();
+
+		expect(invoiceCurrency.conversion_rate.value).toBe(3700);
+		expect(invoiceStore.items[0].company_currency).toBe("UGX");
+		expect(invoiceStore.items[0].conversion_rate).toBe(3700);
+		expect(
+			getItemLossRisk(invoiceStore.items[0], { currencyPrecision: 2 })
+				?.belowCost,
+		).toBe(true);
+
+		// Even if profile.company_currency is also omitted and update_item_rates runs directly
+		// before update_currency_and_rate, known row company_currency and conversion_rate must stay intact.
+		uiStore.setPosProfile({
+			name: "POS-USD-UNLOADED",
+			company: "Uganda Co",
+			currency: "USD",
+			selling_price_list: "USD Selling",
+			posa_decimal_precision: "2",
+		} as any);
+		const freshCurrency = useInvoiceCurrency();
+		freshCurrency.selected_currency.value = "USD";
+		freshCurrency.price_list_currency.value = "USD";
+		await freshCurrency.update_item_rates();
+		expect(invoiceStore.items[0].company_currency).toBe("UGX");
+		expect(invoiceStore.items[0].conversion_rate).toBe(3700);
+	});
+
+	it("passes purpose for_selling on invoice currency refresh so a newer buying-only FX rate is not selected", async () => {
+		const { db } = await import("../src/offline/db");
+		if (!db.isOpen()) await db.open();
+		await db.table("currency_rate_records").clear();
+		await db.table("currency_rate_records").bulkPut([
+			{
+				name: "FX-USD-UGX-SELL-OLD",
+				profile_name: "POS-SELL-PURPOSE",
+				company: "Uganda Co",
+				from_currency: "USD",
+				to_currency: "UGX",
+				exchange_rate: 3700,
+				date: "2026-04-08",
+				for_buying: 0,
+				for_selling: 1,
+				modified: "2026-04-08T10:00:00",
+			},
+			{
+				name: "FX-USD-UGX-BUY-NEW",
+				profile_name: "POS-SELL-PURPOSE",
+				company: "Uganda Co",
+				from_currency: "USD",
+				to_currency: "UGX",
+				exchange_rate: 4050,
+				date: "2026-04-09",
+				for_buying: 1,
+				for_selling: 0,
+				modified: "2026-04-09T10:00:00",
+			},
+		]);
+
+		const { useUIStore } = await import("../src/posapp/stores/uiStore");
+		const { useInvoiceCurrency } = await import(
+			"../src/posapp/composables/pos/invoice/useInvoiceCurrency"
+		);
+
+		const uiStore = useUIStore();
+		uiStore.setPosProfile({
+			name: "POS-SELL-PURPOSE",
+			company: "Uganda Co",
+			currency: "USD",
+			company_currency: "UGX",
+			selling_price_list: "USD Selling",
+			posa_decimal_precision: "2",
+		} as any);
+		uiStore.setCompanyDoc({ default_currency: "UGX" });
+
+		const invoiceCurrency = useInvoiceCurrency();
+		invoiceCurrency.selected_currency.value = "USD";
+		invoiceCurrency.price_list_currency.value = "USD";
+		await invoiceCurrency.update_currency_and_rate();
+
+		// Must select the for_selling=1 rate (3,700), never the newer buying-only rate (4,050).
+		expect(invoiceCurrency.conversion_rate.value).toBe(3700);
 	});
 });
