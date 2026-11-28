@@ -60,8 +60,8 @@ def _install_stubs():
     sys.modules["frappe.query_builder.functions"] = frappe_qb_functions
 
     frappe_utils = types.ModuleType("frappe.utils")
-    frappe_utils.cint = int
-    frappe_utils.flt = float
+    frappe_utils.cint = lambda value: int(value or 0)
+    frappe_utils.flt = lambda value, *_args, **_kwargs: float(value or 0)
     frappe_utils.nowdate = lambda: "2026-04-17"
     sys.modules["frappe.utils"] = frappe_utils
 
@@ -317,6 +317,148 @@ class TestItemFetchers(unittest.TestCase):
 
         self.assertEqual(row["valuation_rate"], 4500.0)
         self.assertEqual(row["warehouse_valuation_rate"], 4500.0)
+
+    def test_merge_item_row_normalizes_ugx_buying_rate_for_usd_invoice(self):
+        lookup = self.module.ItemLookupData(
+            price_map={
+                "ITEM-MC": {
+                    "Nos": AttrDict(
+                        {
+                            "price_list_rate": 15.0,
+                            "currency": "USD",
+                            "price_list": "USD Selling",
+                        }
+                    )
+                }
+            },
+            buying_price_map={
+                "ITEM-MC": {
+                    "Nos": AttrDict(
+                        {
+                            "price_list_rate": 37000.0,
+                            "currency": "UGX",
+                            "price_list": "Standard Buying",
+                        }
+                    )
+                }
+            },
+            stock_map={},
+            meta_map={"ITEM-MC": AttrDict({"name": "ITEM-MC", "stock_uom": "Nos"})},
+            uom_map={},
+            barcode_map={},
+            batch_map={},
+            serial_map={},
+            bom_map={},
+        )
+
+        row = self.module.merge_item_row(
+            {"item_code": "ITEM-MC"},
+            lookup,
+            "USD",
+            exchange_rate=3700.0,
+            buying_exchange_rate=1.0,
+        )
+
+        self.assertAlmostEqual(row["trade_price"], 10.0)
+        self.assertAlmostEqual(row["buying_rate"], 10.0)
+        self.assertEqual(row["buying_rate_currency"], "USD")
+        self.assertEqual(row["buying_price_currency"], "UGX")
+        self.assertAlmostEqual(
+            row["_buying_prices_by_uom"]["Nos"]["base_price_list_rate"],
+            37000.0,
+        )
+
+    def test_merge_item_row_normalizes_usd_buying_rate_for_ugx_invoice(self):
+        lookup = self.module.ItemLookupData(
+            price_map={
+                "ITEM-MC": {
+                    "Nos": AttrDict(
+                        {
+                            "price_list_rate": 40000.0,
+                            "currency": "UGX",
+                            "price_list": "UGX Selling",
+                        }
+                    )
+                }
+            },
+            buying_price_map={
+                "ITEM-MC": {
+                    "Nos": AttrDict(
+                        {
+                            "price_list_rate": 10.0,
+                            "currency": "USD",
+                            "price_list": "USD Buying",
+                        }
+                    )
+                }
+            },
+            stock_map={},
+            meta_map={"ITEM-MC": AttrDict({"name": "ITEM-MC", "stock_uom": "Nos"})},
+            uom_map={},
+            barcode_map={},
+            batch_map={},
+            serial_map={},
+            bom_map={},
+        )
+
+        row = self.module.merge_item_row(
+            {"item_code": "ITEM-MC"},
+            lookup,
+            "UGX",
+            exchange_rate=1.0,
+            buying_exchange_rate=3700.0,
+        )
+
+        self.assertAlmostEqual(row["trade_price"], 37000.0)
+        self.assertAlmostEqual(row["buying_rate"], 37000.0)
+        self.assertEqual(row["buying_rate_currency"], "UGX")
+        self.assertEqual(row["buying_price_currency"], "USD")
+
+    def test_merge_item_row_omits_unconvertible_cross_currency_buying_rate(self):
+        lookup = self.module.ItemLookupData(
+            price_map={
+                "ITEM-MC": {
+                    "Nos": AttrDict(
+                        {
+                            "price_list_rate": 15.0,
+                            "currency": "USD",
+                            "price_list": "USD Selling",
+                        }
+                    )
+                }
+            },
+            buying_price_map={
+                "ITEM-MC": {
+                    "Nos": AttrDict(
+                        {
+                            "price_list_rate": 37000.0,
+                            "currency": "UGX",
+                            "price_list": "Standard Buying",
+                        }
+                    )
+                }
+            },
+            stock_map={},
+            meta_map={"ITEM-MC": AttrDict({"name": "ITEM-MC", "stock_uom": "Nos"})},
+            uom_map={},
+            barcode_map={},
+            batch_map={},
+            serial_map={},
+            bom_map={},
+        )
+
+        row = self.module.merge_item_row(
+            {"item_code": "ITEM-MC"},
+            lookup,
+            "USD",
+            exchange_rate=3700.0,
+            buying_exchange_rate=None,
+        )
+
+        self.assertIsNone(row["trade_price"])
+        self.assertIsNone(row["buying_rate"])
+        self.assertIsNone(row["buying_rate_currency"])
+        self.assertEqual(row["buying_price_currency"], "UGX")
 
 
 if __name__ == "__main__":

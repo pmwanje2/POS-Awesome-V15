@@ -263,4 +263,150 @@ describe("loss prevention", () => {
 			expect(risk?.belowCost).toBe(true);
 		}
 	});
+
+	it("allows a valid USD invoice sale when raw UGX buying fields accompany _buying_prices_by_uom", () => {
+		expect(
+			getItemLossRisk({
+				item_code: "MC-UGX-BUY-USD-SELL",
+				qty: 1,
+				rate: 15,
+				currency: "USD",
+				conversion_rate: 3700,
+				uom: "Nos",
+				stock_uom: "Nos",
+				conversion_factor: 1,
+				buying_price_currency: "UGX",
+				trade_price: 37000,
+				buying_rate: 37000,
+				_buying_prices_by_uom: {
+					Nos: {
+						price_list_rate: 37000,
+						base_price_list_rate: 37000,
+						currency: "UGX",
+					},
+				},
+			}),
+		).toBeNull();
+	});
+
+	it("blocks a below-cost USD invoice sale at the normalized USD floor instead of raw UGX buying rate", () => {
+		const risk = getItemLossRisk({
+			item_code: "MC-UGX-BUY-USD-SELL",
+			qty: 1,
+			rate: 8,
+			currency: "USD",
+			conversion_rate: 3700,
+			uom: "Nos",
+			stock_uom: "Nos",
+			conversion_factor: 1,
+			buying_price_currency: "UGX",
+			trade_price: 37000,
+			buying_rate: 37000,
+			_buying_prices_by_uom: {
+				Nos: {
+					price_list_rate: 37000,
+					base_price_list_rate: 37000,
+					currency: "UGX",
+				},
+			},
+		});
+
+		expect(risk?.belowCost).toBe(true);
+		expect(risk?.costField).toBe("_buying_prices_by_uom");
+		expect(risk?.costRate).toBeCloseTo(10);
+	});
+
+	it("handles USD buying list with UGX invoice for both valid and below-cost sales", () => {
+		const baseItem = {
+			item_code: "MC-USD-BUY-UGX-SELL",
+			qty: 1,
+			currency: "UGX",
+			conversion_rate: 1,
+			uom: "Nos",
+			stock_uom: "Nos",
+			conversion_factor: 1,
+			buying_price_currency: "USD",
+			trade_price: 10,
+			buying_rate: 10,
+			_buying_prices_by_uom: {
+				Nos: {
+					price_list_rate: 10,
+					base_price_list_rate: 37000,
+					currency: "USD",
+				},
+			},
+		};
+
+		expect(getItemLossRisk({ ...baseItem, rate: 40000 })).toBeNull();
+
+		const risk = getItemLossRisk({ ...baseItem, rate: 30000 });
+		expect(risk?.belowCost).toBe(true);
+		expect(risk?.costField).toBe("_buying_prices_by_uom");
+		expect(risk?.costRate).toBeCloseTo(37000);
+	});
+
+	it("allows a valid USD invoice sale when company currency is USD and buying list is UGX", () => {
+		expect(
+			getItemLossRisk({
+				item_code: "MC-USD-CO-UGX-BUY",
+				qty: 1,
+				rate: 15,
+				currency: "USD",
+				conversion_rate: 1,
+				uom: "Nos",
+				stock_uom: "Nos",
+				conversion_factor: 1,
+				buying_price_currency: "UGX",
+				trade_price: 37000,
+				buying_rate: 37000,
+				_buying_prices_by_uom: {
+					Nos: {
+						price_list_rate: 37000,
+						base_price_list_rate: 10,
+						currency: "UGX",
+					},
+				},
+			}),
+		).toBeNull();
+	});
+
+	it("normalizes mismatched-currency buying fields against company currency when _buying_prices_by_uom is absent", () => {
+		const baseItem = {
+			item_code: "MC-NO-TABLE",
+			qty: 1,
+			currency: "USD",
+			company_currency: "UGX",
+			conversion_rate: 3700,
+			uom: "Nos",
+			stock_uom: "Nos",
+			conversion_factor: 1,
+			buying_price_currency: "UGX",
+			trade_price: 37000,
+			buying_rate: 37000,
+		};
+
+		expect(getItemLossRisk({ ...baseItem, rate: 15 })).toBeNull();
+
+		const risk = getItemLossRisk({ ...baseItem, rate: 8 });
+		expect(risk?.belowCost).toBe(true);
+		expect(risk?.costRate).toBeCloseTo(10);
+	});
+
+	it("skips unconvertible foreign-currency buying fields instead of falsely blocking valid multicurrency sales", () => {
+		expect(
+			getItemLossRisk({
+				item_code: "MC-UNCONVERTIBLE",
+				qty: 1,
+				rate: 15,
+				currency: "USD",
+				conversion_rate: 3700,
+				uom: "Nos",
+				stock_uom: "Nos",
+				conversion_factor: 1,
+				buying_price_currency: "UGX",
+				trade_price: 37000,
+				buying_rate: 37000,
+			}),
+		).toBeNull();
+	});
 });
