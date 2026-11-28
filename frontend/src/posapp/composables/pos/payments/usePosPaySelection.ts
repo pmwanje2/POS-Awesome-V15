@@ -20,6 +20,16 @@ export function usePosPaySelection({
 	const total_selected_invoices = computed(() => {
 		if (!selected_invoices.value.length) return 0;
 		return selected_invoices.value.reduce((acc: number, cur: any) => {
+			const conversionUnavailable = Boolean(
+				cur?.outstanding_amount_in_invoice_currency == null &&
+					(cur?.outstanding_conversion_unavailable ||
+						(cur?.party_account_currency &&
+							cur?.currency &&
+							cur.party_account_currency !== cur.currency)),
+			);
+			if (conversionUnavailable) {
+				return acc;
+			}
 			const invoice_currency = cur.currency || posProfile.value.currency;
 			if (
 				currency_filter.value === "ALL" ||
