@@ -2,6 +2,7 @@ import { computed, ref } from "vue";
 import { describe, expect, it, vi } from "vitest";
 
 import payViewSource from "../src/posapp/components/pos/shell/PayView.vue?raw";
+import { usePosPaySelection } from "../src/posapp/composables/pos/payments/usePosPaySelection";
 
 function extractBlock(source: string, marker: RegExp, label: string): string {
 	const match = marker.exec(source);
@@ -629,5 +630,308 @@ describe("PayView.vue company currency & selling FX resolution", () => {
 		);
 		expect(setupReturnMatch).not.toBeNull();
 		expect(setupReturnMatch?.[0]).toMatch(/\bcompanyCurrencyLocal\b/);
+	});
+
+	it("uses invoice.currency (not party_account_currency) for invoiceTotalCurrency, FX trigger, and route-opened filter", () => {
+		const invoiceTotalCurrencyBody = extractBlock(
+			payViewSource,
+			/\bconst invoiceTotalCurrency\s*=\s*computed\(\(\)\s*=>\s*\{/,
+			"invoiceTotalCurrency",
+		);
+		const filteredInvoicesBody = extractBlock(
+			payViewSource,
+			/\bconst filtered_outstanding_invoices\s*=\s*computed\(\(\)\s*=>\s*\{/,
+			"filtered_outstanding_invoices",
+		);
+		const applyRouteBody = extractBlock(
+			payViewSource,
+			/\bfunction applyPaymentRouteTarget\(\)\s*\{/,
+			"applyPaymentRouteTarget",
+		);
+
+		(globalThis as any).flt = (v: unknown) => Number(v || 0);
+		const pos_profile = ref<any>({
+			name: "POS-UGX",
+			company: "Uganda Co",
+			currency: "UGX",
+			company_currency: "UGX",
+		});
+		const currency_filter = ref("ALL");
+		const selection = usePosPaySelection({
+			posProfile: pos_profile,
+			currency_filter,
+		});
+		const usdInvoice = {
+			voucher_no: "SINV-USD-UGX-1",
+			currency: "USD",
+			party_account_currency: "UGX",
+			company_currency: "UGX",
+			outstanding_amount: 37000,
+			outstanding_amount_in_invoice_currency: 10,
+			outstanding_conversion_unavailable: false,
+		};
+		const outstanding_invoices = ref<any[]>([usdInvoice]);
+		selection.selected_invoices.value = [usdInvoice];
+
+		const invoiceTotalCurrency = new Function(
+			"computed",
+			"currency_filter",
+			"selected_invoices",
+			"pos_profile",
+			`return computed(() => { ${invoiceTotalCurrencyBody} });`,
+		)(computed, currency_filter, selection.selected_invoices, pos_profile);
+
+		const filtered_outstanding_invoices = new Function(
+			"computed",
+			"currency_filter",
+			"outstanding_invoices",
+			"pos_profile",
+			`return computed(() => { ${filteredInvoicesBody} });`,
+		)(computed, currency_filter, outstanding_invoices, pos_profile);
+
+		const companyCurrencyLocal = computed(() => "UGX");
+		const requiresExchangeRate = computed(
+			() => invoiceTotalCurrency.value !== companyCurrencyLocal.value,
+		);
+
+		// Under ALL filter, selecting the USD 10 invoice with UGX party account must label USD (not UGX) and trigger USD->UGX FX.
+		expect(invoiceTotalCurrency.value).toBe("USD");
+		expect(requiresExchangeRate.value).toBe(true);
+		expect(selection.total_selected_invoices.value).toBe(10);
+
+		// Route-opening the USD invoice must select the USD filter, keeping the row visible with selected total 10.
+		const paymentRouteTarget = ref<any>({ invoiceName: "SINV-USD-UGX-1" });
+		const uiStore = { clearPaymentRouteTarget: vi.fn() };
+		const applyPaymentRouteTarget = new Function(
+			"paymentRouteTarget",
+			"outstanding_invoices",
+			"clearSelections",
+			"selected_invoices",
+			"currency_filter",
+			"pos_profile",
+			"uiStore",
+			applyRouteBody,
+		);
+		applyPaymentRouteTarget(
+			paymentRouteTarget,
+			outstanding_invoices,
+			selection.clearSelections,
+			selection.selected_invoices,
+			currency_filter,
+			pos_profile,
+			uiStore,
+		);
+
+		expect(currency_filter.value).toBe("USD");
+		expect(filtered_outstanding_invoices.value.map((r: any) => r.voucher_no)).toEqual([
+			"SINV-USD-UGX-1",
+		]);
+		expect(invoiceTotalCurrency.value).toBe("USD");
+		expect(selection.total_selected_invoices.value).toBe(10);
+	});
+
+	it("excludes outstanding_conversion_unavailable rows from PayView summary and selection USD totals", () => {
+		const totalOutstandingBody = extractBlock(
+			payViewSource,
+			/\bconst total_outstanding_amount\s*=\s*computed\(\(\)\s*=>\s*\{/,
+			"total_outstanding_amount",
+		);
+		const outstandingByCurrencyBody = extractBlock(
+			payViewSource,
+			/\bconst outstanding_by_currency\s*=\s*computed\(\(\)\s*=>\s*\{/,
+			"outstanding_by_currency",
+		);
+
+		(globalThis as any).flt = (v: unknown) => Number(v || 0);
+		const pos_profile = ref<any>({
+			name: "POS-USD",
+			company: "Uganda Co",
+			currency: "USD",
+			company_currency: "UGX",
+		});
+		const currency_filter = ref("ALL");
+		const unconvertibleRow = {
+			voucher_no: "SINV-EUR-NOQUOTE",
+			currency: "USD",
+			party_account_currency: "EUR",
+			company_currency: "UGX",
+			outstanding_amount: 10,
+			outstanding_amount_in_invoice_currency: null,
+			outstanding_conversion_unavailable: true,
+		};
+		const outstanding_invoices = ref<any[]>([unconvertibleRow]);
+
+		const total_outstanding_amount = new Function(
+			"computed",
+			"outstanding_invoices",
+			"flt",
+			`return computed(() => { ${totalOutstandingBody} });`,
+		)(computed, outstanding_invoices, (v: unknown) => Number(v || 0));
+
+		const outstanding_by_currency = new Function(
+			"computed",
+			"outstanding_invoices",
+			"pos_profile",
+			"currencySymbol",
+			"flt",
+			`return computed(() => { ${outstandingByCurrencyBody} });`,
+		)(
+			computed,
+			outstanding_invoices,
+			pos_profile,
+			(c: string) => c,
+			(v: unknown) => Number(v || 0),
+		);
+
+		const selection = usePosPaySelection({
+			posProfile: pos_profile,
+			currency_filter,
+		});
+		selection.selected_invoices.value = [unconvertibleRow];
+
+		expect(Object.keys(outstanding_by_currency.value)).toEqual([]);
+		expect(total_outstanding_amount.value).toBe(0);
+		expect(selection.total_selected_invoices.value).toBe(0);
+	});
+
+	it("ignores stale in-flight payment-method and selected-payment row FX responses after switching Receive to Supplier Pay", async () => {
+		const resolvePaymentMethodBody = extractBlock(
+			payViewSource,
+			/\bconst resolvePaymentMethodRate\s*=\s*async\s*\(method\)\s*=>\s*\{/,
+			"resolvePaymentMethodRate",
+		);
+		const normalizeSelectedBody = extractBlock(
+			payViewSource,
+			/\bconst normalizeSelectedPayment\s*=\s*async\s*\(row,\s*amountField\)\s*=>\s*\{/,
+			"normalizeSelectedPayment",
+		);
+		const purposeExpr = extractExpression(
+			payViewSource,
+			/\bconst exchangeRatePurpose\s*=\s*computed\(\s*/,
+			"exchangeRatePurpose",
+		);
+
+		const paymentEntryType = ref("Receive");
+		const partyType = ref("Customer");
+		const exchangeRatePurpose = new Function(
+			"computed",
+			"paymentEntryType",
+			"partyType",
+			`return computed(${purposeExpr});`,
+		)(computed, paymentEntryType, partyType);
+
+		const pos_profile = ref<any>({
+			name: "POS-ROW-RACE",
+			company: "Uganda Co",
+			currency: "USD",
+			company_currency: "UGX",
+		});
+		const company = ref("Uganda Co");
+		const companyCurrencyLocal = computed(() => "UGX");
+		const invoiceTotalCurrency = computed(() => "USD");
+		const postingDate = ref("2026-11-28");
+		const available_bank_accounts = ref<Record<string, any[]>>({});
+
+		const deferredSelling: Array<() => void> = [];
+		const resolveExchangeRate = vi.fn(({ fromCurrency, toCurrency, purpose }) => {
+			if (purpose === "for_selling") {
+				return new Promise((resolve) => {
+					deferredSelling.push(() =>
+						resolve({
+							found: true,
+							fromCurrency,
+							toCurrency,
+							rate: 3,
+							effectiveDate: "2026-11-28",
+							rateDate: "2026-11-28",
+							source: "currency_exchange",
+						}),
+					);
+				});
+			}
+			return Promise.resolve({
+				found: true,
+				fromCurrency,
+				toCurrency,
+				rate: 2,
+				effectiveDate: "2026-11-28",
+				rateDate: "2026-11-28",
+				source: "currency_exchange",
+			});
+		});
+
+		const resolvePaymentMethodRate = new Function(
+			"available_bank_accounts",
+			"getPaymentMethodCurrency",
+			"invoiceTotalCurrency",
+			"companyCurrencyLocal",
+			"pos_profile",
+			"company",
+			"postingDate",
+			"getTodayDate",
+			"resolveExchangeRate",
+			"flt",
+			"exchangeRatePurpose",
+			`return async (method) => { ${resolvePaymentMethodBody} };`,
+		)(
+			available_bank_accounts,
+			() => "EUR",
+			invoiceTotalCurrency,
+			companyCurrencyLocal,
+			pos_profile,
+			company,
+			postingDate,
+			() => "2026-11-28",
+			resolveExchangeRate,
+			(v: unknown) => Number(v || 0),
+			exchangeRatePurpose,
+		);
+
+		const normalizeSelectedPayment = new Function(
+			"pos_profile",
+			"invoiceTotalCurrency",
+			"resolveExchangeRate",
+			"company",
+			"postingDate",
+			"getTodayDate",
+			"flt",
+			"exchangeRatePurpose",
+			`return async (row, amountField) => { ${normalizeSelectedBody} };`,
+		)(
+			pos_profile,
+			invoiceTotalCurrency,
+			resolveExchangeRate,
+			company,
+			postingDate,
+			() => "2026-11-28",
+			(v: unknown) => Number(v || 0),
+			exchangeRatePurpose,
+		);
+
+		const method: any = { mode_of_payment: "Cash EUR", amount: 10, payment_currency: "EUR" };
+		const unallocatedRow: any = { currency: "EUR", unallocated_amount: 10 };
+
+		// Start slow Customer Receive (for_selling -> rate 3, equiv 30) lookups.
+		const slowMethodCall = resolvePaymentMethodRate(method);
+		const slowSelectedCall = normalizeSelectedPayment(unallocatedRow, "unallocated_amount");
+
+		// Switch to Supplier Pay (for_buying -> rate 2, equiv 20) while earlier lookups are in flight.
+		paymentEntryType.value = "Pay";
+		partyType.value = "Supplier";
+		await resolvePaymentMethodRate(method);
+		await normalizeSelectedPayment(unallocatedRow, "unallocated_amount");
+
+		expect(method.invoice_exchange_rate).toBe(2);
+		expect(method.invoice_equivalent).toBe(20);
+		expect(unallocatedRow.invoice_equivalent).toBe(20);
+
+		// Release stale for_selling responses late — must NOT overwrite rate 2 / equiv 20 with rate 3 / equiv 30.
+		deferredSelling.forEach((release) => release());
+		await Promise.all([slowMethodCall, slowSelectedCall]);
+
+		expect(method.invoice_exchange_rate).toBe(2);
+		expect(method.company_exchange_rate).toBe(2);
+		expect(method.invoice_equivalent).toBe(20);
+		expect(unallocatedRow.invoice_equivalent).toBe(20);
 	});
 });
