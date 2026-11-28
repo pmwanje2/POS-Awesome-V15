@@ -139,12 +139,82 @@ def _discover_pairs(profile, enabled_currencies):
     return list(dict.fromkeys(pairs))
 
 
+def _discover_required_floor_pairs(profile):
+    """Discover direct and inverse FX pairs needed for foreign tills and buying floors."""
+
+    company = profile.get("company")
+    company_currency = ""
+    if company:
+        company_currency = str(
+            frappe.db.get_value("Company", company, "default_currency") or ""
+        ).strip()
+    if not company_currency:
+        return []
+
+    foreign_currencies = []
+
+    def _add_currency(value):
+        normalized = str(value or "").strip()
+        if normalized and normalized != company_currency and normalized not in foreign_currencies:
+            foreign_currencies.append(normalized)
+
+    _add_currency(profile.get("currency"))
+
+    selling_price_list = str(profile.get("selling_price_list") or "").strip()
+    if selling_price_list:
+        _add_currency(get_price_list_currency(selling_price_list))
+
+    buying_price_list = str(profile.get("buying_price_list") or "").strip()
+    if not buying_price_list:
+        try:
+            from posawesome.posawesome.api.item_sale_controls import (
+                _resolve_buying_price_list,
+            )
+
+            buying_price_list = str(
+                _resolve_buying_price_list(profile.get("name")) or ""
+            ).strip()
+        except Exception:
+            buying_price_list = ""
+
+    if buying_price_list:
+        _add_currency(get_price_list_currency(buying_price_list))
+        try:
+            _add_currency(
+                frappe.db.get_value("Price List", buying_price_list, "currency")
+            )
+        except Exception:
+            pass
+        try:
+            buying_rows = (
+                frappe.get_all(
+                    "Item Price",
+                    filters={"price_list": buying_price_list, "buying": 1},
+                    fields=["currency"],
+                )
+                or []
+            )
+            for row in buying_rows:
+                _add_currency(row.get("currency"))
+        except Exception:
+            pass
+
+    pairs = []
+    for foreign_currency in foreign_currencies:
+        pairs.append((foreign_currency, company_currency))
+        pairs.append((company_currency, foreign_currency))
+    return list(dict.fromkeys(pairs))
+
+
 def _normalize_pairs(currency_pairs, profile, enabled_currencies):
     explicit_pairs = _parse_pairs(currency_pairs)
     if explicit_pairs:
         return explicit_pairs, True
-    # Startup sync is metadata-only. Rates are requested lazily after a
-    # transaction actually selects a foreign currency.
+    floor_pairs = _discover_required_floor_pairs(profile)
+    if floor_pairs:
+        return floor_pairs, True
+    # Startup sync on domestic-only profiles stays metadata-only until a
+    # transaction selects a foreign currency.
     return [], False
 
 

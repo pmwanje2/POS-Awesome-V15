@@ -2,6 +2,10 @@ import {
 	getCachedExchangeRate,
 	saveExchangeRateCache,
 } from "../../offline/index";
+import {
+	isCurrencyRateDateWithinStalePolicy,
+	oppositeCurrencyPurpose,
+} from "../../offline/currencyRatePolicy";
 import { currencyRateRepository } from "../../offline/repositories";
 
 declare const frappe: any;
@@ -86,25 +90,38 @@ const resolveUncached = async (
 		};
 	}
 
-	if (!args.purpose) {
-		const inverse = resolvedRates.get(
-			cacheKey({
-				...args,
-				fromCurrency: args.toCurrency,
-				toCurrency: args.fromCurrency,
-			}),
-		);
-		if (inverse?.found && inverse.rate) {
-			return {
-				found: true,
-				fromCurrency: args.fromCurrency,
-				toCurrency: args.toCurrency,
-				rate: 1 / inverse.rate,
-				effectiveDate: args.effectiveDate,
-				rateDate: inverse.rateDate,
-				source: "derived_inverse",
-			};
-		}
+	const exchangeSettings =
+		typeof currencyRateRepository?.getExchangeSettings === "function"
+			? await currencyRateRepository.getExchangeSettings()
+			: null;
+	const reversePurpose = oppositeCurrencyPurpose(args.purpose);
+
+	const inverse = resolvedRates.get(
+		cacheKey({
+			...args,
+			fromCurrency: args.toCurrency,
+			toCurrency: args.fromCurrency,
+			purpose: reversePurpose,
+		}),
+	);
+	if (
+		inverse?.found &&
+		inverse.rate &&
+		isCurrencyRateDateWithinStalePolicy(
+			inverse.rateDate,
+			args.effectiveDate,
+			exchangeSettings,
+		)
+	) {
+		return {
+			found: true,
+			fromCurrency: args.fromCurrency,
+			toCurrency: args.toCurrency,
+			rate: 1 / inverse.rate,
+			effectiveDate: args.effectiveDate,
+			rateDate: inverse.rateDate,
+			source: "derived_inverse",
+		};
 	}
 
 	const legacyCached = getCachedExchangeRate({
@@ -115,13 +132,19 @@ const resolveUncached = async (
 		rateDate: args.effectiveDate,
 		...(args.purpose ? { purpose: args.purpose } : {}),
 	});
-	// Never let an unqualified/mismatched legacy warm-cache entry override an explicit
-	// purpose lookup (e.g. for_buying vs for_selling).
+	// Never let an unqualified/mismatched or stale warm-cache entry override
+	// an explicit purpose lookup or Accounts Settings stale_days policy.
 	const legacyMatchesPurpose =
 		!args.purpose || legacyCached?.purpose === args.purpose;
-	const legacyRate = legacyMatchesPurpose
-		? positiveFinite(legacyCached?.exchange_rate)
-		: null;
+	const legacyWithinStalePolicy = isCurrencyRateDateWithinStalePolicy(
+		legacyCached?.date,
+		args.effectiveDate,
+		exchangeSettings,
+	);
+	const legacyRate =
+		legacyMatchesPurpose && legacyWithinStalePolicy
+			? positiveFinite(legacyCached?.exchange_rate)
+			: null;
 	if (legacyRate) {
 		return {
 			found: true,
@@ -131,6 +154,37 @@ const resolveUncached = async (
 			effectiveDate: args.effectiveDate,
 			rateDate: legacyCached?.date || args.effectiveDate,
 			source: "offline_cache",
+		};
+	}
+
+	const reverseWarmCached = getCachedExchangeRate({
+		profileName: args.profileName,
+		company: args.company,
+		fromCurrency: args.toCurrency,
+		toCurrency: args.fromCurrency,
+		rateDate: args.effectiveDate,
+		...(reversePurpose ? { purpose: reversePurpose } : {}),
+	});
+	const reverseWarmMatchesPurpose =
+		!reversePurpose || reverseWarmCached?.purpose === reversePurpose;
+	const reverseWarmWithinPolicy = isCurrencyRateDateWithinStalePolicy(
+		reverseWarmCached?.date,
+		args.effectiveDate,
+		exchangeSettings,
+	);
+	const reverseWarmRate =
+		reverseWarmMatchesPurpose && reverseWarmWithinPolicy
+			? positiveFinite(reverseWarmCached?.exchange_rate)
+			: null;
+	if (reverseWarmRate) {
+		return {
+			found: true,
+			fromCurrency: args.fromCurrency,
+			toCurrency: args.toCurrency,
+			rate: 1 / reverseWarmRate,
+			effectiveDate: args.effectiveDate,
+			rateDate: reverseWarmCached?.date || args.effectiveDate,
+			source: "derived_inverse",
 		};
 	}
 
@@ -153,7 +207,9 @@ const resolveUncached = async (
 					rate: cachedRate,
 					effectiveDate: args.effectiveDate,
 					rateDate: cachedRecord?.date,
-					source: "offline_cache",
+					source: cachedRecord?._inverted
+						? "derived_inverse"
+						: "offline_cache",
 				};
 			}
 		} catch (error) {

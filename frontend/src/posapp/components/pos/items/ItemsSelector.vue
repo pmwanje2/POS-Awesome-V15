@@ -405,6 +405,51 @@ const eventBus = inject("eventBus") as any;
 const selected_currency = ref("");
 const selected_exchange_rate = ref(1);
 const selected_conversion_rate = ref(1);
+const hasExplicitConversionRate = ref(false);
+
+const resolveCompanyContext = (item?: any) => {
+	if (uiStore.companyDoc?.default_currency) {
+		return uiStore.companyDoc;
+	}
+	const fallbackCurrency = String(
+		(pos_profile.value as any)?.company_currency ||
+			item?.company_currency ||
+			"",
+	).trim();
+	if (fallbackCurrency) {
+		return {
+			...(uiStore.companyDoc || {}),
+			default_currency: fallbackCurrency,
+		};
+	}
+	return uiStore.companyDoc || undefined;
+};
+
+const resolveSelectorConversionRate = (
+	item: any,
+	companyContext: { default_currency?: string } | undefined,
+	effectiveSelectedCurrency: string | undefined,
+) => {
+	const effectiveCompanyCurrency =
+		companyContext?.default_currency || pos_profile.value?.currency;
+	if (
+		effectiveSelectedCurrency &&
+		effectiveCompanyCurrency &&
+		effectiveSelectedCurrency !== effectiveCompanyCurrency &&
+		!hasExplicitConversionRate.value
+	) {
+		const itemRate = Number(item?.conversion_rate);
+		if (
+			item?.currency === effectiveSelectedCurrency &&
+			Number.isFinite(itemRate) &&
+			itemRate > 0
+		) {
+			return itemRate;
+		}
+		return undefined;
+	}
+	return selected_conversion_rate.value;
+};
 const isInitialized = ref(false);
 const initTimeout = ref<ReturnType<typeof setTimeout> | null>(null);
 const initError = ref<unknown>(null);
@@ -980,13 +1025,22 @@ const add_item = async (item, optionsOrQty: any = {}) => {
 			return null;
 		}
 
+		const addCompanyContext = resolveCompanyContext(item);
+		const addSelectedCurrency =
+			selected_currency.value || pos_profile.value?.currency;
+		const addConversionRate = resolveSelectorConversionRate(
+			item,
+			addCompanyContext,
+			addSelectedCurrency,
+		);
 		const context: any = {
+			company: addCompanyContext,
 			pos_profile: pos_profile.value,
 			stock_settings: stock_settings.value,
 			customer: selectedCustomer.value,
-			selected_currency: selected_currency.value,
+			selected_currency: addSelectedCurrency,
 			exchange_rate: selected_exchange_rate.value,
-			conversion_rate: selected_conversion_rate.value,
+			conversion_rate: addConversionRate,
 			price_list_currency:
 				item.original_currency || item.price_list_currency || pos_profile.value?.currency,
 			itemCurrencyUtils,
@@ -1384,13 +1438,22 @@ onMounted(async () => {
 		},
 		markStorageUnavailable,
 		applyCurrencyConversionToItem: (item) => {
+			const companyContext = resolveCompanyContext(item);
+			const effectiveSelectedCurrency =
+				selected_currency.value || pos_profile.value?.currency;
+			const effectiveConversionRate = resolveSelectorConversionRate(
+				item,
+				companyContext,
+				effectiveSelectedCurrency,
+			);
 			itemCurrencyUtils.applyCurrencyConversionToItem(item, {
+				company: companyContext,
 				pos_profile: pos_profile.value,
 				price_list_currency:
 					item?.original_currency || item?.price_list_currency || pos_profile.value?.currency,
-				selected_currency: selected_currency.value || pos_profile.value?.currency,
+				selected_currency: effectiveSelectedCurrency,
 				exchange_rate: selected_exchange_rate.value,
-				conversion_rate: selected_conversion_rate.value,
+				conversion_rate: effectiveConversionRate,
 				currency_precision: pos_profile.value?.currency_precision || 2,
 				flt: (window as any).frappe?.utils?.flt,
 			});
@@ -1509,6 +1572,7 @@ onMounted(async () => {
 		selectedCurrency: selected_currency,
 		selectedExchangeRate: selected_exchange_rate,
 		selectedConversionRate: selected_conversion_rate,
+		hasExplicitConversionRate,
 		selectedSupplier,
 		syncSelectorPriceList,
 		scheduleLastBuyingRateRefresh,

@@ -17,6 +17,58 @@ import { buildItemDetailsRequestIdentity } from "./detailFetcher/requestIdentity
 
 declare const frappe: any;
 
+const BUYING_FLOOR_DETAIL_FIELDS = [
+	"_buying_prices_by_uom",
+	"base_buying_rate",
+	"trade_price",
+	"buying_rate",
+	"buying_price",
+	"buying_price_list",
+	"buying_price_currency",
+	"buying_rate_currency",
+	"buying_exchange_rate",
+	"buying_price_not_uom_dependent",
+	"_source_buying_currency",
+	"_source_buying_price",
+	"_company_buying_price",
+	"company_currency",
+	"price_list_currency",
+	"plc_conversion_rate",
+	"conversion_rate",
+	"valuation_rate",
+	"warehouse_valuation_rate",
+	"last_purchase_rate",
+	"manufacturing_cost",
+	"manufacturing_cost_source",
+	"manufacturing_bom",
+] as const;
+
+function applyBuyingFloorDetailFields(
+	target: Record<string, any>,
+	source: Record<string, any>,
+) {
+	if (!target || !source) return;
+	for (const field of BUYING_FLOOR_DETAIL_FIELDS) {
+		if (
+			Object.prototype.hasOwnProperty.call(source, field) &&
+			source[field] !== undefined
+		) {
+			target[field] = source[field];
+		}
+	}
+	const hasBuyingFloorPayload =
+		Object.prototype.hasOwnProperty.call(source, "_buying_prices_by_uom") ||
+		Object.prototype.hasOwnProperty.call(source, "base_buying_rate") ||
+		Object.prototype.hasOwnProperty.call(source, "buying_exchange_rate");
+	if (
+		hasBuyingFloorPayload &&
+		source._company_buying_price === undefined &&
+		Object.prototype.hasOwnProperty.call(target, "_company_buying_price")
+	) {
+		delete target._company_buying_price;
+	}
+}
+
 type ItemDetailRequestCache = {
 	key: string | null;
 	promise: Promise<any> | null;
@@ -227,7 +279,7 @@ export function useItemDetailFetcher() {
 				itemCodes,
 			);
 			const missingCodes = new Set(cacheResult?.missing || []);
-			const updates: Array<{ item: any; upd: any }> = [];
+			const updates: Array<{ item: any; upd: any; source: any }> = [];
 
 			cacheResult.cached.forEach((det: any) => {
 				const item = displayedItemMap.get(det.item_code);
@@ -253,13 +305,14 @@ export function useItemDetailFetcher() {
 						upd.currency = det.currency;
 						upd.original_currency = det.currency;
 					}
-					updates.push({ item, upd });
+					updates.push({ item, upd, source: det });
 				}
 			});
 
 			if (cacheResult.missing.length === 0) {
-				updates.forEach(({ item, upd }) => {
+				updates.forEach(({ item, upd, source }) => {
 					Object.assign(item, upd);
+					applyBuyingFloorDetailFields(item, source);
 					rebaseAndReapplyReservation(item, upd.actual_qty);
 				});
 				updateLocalStockCache(cacheResult.cached);
@@ -302,12 +355,13 @@ export function useItemDetailFetcher() {
 					if (updItem.serial_no_data) {
 						upd.serial_no_data = updItem.serial_no_data;
 					}
-					updates.push({ item, upd });
+					updates.push({ item, upd, source: updItem });
 				}
 			});
 
-			updates.forEach(({ item, upd }) => {
+			updates.forEach(({ item, upd, source }) => {
 				Object.assign(item, upd);
+				applyBuyingFloorDetailFields(item, source);
 				rebaseAndReapplyReservation(item, upd.actual_qty);
 			});
 			updateLocalStockCache(details);
@@ -413,6 +467,7 @@ export function useItemDetailFetcher() {
 					item.currency = det.currency;
 					item.original_currency = det.currency;
 				}
+				applyBuyingFloorDetailFields(item, det);
 
 				if (ctx.itemAvailability) {
 					ctx.itemAvailability.captureBaseAvailability(
@@ -509,7 +564,7 @@ export function useItemDetailFetcher() {
 			if (details && details.length) {
 				itemDetailsRetryCount.value = 0;
 				let qtyChanged = false;
-				let updatedItems: Array<{ item: any; updates: any }> = [];
+				let updatedItems: Array<{ item: any; updates: any; source: any }> = [];
 				const detailMap = new Map<any, any>(
 					details.map((detail: any) => [detail.item_code, detail]),
 				);
@@ -521,6 +576,7 @@ export function useItemDetailFetcher() {
 
 						updatedItems.push({
 							item: item,
+							source: updated_item,
 							updates: {
 								actual_qty: updated_item.actual_qty,
 								has_batch_no: updated_item.has_batch_no,
@@ -579,8 +635,9 @@ export function useItemDetailFetcher() {
 					}
 				});
 
-				updatedItems.forEach(({ item, updates }) => {
+				updatedItems.forEach(({ item, updates, source }) => {
 					Object.assign(item, updates);
+					applyBuyingFloorDetailFields(item, source);
 					if (ctx.itemAvailability)
 						ctx.itemAvailability.captureBaseAvailability(
 							item,

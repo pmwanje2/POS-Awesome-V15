@@ -521,8 +521,11 @@ export function getItemCostFloor(
 	const hasExplicitInvalidBuyingFx = Boolean(
 		Object.prototype.hasOwnProperty.call(item, "buying_exchange_rate") &&
 			item.buying_exchange_rate !== undefined &&
-			item.buying_exchange_rate !== null &&
 			(rawBuyingExchangeRate === null || rawBuyingExchangeRate <= 0),
+	);
+	const hasExplicitNullBaseBuying = Boolean(
+		Object.prototype.hasOwnProperty.call(item, "base_buying_rate") &&
+			item.base_buying_rate === null,
 	);
 
 	const pricesByUom = item._buying_prices_by_uom;
@@ -545,6 +548,14 @@ export function getItemCostFloor(
 				: undefined);
 		const selected = exact || fallback;
 		selectedTableCurrency = String(selected?.currency || "").trim();
+		const hasExplicitNullBaseRate = Boolean(
+			selected &&
+				Object.prototype.hasOwnProperty.call(
+					selected,
+					"base_price_list_rate",
+				) &&
+				selected.base_price_list_rate === null,
+		);
 		const baseRate =
 			toFiniteNumber(selected?.base_price_list_rate) ??
 			toFiniteNumber(selected?.base_rate);
@@ -567,6 +578,11 @@ export function getItemCostFloor(
 					companyCurrency &&
 					selectedTableCurrency === companyCurrency,
 			);
+			const isForeignTableEntry = Boolean(
+				selectedTableCurrency &&
+					companyCurrency &&
+					selectedTableCurrency !== companyCurrency,
+			);
 			const sameAsInvoice = Boolean(
 				selectedTableCurrency &&
 					invoiceCurrency &&
@@ -575,12 +591,9 @@ export function getItemCostFloor(
 			if (sameAsCompany) {
 				selectedTableRate = rawTableRate * conversionFactor;
 				hasNormalizedBuyingPrice = true;
-			} else if (
-				buyingPriceCurrency &&
-				selectedTableCurrency === buyingPriceCurrency &&
-				hasExplicitInvalidBuyingFx
-			) {
+			} else if (isForeignTableEntry && hasExplicitInvalidBuyingFx) {
 				hasUnresolvedCrossCurrencyCost = true;
+				hasNormalizedBuyingPrice = true;
 			} else if (
 				buyingPriceCurrency &&
 				selectedTableCurrency === buyingPriceCurrency &&
@@ -589,6 +602,9 @@ export function getItemCostFloor(
 			) {
 				selectedTableRate =
 					rawTableRate * conversionFactor * rawBuyingExchangeRate;
+				hasNormalizedBuyingPrice = true;
+			} else if (isForeignTableEntry && hasExplicitNullBaseRate) {
+				hasUnresolvedCrossCurrencyCost = true;
 				hasNormalizedBuyingPrice = true;
 			} else if (sameAsInvoice) {
 				selectedTableInvoiceRate = rawTableRate * conversionFactor;
@@ -669,9 +685,12 @@ export function getItemCostFloor(
 				scalarCurrency &&
 					companyCurrency &&
 					scalarCurrency !== companyCurrency &&
-					buyingPriceCurrency &&
-					scalarCurrency === buyingPriceCurrency,
+					(!buyingPriceCurrency || scalarCurrency === buyingPriceCurrency),
 			);
+			const buyingScalarFxUnresolved =
+				hasExplicitInvalidBuyingFx ||
+				(hasExplicitNullBaseBuying &&
+					(rawBuyingExchangeRate === null || rawBuyingExchangeRate <= 0));
 			const currencyMismatch = Boolean(
 				scalarCurrency &&
 					effectiveInvoiceCurrency &&
@@ -679,13 +698,13 @@ export function getItemCostFloor(
 			);
 			// Mirror ERPNext setup/utils.py:77 & backend _resolve_floor_rates: even when
 			// sourceCurrency === invoiceCurrency !== companyCurrency, a raw buying scalar with
-			// buying_exchange_rate converts via for_buying FX (and fails closed if <= 0).
+			// buying_exchange_rate converts via for_buying FX (and fails closed if null/<= 0).
 			if (
 				isForeignBuyingScalar &&
-				(hasExplicitInvalidBuyingFx || rawBuyingExchangeRate !== null)
+				(buyingScalarFxUnresolved || rawBuyingExchangeRate !== null)
 			) {
 				if (
-					hasExplicitInvalidBuyingFx ||
+					buyingScalarFxUnresolved ||
 					rawBuyingExchangeRate === null ||
 					rawBuyingExchangeRate <= 0 ||
 					invoiceToCompanyRate === null
@@ -757,9 +776,12 @@ export function getItemCostFloor(
 				sourceCurrency &&
 					companyCurrency &&
 					sourceCurrency !== companyCurrency &&
-					buyingPriceCurrency &&
-					sourceCurrency === buyingPriceCurrency,
+					(!buyingPriceCurrency || sourceCurrency === buyingPriceCurrency),
 			);
+			const sourceFxUnresolved =
+				hasExplicitInvalidBuyingFx ||
+				(hasExplicitNullBaseBuying &&
+					(rawBuyingExchangeRate === null || rawBuyingExchangeRate <= 0));
 			const sourceMismatch = Boolean(
 				sourceCurrency &&
 					effectiveInvoiceCurrency &&
@@ -767,10 +789,10 @@ export function getItemCostFloor(
 			);
 			if (
 				isForeignSource &&
-				(hasExplicitInvalidBuyingFx || rawBuyingExchangeRate !== null)
+				(sourceFxUnresolved || rawBuyingExchangeRate !== null)
 			) {
 				if (
-					hasExplicitInvalidBuyingFx ||
+					sourceFxUnresolved ||
 					rawBuyingExchangeRate === null ||
 					rawBuyingExchangeRate <= 0 ||
 					invoiceToCompanyRate === null
@@ -962,7 +984,7 @@ function resolveNativeUnitNetRate(
 		) {
 			return normalizedNetRate;
 		}
-		return netFromAmount;
+		return Math.min(netFromAmount, roundToPrecision(netFromAmount, precision));
 	}
 	return netFromAmount;
 }
@@ -970,6 +992,10 @@ function resolveNativeUnitNetRate(
 function resolveRoundRowWiseTax(options: LossPreventionOptions): boolean {
 	if (options.roundRowWiseTax !== undefined) {
 		return Boolean(options.roundRowWiseTax);
+	}
+	const flagVal = (globalThis as any)?.frappe?.flags?.round_row_wise_tax;
+	if (flagVal !== undefined && flagVal !== null) {
+		return flagVal === 1 || flagVal === true || flagVal === "1";
 	}
 	const sysVal = (globalThis as any)?.frappe?.boot?.sysdefaults
 		?.round_row_wise_tax;
@@ -1021,10 +1047,15 @@ function areNativeNetAmountsReconciled(
 		const grossRate = getEffectiveSellingRate(item);
 		const { inclA, inclB } = computeRowTaxParams(item, options.taxes);
 		const hasInclusiveTax = inclA > 0 || inclB > 0;
-		const preDiscountNet = Math.max((grossRate - inclB) / (1 + inclA), 0);
-		const preAmount = preDiscountNet * qty;
+		// Mirror ERPNext taxes_and_totals.py:287 & :438-442: round gross item.amount
+		// to currency precision before extracting inclusive tax into net_amount.
+		const lineGrossAmount = roundToPrecision(grossRate * qty, precision);
+		const preAmount = Math.max(
+			(lineGrossAmount - inclB * qty) / (1 + inclA),
+			0,
+		);
 		const computedAmount =
-			preDiscountNet * (1 - invoiceDiscountPercentage / 100) * qty;
+			preAmount * (1 - invoiceDiscountPercentage / 100);
 		let nativeAmount = resolveNativeNetAmount(item, grossRate, qty, true);
 		if (nativeAmount === null) {
 			if (isPricingRuleFreeLine(item) && grossRate <= 0) {
@@ -1046,7 +1077,7 @@ function areNativeNetAmountsReconciled(
 			hasZeroAboveHalfUlp = true;
 		}
 		const rowWiseExpected = Math.min(
-			grossRate * qty,
+			lineGrossAmount,
 			roundToPrecision(preAmount, precision),
 		);
 		if (Math.abs(nativeAmount - rowWiseExpected) > 1e-9) {
@@ -1054,9 +1085,9 @@ function areNativeNetAmountsReconciled(
 		}
 		// ERPNext taxes_and_totals.py:438-462 carries inclusive-tax rounding across rows
 		// within the same tax group, permitting up to +1 ULP on an individual inclusive row
-		// (strictly capped at gross line amount) while keeping the tax-group total within 0.5 ULP.
+		// (strictly capped at rounded gross line amount) while keeping the tax-group total within 0.5 ULP.
 		const maxPreAmount = hasInclusiveTax
-			? Math.min(grossRate * qty, preAmount + ulp)
+			? Math.min(lineGrossAmount, preAmount + ulp)
 			: preAmount;
 		if (
 			nativeAmount > maxPreAmount + 1e-9 ||

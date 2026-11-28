@@ -20,7 +20,7 @@ type CurrencyItem = {
 
 type CurrencyContext = {
 	company?: { default_currency?: string };
-	pos_profile: { currency: string };
+	pos_profile: { currency: string; company_currency?: string };
 	price_list_currency?: string;
 	selected_currency?: string;
 	exchange_rate?: number;
@@ -191,7 +191,25 @@ export function useItemCurrency() {
 		context: CurrencyContext,
 	) => {
 		if (!item) return;
-		const base = getCompanyCurrency(context) || context.pos_profile.currency;
+		const explicitCompanyCurrency = String(
+			context.company?.default_currency ||
+				context.pos_profile?.company_currency ||
+				item.company_currency ||
+				"",
+		).trim();
+		const base =
+			explicitCompanyCurrency ||
+			getCompanyCurrency(context) ||
+			context.pos_profile.currency;
+		const resolvedContext: CurrencyContext = explicitCompanyCurrency
+			? {
+					...context,
+					company: {
+						...(context.company || {}),
+						default_currency: explicitCompanyCurrency,
+					},
+				}
+			: context;
 		const previousCurrency = String(item.currency || "").trim();
 		const previousConversionRate = parsePositiveFinite(item.conversion_rate);
 
@@ -204,14 +222,14 @@ export function useItemCurrency() {
 		}
 		if (!item.original_currency) {
 			item.original_currency =
-				context.price_list_currency || item.currency || base;
+				resolvedContext.price_list_currency || item.currency || base;
 		}
 
 		// original_rate is in price list currency
 		const price_list_rate = item.original_rate || 0;
 
 		// Determine base rate using available conversion info (Price List -> Company)
-		const plc_to_cc_rate = getPlcToCompanyRate(item, context);
+		const plc_to_cc_rate = getPlcToCompanyRate(item, resolvedContext);
 		const base_rate = price_list_rate * plc_to_cc_rate;
 
 		item.base_rate = base_rate;
@@ -219,12 +237,12 @@ export function useItemCurrency() {
 
 		// Determine selected rate using exchange rate (Price List -> Selected)
 		// item.original_currency is the Price List Currency
-		const priceListCurrency = getPriceListCurrency(context) || base;
-		const selectedCurrency = getSelectedCurrency(context) || base;
+		const priceListCurrency = getPriceListCurrency(resolvedContext) || base;
+		const selectedCurrency = getSelectedCurrency(resolvedContext) || base;
 
 		const strictPlcToCompanyRate = resolveStrictPlcToCompanyRate(
 			item,
-			context,
+			resolvedContext,
 			base,
 			priceListCurrency,
 			selectedCurrency,
@@ -232,16 +250,20 @@ export function useItemCurrency() {
 		let nextConversionRate: number;
 		if (selectedCurrency === base) {
 			nextConversionRate = 1;
-		} else if (context.conversion_rate !== undefined) {
-			nextConversionRate = parsePositiveFinite(context.conversion_rate) ?? 0;
+		} else if (resolvedContext.conversion_rate !== undefined) {
+			nextConversionRate =
+				parsePositiveFinite(resolvedContext.conversion_rate) ?? 0;
 		} else {
-			const displayRate = parsePositiveFinite(context.exchange_rate);
+			const displayRate = parsePositiveFinite(resolvedContext.exchange_rate);
 			nextConversionRate =
 				displayRate !== null &&
 				strictPlcToCompanyRate !== null &&
 				strictPlcToCompanyRate > 0
 					? strictPlcToCompanyRate / displayRate
-					: 0;
+					: previousCurrency === selectedCurrency &&
+						  previousConversionRate !== null
+						? previousConversionRate
+						: 0;
 		}
 
 		// Preserve company-currency buying cost before switching item.currency/conversion_rate.
@@ -266,7 +288,7 @@ export function useItemCurrency() {
 				? price_list_rate
 				: item.original_currency === selectedCurrency
 					? price_list_rate
-					: priceListToSelectedCurrency(context, price_list_rate);
+					: priceListToSelectedCurrency(resolvedContext, price_list_rate);
 
 		// context.flt is expected to be available or passed
 		const flt = context.flt || ((v: unknown) => Number(v));

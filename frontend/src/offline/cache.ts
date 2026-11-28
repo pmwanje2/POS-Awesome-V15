@@ -1238,6 +1238,10 @@ export function saveItemDetailsCache(profileName, priceList, items) {
 				item_uoms: it.item_uoms,
 				rate: it.rate,
 				price_list_rate: it.price_list_rate,
+				currency: it.currency,
+				price_list_currency: it.price_list_currency,
+				plc_conversion_rate: it.plc_conversion_rate,
+				conversion_rate: it.conversion_rate,
 				trade_price: it.trade_price,
 				buying_rate: it.buying_rate,
 				base_buying_rate: it.base_buying_rate,
@@ -1245,7 +1249,17 @@ export function saveItemDetailsCache(profileName, priceList, items) {
 				buying_exchange_rate: it.buying_exchange_rate,
 				buying_price_list: it.buying_price_list,
 				buying_price_currency: it.buying_price_currency,
+				buying_price_not_uom_dependent: it.buying_price_not_uom_dependent,
+				_source_buying_currency: it._source_buying_currency,
+				_source_buying_price: it._source_buying_price,
+				_company_buying_price: it._company_buying_price,
 				company_currency: it.company_currency,
+				valuation_rate: it.valuation_rate,
+				warehouse_valuation_rate: it.warehouse_valuation_rate,
+				last_purchase_rate: it.last_purchase_rate,
+				manufacturing_cost: it.manufacturing_cost,
+				manufacturing_cost_source: it.manufacturing_cost_source,
+				manufacturing_bom: it.manufacturing_bom,
 				_buying_prices_by_uom: it._buying_prices_by_uom,
 			}));
 			cleanItems = JSON.parse(JSON.stringify(cleanItems));
@@ -1312,37 +1326,66 @@ async function attachOfflineBuyingFloors(profileName: string, items: any[]) {
 		typeof currencyRateRepository?.getExchangeSettings === "function"
 			? await currencyRateRepository.getExchangeSettings()
 			: null;
-	const currencyRates = new Map<string, number>();
+	const currencyRates = new Map<
+		string,
+		{ rate: number; hasSyncedRows: boolean }
+	>();
 	const toCompanyRate = async (
 		currency: string,
 		companyCurrency: string,
-	) => {
-		if (!currency || !companyCurrency) return 0;
-		if (currency === companyCurrency) return 1;
+	): Promise<{ rate: number; hasSyncedRows: boolean }> => {
+		if (!currency || !companyCurrency) {
+			return { rate: 0, hasSyncedRows: false };
+		}
+		if (currency === companyCurrency) {
+			return { rate: 1, hasSyncedRows: true };
+		}
 		const cacheKey = `${currency}::${companyCurrency}`;
-		if (currencyRates.has(cacheKey))
-			return currencyRates.get(cacheKey) || 0;
-		const rows = await db
+		const cachedLookup = currencyRates.get(cacheKey);
+		if (cachedLookup) {
+			return cachedLookup;
+		}
+		const companyName = String(profile?.company || "");
+		const directRows = await db
 			.table("currency_rate_records")
 			.where("[profile_name+company+from_currency+to_currency]")
-			.equals([
-				profileName,
-				String(profile?.company || ""),
-				currency,
-				companyCurrency,
-			])
+			.equals([profileName, companyName, currency, companyCurrency])
 			.toArray();
-		// Mirror ERPNext setup/utils.py:66-125: buying floors must resolve via for_buying FX,
-		// enforce Accounts Settings stale_days when allow_stale=0, and tie-break by name desc.
+		// Mirror ERPNext setup/utils.py:66-134: buying floors resolve via for_buying FX,
+		// falling back to reverse pair with opposite purpose (for_selling) when direct is absent.
 		const selected = selectCurrencyRateRecord(
-			rows,
+			directRows,
 			today,
 			"for_buying",
 			exchangeSettings,
 		);
-		const rate = Number(selected?.exchange_rate || 0);
-		currencyRates.set(cacheKey, Number.isFinite(rate) ? rate : 0);
-		return currencyRates.get(cacheKey) || 0;
+		let resolvedRate = Number(selected?.exchange_rate || 0);
+		let hasSyncedRows = directRows.length > 0;
+		if (!Number.isFinite(resolvedRate) || resolvedRate <= 0) {
+			const reverseRows = await db
+				.table("currency_rate_records")
+				.where("[profile_name+company+from_currency+to_currency]")
+				.equals([profileName, companyName, companyCurrency, currency])
+				.toArray();
+			hasSyncedRows = hasSyncedRows || reverseRows.length > 0;
+			const reverseSelected = selectCurrencyRateRecord(
+				reverseRows,
+				today,
+				"for_selling",
+				exchangeSettings,
+			);
+			const reverseRate = Number(reverseSelected?.exchange_rate || 0);
+			resolvedRate =
+				Number.isFinite(reverseRate) && reverseRate > 0
+					? 1 / reverseRate
+					: 0;
+		}
+		const result = {
+			rate: Number.isFinite(resolvedRate) && resolvedRate > 0 ? resolvedRate : 0,
+			hasSyncedRows,
+		};
+		currencyRates.set(cacheKey, result);
+		return result;
 	};
 
 	const rowsByItem = new Map<string, any[]>();
@@ -1420,11 +1463,44 @@ async function attachOfflineBuyingFloors(profileName: string, items: any[]) {
 			} else {
 				priceNotUomDependent = existingAnyNotUomDependent;
 			}
-			const exchangeRate = await toCompanyRate(
+			const { rate: exchangeRate, hasSyncedRows } = await toCompanyRate(
 				rowCurrency || companyCurrency,
 				companyCurrency,
 			);
 			if (exchangeRate <= 0) {
+				const existingEntry = existingBuyingMap?.[uom];
+				const existingBaseRate = Number(
+					existingEntry?.base_price_list_rate ||
+						existingEntry?.base_rate ||
+						0,
+				);
+				const existingSourceRate = Number(
+					existingEntry?.price_list_rate || 0,
+				);
+				const existingCurrency = String(
+					existingEntry?.currency || "",
+				).trim();
+				const existingPriceList = String(
+					existingEntry?.price_list || "",
+				).trim();
+				const canPreserveVerifiedServerFloor =
+					!hasSyncedRows &&
+					existingEntry?.unresolved_fx !== true &&
+					Number.isFinite(existingBaseRate) &&
+					existingBaseRate > 0 &&
+					Math.abs(existingSourceRate - rate) <= 1e-9 &&
+					(!existingCurrency || existingCurrency === rowCurrency) &&
+					(!existingPriceList || existingPriceList === buyingPriceList);
+				if (canPreserveVerifiedServerFloor) {
+					pricesByUom[uom] = {
+						price_list_rate: rate,
+						base_price_list_rate: existingBaseRate,
+						currency: rowCurrency || companyCurrency,
+						price_list: buyingPriceList,
+						price_not_uom_dependent: priceNotUomDependent ? 1 : 0,
+					};
+					continue;
+				}
 				// Preserve the unresolved buying-price row so getItemCostFloor fails closed
 				// rather than falling through to warehouse valuation.
 				unresolvedBuyingCurrency = unresolvedBuyingCurrency || rowCurrency;

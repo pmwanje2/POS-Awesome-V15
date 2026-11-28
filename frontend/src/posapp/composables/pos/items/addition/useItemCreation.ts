@@ -197,7 +197,11 @@ export function useItemCreation() {
 			// applyCurrencyConversionToItem logic
 			itemCurrencyUtils.applyCurrencyConversionToItem(item, context);
 
-			const companyCurrency = pos_profile.currency;
+			const companyCurrency =
+				context.company?.default_currency ||
+				pos_profile.company_currency ||
+				item.company_currency ||
+				pos_profile.currency;
 			// _getPlcToCompanyRate logic
 			const plcToCompanyRate = itemCurrencyUtils.getPlcToCompanyRate(
 				item,

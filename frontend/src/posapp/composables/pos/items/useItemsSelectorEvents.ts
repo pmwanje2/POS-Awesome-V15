@@ -29,6 +29,7 @@ type UseItemsSelectorEventsArgs = {
 	selectedCurrency: Ref<string>;
 	selectedExchangeRate: Ref<number>;
 	selectedConversionRate: Ref<number>;
+	hasExplicitConversionRate?: Ref<boolean>;
 	selectedSupplier: Ref<string | null>;
 	syncSelectorPriceList: (_priceList: unknown) => Promise<void> | void;
 	scheduleLastBuyingRateRefresh: () => void;
@@ -53,6 +54,7 @@ export function registerItemsSelectorEvents({
 	selectedCurrency,
 	selectedExchangeRate,
 	selectedConversionRate,
+	hasExplicitConversionRate,
 	selectedSupplier,
 	syncSelectorPriceList,
 	scheduleLastBuyingRateRefresh,
@@ -72,6 +74,9 @@ export function registerItemsSelectorEvents({
 				selectedExchangeRate.value = 0;
 				selectedConversionRate.value = 0;
 			}
+			if (hasExplicitConversionRate) {
+				hasExplicitConversionRate.value = true;
+			}
 			return;
 		}
 
@@ -87,6 +92,9 @@ export function registerItemsSelectorEvents({
 				selectedConversionRate.value = parsePositiveRate(data.conversion_rate);
 			} else if (currencyChanged) {
 				selectedConversionRate.value = 0;
+			}
+			if (hasExplicitConversionRate) {
+				hasExplicitConversionRate.value = true;
 			}
 		}
 	};

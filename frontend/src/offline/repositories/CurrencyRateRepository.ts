@@ -1,4 +1,9 @@
 import { db } from "../db";
+import {
+	isCurrencyFlagEnabled,
+	isCurrencyRateDateWithinStalePolicy,
+	oppositeCurrencyPurpose,
+} from "../currencyRatePolicy";
 
 export type OfflineCurrencyRateRecord = {
 	name: string;
@@ -37,38 +42,12 @@ export type CurrencyRateSelectionOptions = {
 
 const CURRENCY_EXCHANGE_SETTINGS_KEY = "currency_exchange_settings";
 
-function isFlagEnabled(value: unknown): boolean {
-	return value === 1 || value === true || value === "1";
-}
-
-function hasExplicitPurposeFlags(row: Record<string, any>): boolean {
-	return (
-		(row?.for_buying !== undefined && row?.for_buying !== null) ||
-		(row?.for_selling !== undefined && row?.for_selling !== null)
-	);
-}
-
-function subtractDaysIso(isoDate: string, days: number): string | null {
-	const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(isoDate.slice(0, 10));
-	if (!match) {
-		return null;
-	}
-	const year = Number(match[1]);
-	const month = Number(match[2]);
-	const day = Number(match[3]);
-	const dt = new Date(Date.UTC(year, month - 1, day - days));
-	if (Number.isNaN(dt.getTime())) {
-		return null;
-	}
-	return dt.toISOString().slice(0, 10);
-}
-
 /**
  * Select the authoritative Currency Exchange row matching ERPNext setup/utils.py:66-125:
  * - Date on or before `targetDate`
  * - Strict `date > (targetDate - staleDays)` when `allowStale` is explicitly `0`/`false`
- * - Purpose filter (`for_buying` / `for_selling`), staying backwards-compatible with legacy
- *   cached rows that omit both purpose flags
+ * - Strict purpose filter (`for_buying` / `for_selling`) requiring the matching flag to be
+ *   explicitly enabled when a purpose is specified (legacy unqualified rows fail closed)
  * - Order: `date desc`, purpose-specific before dual-purpose (`for_selling asc` for buying,
  *   `for_buying asc` for selling), `name desc`, falling back to `modified desc` only if tied.
  */
@@ -78,40 +57,24 @@ export function selectCurrencyRateRecord<T extends Record<string, any>>(
 	purpose?: string | null,
 	options?: CurrencyRateSelectionOptions | null,
 ): T | null {
-	const cutoff = String(targetDate || "").slice(0, 10);
 	const normalizedPurpose =
 		purpose === "for_buying" || purpose === "for_selling" ? purpose : null;
-	const enforceStaleLimit = Boolean(
-		cutoff &&
-			options &&
-			options.allowStale !== undefined &&
-			options.allowStale !== null &&
-			!isFlagEnabled(options.allowStale),
-	);
-	const staleDays =
-		options?.staleDays !== undefined &&
-		options?.staleDays !== null &&
-		Number.isFinite(Number(options.staleDays)) &&
-		Number(options.staleDays) >= 0
-			? Math.trunc(Number(options.staleDays))
-			: 1;
-	const checkpointDate = enforceStaleLimit
-		? subtractDaysIso(cutoff, staleDays)
-		: null;
 
 	const eligible = (rows || []).filter((row) => {
 		if (!row) {
 			return false;
 		}
-		const rowDate = String(row.date || "").slice(0, 10);
-		if (cutoff && rowDate && rowDate > cutoff) {
+		if (
+			!isCurrencyRateDateWithinStalePolicy(
+				row.date,
+				targetDate,
+				options,
+			)
+		) {
 			return false;
 		}
-		if (checkpointDate && (!rowDate || rowDate <= checkpointDate)) {
-			return false;
-		}
-		if (normalizedPurpose && hasExplicitPurposeFlags(row)) {
-			return isFlagEnabled(row[normalizedPurpose]);
+		if (normalizedPurpose) {
+			return isCurrencyFlagEnabled(row[normalizedPurpose]);
 		}
 		return true;
 	});
@@ -123,30 +86,14 @@ export function selectCurrencyRateRecord<T extends Record<string, any>>(
 			return rightDate > leftDate ? 1 : -1;
 		}
 		if (normalizedPurpose === "for_buying") {
-			const leftSelling = hasExplicitPurposeFlags(left)
-				? isFlagEnabled(left.for_selling)
-					? 1
-					: 0
-				: 1;
-			const rightSelling = hasExplicitPurposeFlags(right)
-				? isFlagEnabled(right.for_selling)
-					? 1
-					: 0
-				: 1;
+			const leftSelling = isCurrencyFlagEnabled(left.for_selling) ? 1 : 0;
+			const rightSelling = isCurrencyFlagEnabled(right.for_selling) ? 1 : 0;
 			if (leftSelling !== rightSelling) {
 				return leftSelling - rightSelling;
 			}
 		} else if (normalizedPurpose === "for_selling") {
-			const leftBuying = hasExplicitPurposeFlags(left)
-				? isFlagEnabled(left.for_buying)
-					? 1
-					: 0
-				: 1;
-			const rightBuying = hasExplicitPurposeFlags(right)
-				? isFlagEnabled(right.for_buying)
-					? 1
-					: 0
-				: 1;
+			const leftBuying = isCurrencyFlagEnabled(left.for_buying) ? 1 : 0;
+			const rightBuying = isCurrencyFlagEnabled(right.for_buying) ? 1 : 0;
 			if (leftBuying !== rightBuying) {
 				return leftBuying - rightBuying;
 			}
@@ -228,7 +175,7 @@ class CurrencyRateRepository {
 				allow_stale:
 					settings.allow_stale === undefined || settings.allow_stale === null
 						? 1
-						: isFlagEnabled(settings.allow_stale)
+						: isCurrencyFlagEnabled(settings.allow_stale)
 							? 1
 							: 0,
 				stale_days:
@@ -271,12 +218,46 @@ class CurrencyRateRepository {
 						staleDays: lookup.staleDays,
 					}
 				: await this.getExchangeSettings();
-		return selectCurrencyRateRecord(
+		const direct = selectCurrencyRateRecord(
 			rows,
 			lookup.date,
 			lookup.purpose,
 			selectionOptions,
 		);
+		if (direct) {
+			return direct;
+		}
+		if (
+			lookup.fromCurrency &&
+			lookup.toCurrency &&
+			lookup.fromCurrency !== lookup.toCurrency
+		) {
+			// Mirror ERPNext setup/utils.py:128-134: when direct rate is unavailable,
+			// fall back to reverse pair with the opposite purpose (for_buying <-> for_selling).
+			const reverseRows = await this.findForPair({
+				...lookup,
+				fromCurrency: lookup.toCurrency,
+				toCurrency: lookup.fromCurrency,
+			});
+			const reversePurpose = oppositeCurrencyPurpose(lookup.purpose);
+			const reverse = selectCurrencyRateRecord(
+				reverseRows,
+				lookup.date,
+				reversePurpose,
+				selectionOptions,
+			);
+			const reverseRate = Number(reverse?.exchange_rate || 0);
+			if (reverse && Number.isFinite(reverseRate) && reverseRate > 0) {
+				return {
+					...reverse,
+					from_currency: lookup.fromCurrency,
+					to_currency: lookup.toCurrency,
+					exchange_rate: 1 / reverseRate,
+					_inverted: true,
+				};
+			}
+		}
+		return null;
 	}
 }
 

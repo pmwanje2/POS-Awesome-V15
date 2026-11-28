@@ -1422,12 +1422,13 @@ def _invoice_actual_tax_total(invoice_doc):
 
 
 def _is_round_row_wise_tax_enabled(invoice_doc=None):
-    """Return whether ERPNext's ``Accounts Settings.round_row_wise_tax`` is active."""
+    """Return whether ERPNext's ``Accounts Settings.round_row_wise_tax`` is active.
 
-    if invoice_doc and hasattr(invoice_doc, "get"):
-        explicit = invoice_doc.get("round_row_wise_tax")
-        if explicit is not None:
-            return explicit in (1, True, "1")
+    Mirrors ERPNext ``taxes_and_totals.py:42``: read only authoritative server
+    flags / ``Accounts Settings``, never letting a client-provided field on
+    ``invoice_doc`` override the site setting.
+    """
+
     flags = getattr(frappe, "flags", None)
     flag_val = getattr(flags, "round_row_wise_tax", None) if flags is not None else None
     if flag_val is not None:
@@ -1518,6 +1519,8 @@ def collect_below_buying_price_errors(
 
     row_tax_params = {}
     pre_discount_nets = {}
+    pre_discount_amounts = {}
+    line_gross_amounts = {}
     eligible_indexes = []
     eligible_net_total = 0.0
     eligible_scalable_grand_total = 0.0
@@ -1528,6 +1531,22 @@ def collect_below_buying_price_errors(
         incl_a, incl_b, all_a, all_b = _row_tax_params(item, invoice_doc)
         row_tax_params[index] = (incl_a, incl_b, all_a, all_b)
         gross_rate = abs(flt(item.get("rate")))
+        row_qty = abs(flt(item.get("qty")))
+        amount_prec = _resolve_currency_precision(item, invoice_doc, "amount")
+        if amount_prec is None:
+            amount_prec = _resolve_currency_precision(item, invoice_doc, "net_amount")
+        if amount_prec is None:
+            amount_prec = _resolve_currency_precision(item, invoice_doc, "net_rate")
+        # Mirror ERPNext taxes_and_totals.py:287 & :438-442: round gross item.amount
+        # to amount precision before extracting inclusive tax into net_amount.
+        line_gross_amount = (
+            flt(gross_rate * row_qty, amount_prec)
+            if amount_prec is not None
+            else (gross_rate * row_qty)
+        )
+        line_gross_amounts[index] = line_gross_amount
+        pre_discount_amount = max((line_gross_amount - incl_b * row_qty) / (1.0 + incl_a), 0.0)
+        pre_discount_amounts[index] = pre_discount_amount
         pre_discount_net = max((gross_rate - incl_b) / (1.0 + incl_a), 0.0)
         pre_discount_nets[index] = pre_discount_net
         # Include verified promotional rows in the invoice discount allocation base
@@ -1539,10 +1558,9 @@ def collect_below_buying_price_errors(
             and flt(item.get("qty")) > 0
         ):
             eligible_indexes.append(index)
-            qty = abs(flt(item.get("qty")))
-            eligible_net_total += pre_discount_net * qty
-            eligible_scalable_grand_total += pre_discount_net * (1.0 + all_a) * qty
-            eligible_fixed_qty_tax_total += all_b * qty
+            eligible_net_total += pre_discount_amount
+            eligible_scalable_grand_total += pre_discount_amount * (1.0 + all_a)
+            eligible_fixed_qty_tax_total += all_b * row_qty
 
     invoice_actual_tax_total = _invoice_actual_tax_total(invoice_doc)
     eligible_grand_total = (
@@ -1550,36 +1568,35 @@ def collect_below_buying_price_errors(
     )
 
     computed_net_rates = {}
+    computed_net_amounts = {}
     for index, row in enumerate(item_rows):
         if not hasattr(row, "get"):
             continue
         pre_discount_net = pre_discount_nets.get(index, 0.0)
+        pre_discount_amount = pre_discount_amounts.get(index, 0.0)
         if apply_discount_on == "Net Total":
             if invoice_discount_percentage > 0:
-                computed_net_rate = pre_discount_net * max(
-                    1.0 - invoice_discount_percentage / 100.0, 0.0
-                )
+                discount_multiplier = max(1.0 - invoice_discount_percentage / 100.0, 0.0)
             elif invoice_discount_amount > 0 and eligible_net_total > 0:
-                computed_net_rate = pre_discount_net * max(
-                    1.0 - invoice_discount_amount / eligible_net_total, 0.0
-                )
+                discount_multiplier = max(1.0 - invoice_discount_amount / eligible_net_total, 0.0)
             else:
-                computed_net_rate = pre_discount_net
+                discount_multiplier = 1.0
         else:
             if is_cash_or_non_trade_discount:
-                computed_net_rate = pre_discount_net
+                discount_multiplier = 1.0
             elif invoice_discount_percentage > 0 and eligible_scalable_grand_total > 0:
                 effective_discount = (invoice_discount_percentage / 100.0) * eligible_grand_total
                 discount_fraction = min(effective_discount / eligible_scalable_grand_total, 1.0)
-                computed_net_rate = pre_discount_net * max(1.0 - discount_fraction, 0.0)
+                discount_multiplier = max(1.0 - discount_fraction, 0.0)
             elif invoice_discount_amount > 0 and eligible_scalable_grand_total > 0:
                 discount_fraction = min(
                     invoice_discount_amount / eligible_scalable_grand_total, 1.0
                 )
-                computed_net_rate = pre_discount_net * max(1.0 - discount_fraction, 0.0)
+                discount_multiplier = max(1.0 - discount_fraction, 0.0)
             else:
-                computed_net_rate = pre_discount_net
-        computed_net_rates[index] = computed_net_rate
+                discount_multiplier = 1.0
+        computed_net_rates[index] = pre_discount_net * discount_multiplier
+        computed_net_amounts[index] = pre_discount_amount * discount_multiplier
 
     # ERPNext distributes rounding differences (+1 ULP) onto individual lines so
     # sum(item.net_amount) matches the discounted net total (taxes_and_totals.py:1105-1116).
@@ -1607,8 +1624,9 @@ def collect_below_buying_price_errors(
                 else:
                     all_rows_reconciled = False
                     break
-            el_pre_amount = pre_discount_nets.get(idx, 0.0) * el_qty
-            el_computed_amount = computed_net_rates.get(idx, 0.0) * el_qty
+            el_gross_amount = line_gross_amounts.get(idx, el_gross * el_qty)
+            el_pre_amount = pre_discount_amounts.get(idx, 0.0)
+            el_computed_amount = computed_net_amounts.get(idx, 0.0)
             el_incl_a, el_incl_b, _el_all_a, _el_all_b = row_tax_params.get(
                 idx, (0.0, 0.0, 0.0, 0.0)
             )
@@ -1620,17 +1638,17 @@ def collect_below_buying_price_errors(
             invoice_ulp = max(invoice_ulp, row_ulp)
             # ERPNext taxes_and_totals.py:438-462 carries inclusive-tax rounding across rows
             # within the same tax group, permitting up to +1 ULP on an individual inclusive row
-            # (strictly capped at gross line amount) while keeping the tax-group total within 0.5 ULP.
+            # (strictly capped at rounded gross line amount) while keeping the tax-group total within 0.5 ULP.
             # When round_row_wise_tax is enabled, each row rounds independently to flt(pre_amount, prec).
             el_row_wise_expected = (
-                min(el_gross * el_qty, flt(el_pre_amount, el_prec))
+                min(el_gross_amount, flt(el_pre_amount, el_prec))
                 if el_prec is not None
                 else el_pre_amount
             )
             if abs(el_native_amount - el_row_wise_expected) > 1e-9:
                 all_rows_match_row_wise = False
             el_max_pre_amount = (
-                min(el_gross * el_qty, el_pre_amount + row_ulp)
+                min(el_gross_amount, el_pre_amount + row_ulp)
                 if has_inclusive_tax and el_prec is not None
                 else el_pre_amount
             )
@@ -1753,7 +1771,11 @@ def collect_below_buying_price_errors(
                 selling_rate = row_net_rate
                 honored_native_net_rate = True
             elif row_net_from_amount is not None:
-                selling_rate = row_net_from_amount
+                selling_rate = (
+                    min(row_net_from_amount, flt(row_net_from_amount, net_rate_precision))
+                    if row_net_rate is not None and net_rate_precision is not None
+                    else row_net_from_amount
+                )
             else:
                 selling_rate = computed_net_rate
         else:
