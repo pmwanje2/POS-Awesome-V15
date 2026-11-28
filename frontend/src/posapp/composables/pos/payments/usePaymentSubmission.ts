@@ -82,8 +82,7 @@ export interface SubmissionCallbacks {
 	}) => void;
 }
 
-const COST_METADATA_FIELDS = [
-	"_buying_prices_by_uom",
+const SCALAR_COST_FALLBACK_FIELDS = [
 	"_company_buying_price",
 	"base_buying_rate",
 	"trade_price",
@@ -93,14 +92,22 @@ const COST_METADATA_FIELDS = [
 	"valuation_rate",
 	"last_purchase_rate",
 	"manufacturing_cost",
+	"_source_buying_price",
 ] as const;
 
-const COST_FALLBACK_COPY_FIELDS = [
-	...COST_METADATA_FIELDS,
+const METADATA_FALLBACK_FIELDS = [
+	"currency",
+	"price_list_currency",
+	"company_currency",
+	"conversion_rate",
+	"plc_conversion_rate",
 	"buying_rate_currency",
 	"buying_price_currency",
 	"buying_exchange_rate",
-	"company_currency",
+	"_source_buying_currency",
+	"uom",
+	"stock_uom",
+	"conversion_factor",
 ] as const;
 
 function resolveCurrencyPrecision(value: unknown): number {
@@ -112,58 +119,127 @@ function resolveCurrencyPrecision(value: unknown): number {
 	return Number.isInteger(numeric) && numeric >= 0 ? numeric : 2;
 }
 
-function hasAnyCostField(item: Record<string, unknown> | null | undefined): boolean {
-	if (!item || typeof item !== "object") {
-		return false;
+function isBlankValue(value: unknown): boolean {
+	return value === undefined || value === null || value === "";
+}
+
+function findMatchingCartItemIndex(
+	docItem: Record<string, any>,
+	index: number,
+	liveCartItems: Array<Record<string, any>>,
+	usedIndexes: Set<number>,
+): number {
+	if (docItem.posa_row_id) {
+		const byRowId = liveCartItems.findIndex(
+			(cartItem) => cartItem && cartItem.posa_row_id === docItem.posa_row_id,
+		);
+		if (byRowId !== -1) {
+			return byRowId;
+		}
 	}
-	return COST_METADATA_FIELDS.some((field) => {
-		const val = item[field];
-		if (val === null || val === undefined || val === "") {
-			return false;
+	if (docItem.name) {
+		const byName = liveCartItems.findIndex(
+			(cartItem) => cartItem && cartItem.name === docItem.name,
+		);
+		if (byName !== -1) {
+			return byName;
 		}
-		if (typeof val === "object") {
-			return Object.keys(val as Record<string, unknown>).length > 0;
+	}
+	const sameIndex = liveCartItems[index];
+	if (
+		!usedIndexes.has(index) &&
+		sameIndex &&
+		sameIndex.item_code === docItem.item_code
+	) {
+		return index;
+	}
+	if (docItem.item_code) {
+		const unclaimedBySku = liveCartItems.findIndex(
+			(cartItem, idx) =>
+				!usedIndexes.has(idx) &&
+				cartItem &&
+				cartItem.item_code === docItem.item_code,
+		);
+		if (unclaimedBySku !== -1) {
+			return unclaimedBySku;
 		}
-		return Number(val) > 0;
-	});
+		return liveCartItems.findIndex(
+			(cartItem) => cartItem && cartItem.item_code === docItem.item_code,
+		);
+	}
+	return -1;
 }
 
 function mergeDocItemsWithCartCostFallback(
 	docItems: Array<Record<string, any>>,
 	liveCartItems: Array<Record<string, any>>,
+	doc?: Record<string, any> | null,
 ): Array<Record<string, any>> {
 	if (!docItems.length) {
 		return liveCartItems;
 	}
-	if (!liveCartItems.length) {
-		return docItems;
-	}
+	const usedCartIndexes = new Set<number>();
 	return docItems.map((docItem, index) => {
-		if (!docItem || typeof docItem !== "object" || hasAnyCostField(docItem)) {
+		if (!docItem || typeof docItem !== "object") {
 			return docItem;
 		}
-		const sameIndex = liveCartItems[index];
-		const matched =
-			(sameIndex && sameIndex.item_code === docItem.item_code
-				? sameIndex
-				: null) ||
-			liveCartItems.find(
-				(cartItem) =>
-					cartItem &&
-					((docItem.posa_row_id &&
-						cartItem.posa_row_id === docItem.posa_row_id) ||
-						(docItem.name && cartItem.name === docItem.name) ||
-						(docItem.item_code && cartItem.item_code === docItem.item_code)),
-			);
-		if (!matched) {
-			return docItem;
+		const matchedIndex = liveCartItems.length
+			? findMatchingCartItemIndex(
+					docItem,
+					index,
+					liveCartItems,
+					usedCartIndexes,
+				)
+			: -1;
+		const matched = matchedIndex !== -1 ? liveCartItems[matchedIndex] : null;
+		if (matchedIndex !== -1) {
+			usedCartIndexes.add(matchedIndex);
 		}
 		const merged: Record<string, any> = { ...docItem };
-		for (const field of COST_FALLBACK_COPY_FIELDS) {
-			if (merged[field] === undefined && matched[field] !== undefined) {
-				merged[field] = matched[field];
+
+		if (matched && typeof matched === "object") {
+			if (
+				matched._buying_prices_by_uom &&
+				typeof matched._buying_prices_by_uom === "object"
+			) {
+				const existingMap =
+					merged._buying_prices_by_uom &&
+					typeof merged._buying_prices_by_uom === "object"
+						? merged._buying_prices_by_uom
+						: null;
+				merged._buying_prices_by_uom = existingMap
+					? { ...matched._buying_prices_by_uom, ...existingMap }
+					: { ...matched._buying_prices_by_uom };
+			}
+			for (const field of SCALAR_COST_FALLBACK_FIELDS) {
+				const currentVal = merged[field];
+				const currentMissing =
+					isBlankValue(currentVal) || !(Number(currentVal) > 0);
+				if (currentMissing && Number(matched[field]) > 0) {
+					merged[field] = matched[field];
+				}
+			}
+			for (const field of METADATA_FALLBACK_FIELDS) {
+				if (isBlankValue(merged[field]) && !isBlankValue(matched[field])) {
+					merged[field] = matched[field];
+				}
 			}
 		}
+
+		if (doc && typeof doc === "object") {
+			for (const docField of [
+				"currency",
+				"price_list_currency",
+				"company_currency",
+				"conversion_rate",
+				"plc_conversion_rate",
+			] as const) {
+				if (isBlankValue(merged[docField]) && !isBlankValue(doc[docField])) {
+					merged[docField] = doc[docField];
+				}
+			}
+		}
+
 		return merged;
 	});
 }
@@ -638,12 +714,13 @@ export function usePaymentSubmission(options: PaymentSubmissionOptions) {
 		const effectiveItems = mergeDocItemsWithCartCostFallback(
 			docItems,
 			liveCartItems,
+			doc,
 		);
 		const lossRiskItems = saleFloorPolicy.enabled
 			? findLossRiskItems(effectiveItems, lossOptions)
 			: [];
 		const missingCostItems = saleFloorPolicy.enabled
-			? (doc?.items || []).filter(
+			? effectiveItems.filter(
 					(item: any) =>
 						!item?.is_return &&
 						!item?.posa_is_replace &&
@@ -656,7 +733,7 @@ export function usePaymentSubmission(options: PaymentSubmissionOptions) {
 			missingCostItems.length &&
 			saleFloorPolicy.missingCostAction === "Block"
 		) {
-			const first = missingCostItems[0];
+			const first = missingCostItems[0]!;
 			throw new Error(
 				__(
 					"Cannot submit invoice because no valid buying floor is available for {0}.",

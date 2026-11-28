@@ -444,8 +444,17 @@ export function getItemCostFloor(
 	let hasUnresolvedCrossCurrencyCost = false;
 	let selectedTableCurrency = "";
 
+	const invoiceCurrency = String(
+		item.currency || item.price_list_currency || "",
+	).trim();
+	const buyingPriceCurrency = String(item.buying_price_currency || "").trim();
+	const buyingRateCurrency = String(item.buying_rate_currency || "").trim();
+	const companyCurrency = String(item.company_currency || "").trim();
+	const rawBuyingExchangeRate = toFiniteNumber(item.buying_exchange_rate);
+
 	const pricesByUom = item._buying_prices_by_uom;
 	let selectedTableRate: number | null = null;
+	let selectedTableInvoiceRate: number | null = null;
 	if (pricesByUom && typeof pricesByUom === "object") {
 		const prices = pricesByUom as Record<
 			string,
@@ -453,49 +462,49 @@ export function getItemCostFloor(
 		>;
 		const selectedUom = String(item.uom || item.stock_uom || "");
 		const stockUom = String(item.stock_uom || "");
-		const exact = prices[selectedUom];
+		const exact = selectedUom ? prices[selectedUom] : undefined;
+		const priceKeys = Object.keys(prices);
 		const fallback =
-			prices[stockUom] ||
+			(stockUom ? prices[stockUom] : undefined) ||
 			prices[""] ||
-			(!selectedUom && !stockUom ? Object.values(prices)[0] : undefined);
+			(!selectedUom && !stockUom && priceKeys.length === 1
+				? prices[priceKeys[0]!]
+				: undefined);
 		const selected = exact || fallback;
 		selectedTableCurrency = String(selected?.currency || "").trim();
-		const baseRate = toFiniteNumber(selected?.base_price_list_rate);
+		const baseRate =
+			toFiniteNumber(selected?.base_price_list_rate) ??
+			toFiniteNumber(selected?.base_rate);
 		const rawTableRate = toFiniteNumber(selected?.price_list_rate);
+		const conversionFactor = exact ? 1 : uomConversionFactor;
 		if (baseRate !== null && baseRate > 0) {
-			const conversionFactor = exact ? 1 : uomConversionFactor;
 			selectedTableRate = baseRate * conversionFactor;
 			hasNormalizedBuyingPrice = true;
 		} else if (rawTableRate !== null && rawTableRate > 0) {
-			const itemInvoiceCurrency = String(
-				item.currency || item.price_list_currency || "",
-			).trim();
-			const itemCompanyCurrency = String(item.company_currency || "").trim();
 			const sameAsCompany = Boolean(
 				selectedTableCurrency &&
-					itemCompanyCurrency &&
-					selectedTableCurrency === itemCompanyCurrency,
+					companyCurrency &&
+					selectedTableCurrency === companyCurrency,
 			);
 			const sameAsInvoice = Boolean(
 				selectedTableCurrency &&
-					itemInvoiceCurrency &&
-					selectedTableCurrency === itemInvoiceCurrency,
+					invoiceCurrency &&
+					selectedTableCurrency === invoiceCurrency,
 			);
 			if (sameAsCompany) {
-				const conversionFactor = exact ? 1 : uomConversionFactor;
 				selectedTableRate = rawTableRate * conversionFactor;
 				hasNormalizedBuyingPrice = true;
+			} else if (sameAsInvoice) {
+				selectedTableInvoiceRate = rawTableRate * conversionFactor;
+				hasNormalizedBuyingPrice = true;
 			} else if (
-				sameAsInvoice &&
-				(!itemCompanyCurrency || itemCompanyCurrency === itemInvoiceCurrency)
+				buyingPriceCurrency &&
+				selectedTableCurrency === buyingPriceCurrency &&
+				rawBuyingExchangeRate !== null &&
+				rawBuyingExchangeRate > 0
 			) {
-				const conversionFactor = exact ? 1 : uomConversionFactor;
-				resolvedCandidates.push({
-					field: "_buying_prices_by_uom",
-					label: "Trade Price",
-					rate: rawTableRate * conversionFactor,
-					baseCurrency: false,
-				});
+				selectedTableRate =
+					rawTableRate * conversionFactor * rawBuyingExchangeRate;
 				hasNormalizedBuyingPrice = true;
 			} else if (selectedTableCurrency) {
 				hasUnresolvedCrossCurrencyCost = true;
@@ -518,6 +527,13 @@ export function getItemCostFloor(
 		} else {
 			hasUnresolvedCrossCurrencyCost = true;
 		}
+	} else if (selectedTableInvoiceRate !== null) {
+		resolvedCandidates.push({
+			field: "_buying_prices_by_uom",
+			label: "Trade Price",
+			rate: selectedTableInvoiceRate,
+			baseCurrency: false,
+		});
 	}
 
 	if (!hasNormalizedBuyingPrice) {
@@ -546,14 +562,6 @@ export function getItemCostFloor(
 			hasNormalizedBuyingPrice = true;
 		}
 	}
-
-	const invoiceCurrency = String(
-		item.currency || item.price_list_currency || "",
-	).trim();
-	const buyingPriceCurrency = String(item.buying_price_currency || "").trim();
-	const buyingRateCurrency = String(item.buying_rate_currency || "").trim();
-	const companyCurrency = String(item.company_currency || "").trim();
-	const rawBuyingExchangeRate = toFiniteNumber(item.buying_exchange_rate);
 
 	for (const candidate of COST_CANDIDATES) {
 		const rawRate = toFiniteNumber(item[candidate.field]);
@@ -730,15 +738,18 @@ function resolveNativeUnitNetRate(
 			? Math.abs(rawNetAmount) / qty
 			: null;
 	const rawNetRate = toFiniteNumber(item.net_rate);
+	const halfUlp = 0.5 * 10 ** -precision;
 	const hasValidNetRate =
 		rawNetRate !== null &&
 		rawNetRate >= 0 &&
-		(rawNetRate > 0 || grossSellingRate <= 0);
+		(rawNetRate > 0 ||
+			grossSellingRate <= 0 ||
+			(netFromAmount !== null &&
+				Math.abs(Math.abs(rawNetRate) - netFromAmount) <= halfUlp + 1e-9));
 	if (hasValidNetRate) {
 		const normalizedNetRate = Math.abs(rawNetRate!);
-		const halfUlp = 0.5 * 10 ** -precision;
 		// ERPNext taxes_and_totals.py:1118-1121 rounds net_rate = flt(net_amount / qty, prec).
-		// Honor native rounded net_rate when it is consistent with net_amount / qty within 0.5 ULP.
+		// Honor native rounded net_rate (including 0.00) when consistent with net_amount / qty within 0.5 ULP.
 		if (
 			netFromAmount === null ||
 			Math.abs(normalizedNetRate - netFromAmount) <= halfUlp + 1e-9

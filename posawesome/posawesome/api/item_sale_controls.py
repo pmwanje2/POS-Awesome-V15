@@ -1163,30 +1163,35 @@ def _server_applied_free_row_indexes(
             recurse_for = flt(rule.get("recurse_for"))
             if recurse_for <= 0:
                 continue
-            # ERPNext pricing_rule/utils.py:312-332, 423-441 evaluates min_qty/max_qty
-            # per paid line when mixed_conditions=0 and is_cumulative=0 (or aggregated
-            # when mixed_conditions/is_cumulative is enabled), using child-table uom
-            # conversion against stock_qty, then awards from qualifying row.qty (845-866).
+            # ERPNext pricing_rule/utils.py:312-332, 423-441 + get_item_details.py:1784-1789:
+            # - Only `mixed_conditions=1` aggregates current-invoice paid lines; when
+            #   `mixed_conditions=0` (including `is_cumulative=1`), each paid line is
+            #   checked independently against `min_qty`/`max_qty`.
+            # - Only `apply_on == "Item Code"` child rows carry `item_code`, so Brand and
+            #   Item Group rules convert with factor 1.0 in ERPNext.
             min_qty = flt(rule.get("min_qty"))
             max_qty = flt(rule.get("max_qty"))
             is_mixed = bool(cint(rule.get("mixed_conditions")))
             is_cumulative = bool(cint(rule.get("is_cumulative")))
+            apply_on = cstr(rule.get("apply_on")).strip()
 
             def _row_threshold_qty(entry):
                 q_code, q_uom, q_stock_uom, _q_qty, q_stock_qty, q_row = entry
+                if apply_on != "Item Code":
+                    return q_stock_qty
                 child_uom = _matched_rule_uom(rule, q_code, q_uom, q_row)
                 if not child_uom or child_uom == q_stock_uom:
                     return q_stock_qty
                 child_cf = _authoritative_uom_factor(q_code, child_uom, q_stock_uom)
                 return (q_stock_qty / child_cf) if child_cf > 0 else None
 
-            if is_mixed or is_cumulative:
+            if is_mixed:
                 threshold_values = [_row_threshold_qty(entry) for entry in qualifying_rows]
                 valid_thresholds = [val for val in threshold_values if val is not None]
                 if not valid_thresholds:
                     continue
                 total_threshold_qty = sum(valid_thresholds)
-                if min_qty > 0 and not is_cumulative and total_threshold_qty < min_qty - 1e-9:
+                if min_qty > 0 and total_threshold_qty < min_qty - 1e-9:
                     continue
                 if max_qty > 0 and total_threshold_qty > max_qty + 1e-9:
                     continue
@@ -1197,7 +1202,7 @@ def _server_applied_free_row_indexes(
                     row_threshold = _row_threshold_qty(entry)
                     if row_threshold is None:
                         continue
-                    if min_qty > 0 and row_threshold < min_qty - 1e-9:
+                    if min_qty > 0 and not is_cumulative and row_threshold < min_qty - 1e-9:
                         continue
                     if max_qty > 0 and row_threshold > max_qty + 1e-9:
                         continue
