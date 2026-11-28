@@ -2,7 +2,16 @@ import { computed, nextTick, ref, watch } from "vue";
 import { describe, expect, it, vi } from "vitest";
 
 import payViewSource from "../src/posapp/components/pos/shell/PayView.vue?raw";
-import { usePosPaySelection } from "../src/posapp/composables/pos/payments/usePosPaySelection";
+import {
+	resolveInvoiceCurrency,
+	usePosPaySelection,
+} from "../src/posapp/composables/pos/payments/usePosPaySelection";
+import { usePosPaySubmission } from "../src/posapp/composables/pos/payments/usePosPaySubmission";
+
+vi.mock("../src/offline/index", () => ({
+	isOffline: vi.fn(() => false),
+	saveOfflinePayment: vi.fn(),
+}));
 
 function extractBlock(source: string, marker: RegExp, label: string): string {
 	const match = marker.exec(source);
@@ -1243,5 +1252,396 @@ describe("PayView.vue company currency & selling FX resolution", () => {
 		expect(method._rate_error).toBe(false);
 		expect(unallocatedRow.invoice_equivalent).toBe(20);
 		expect(unallocatedRow._rate_error).toBe(false);
+	});
+
+	it("clears incompatible selected invoices when currency_filter changes from ALL to another currency and wires currencyFilter into submission", async () => {
+		const invoiceTotalCurrencyBody = extractBlock(
+			payViewSource,
+			/\bconst invoiceTotalCurrency\s*=\s*computed\(\(\)\s*=>\s*\{/,
+			"invoiceTotalCurrency",
+		);
+		const currencyFilterWatchMarker =
+			/\bwatch\(\s*currency_filter\s*,\s*\(nextFilter\)\s*=>\s*\{/;
+
+		(globalThis as any).flt = (v: unknown) => Number(v || 0);
+		const pos_profile = ref<any>({
+			name: "POS-USD",
+			company: "Uganda Co",
+			currency: "USD",
+			company_currency: "UGX",
+		});
+		const currency_filter = ref("ALL");
+		const selection = usePosPaySelection({
+			posProfile: pos_profile,
+			currency_filter,
+		});
+		const usdInvoice = {
+			voucher_no: "SINV-USD-10",
+			currency: "USD",
+			party_account_currency: "USD",
+			outstanding_amount: 10,
+			outstanding_amount_in_invoice_currency: 10,
+			outstanding_conversion_unavailable: false,
+		};
+
+		const invoiceTotalCurrency = new Function(
+			"computed",
+			"currency_filter",
+			"selected_invoices",
+			"pos_profile",
+			`return computed(() => { ${invoiceTotalCurrencyBody} });`,
+		)(computed, currency_filter, selection.selected_invoices, pos_profile);
+
+		let stopFilterWatch: (() => void) | null = null;
+		if (currencyFilterWatchMarker.test(payViewSource)) {
+			const watchBody = extractBlock(
+				payViewSource,
+				currencyFilterWatchMarker,
+				"currency_filter watch",
+			);
+			const onFilterChange = new Function(
+				"selected_invoices",
+				"pos_profile",
+				"resolveInvoiceCurrency",
+				`return (nextFilter) => { ${watchBody} };`,
+			)(selection.selected_invoices, pos_profile, resolveInvoiceCurrency);
+			stopFilterWatch = watch(currency_filter, onFilterChange, { flush: "sync" });
+		}
+
+		try {
+			// Select USD 10 invoice under ALL, then switch filter to UGX.
+			selection.selected_invoices.value = [usdInvoice];
+			expect(selection.total_selected_invoices.value).toBe(10);
+			expect(invoiceTotalCurrency.value).toBe("USD");
+
+			currency_filter.value = "UGX";
+			await nextTick();
+
+			expect(selection.selected_invoices.value).toEqual([]);
+			expect(selection.total_selected_invoices.value).toBe(0);
+			expect(invoiceTotalCurrency.value).toBe("UGX");
+
+			// Switching filter to the matching currency (USD) or back to ALL preserves the USD selection.
+			currency_filter.value = "ALL";
+			selection.selected_invoices.value = [usdInvoice];
+			currency_filter.value = "USD";
+			await nextTick();
+			expect(selection.selected_invoices.value.map((r: any) => r.voucher_no)).toEqual([
+				"SINV-USD-10",
+			]);
+			expect(selection.total_selected_invoices.value).toBe(10);
+			expect(invoiceTotalCurrency.value).toBe("USD");
+		} finally {
+			stopFilterWatch?.();
+		}
+
+		const submissionWireMatch = /usePosPaySubmission\(\{([\s\S]*?)\}\);/.exec(payViewSource);
+		expect(submissionWireMatch).not.toBeNull();
+		expect(submissionWireMatch?.[1]).toMatch(/\bcurrencyFilter\s*:\s*currency_filter\b/);
+	});
+
+	it("tracks pending _rate_loading across postingDate change, preserves loading across superseded completions, and blocks submit until new quotes settle", async () => {
+		const fetchExchangeBody = extractBlock(
+			payViewSource,
+			/\bconst fetchExchangeRate\s*=\s*async\s*\(\)\s*=>\s*\{/,
+			"fetchExchangeRate",
+		);
+		const resolvePaymentMethodBody = extractBlock(
+			payViewSource,
+			/\bconst resolvePaymentMethodRate\s*=\s*async\s*\(method\)\s*=>\s*\{/,
+			"resolvePaymentMethodRate",
+		);
+		const normalizeSelectedBody = extractBlock(
+			payViewSource,
+			/\bconst normalizeSelectedPayment\s*=\s*async\s*\(row,\s*amountField\)\s*=>\s*\{/,
+			"normalizeSelectedPayment",
+		);
+		const purposeExpr = extractExpression(
+			payViewSource,
+			/\bconst exchangeRatePurpose\s*=\s*computed\(\s*/,
+			"exchangeRatePurpose",
+		);
+
+		(globalThis as any).__ = (s: string) => s;
+		(globalThis as any).flt = (v: unknown) => Number(v || 0);
+		let submittedPayload: any = null;
+		(globalThis as any).frappe = {
+			throw: (message: string) => {
+				throw new Error(message);
+			},
+			call: vi.fn(({ args, callback }: any) => {
+				submittedPayload = args.payload;
+				callback({ message: { new_payments_entry: [{ name: "ACC-PAY-NOV30" }] } });
+			}),
+			msgprint: vi.fn(),
+			utils: { play_sound: vi.fn() },
+		};
+
+		const paymentEntryType = ref("Receive");
+		const partyType = ref("Customer");
+		const exchangeRatePurpose = new Function(
+			"computed",
+			"paymentEntryType",
+			"partyType",
+			`return computed(${purposeExpr});`,
+		)(computed, paymentEntryType, partyType);
+
+		const pos_profile = ref<any>({
+			name: "POS-PENDING-FX",
+			company: "Uganda Co",
+			currency: "USD",
+			company_currency: "UGX",
+		});
+		const company = ref("Uganda Co");
+		const companyCurrencyLocal = computed(() => "UGX");
+		const invoiceTotalCurrency = computed(() => "USD");
+		const requiresExchangeRate = computed(() => true);
+		const exchangeRate = ref<number | null>(null);
+		const exchangeRateLoading = ref(false);
+		const exchangeRateError = ref<string | null>(null);
+		const exchangeRateRequestKey = ref("");
+		const postingDate = ref("2026-11-28");
+		const available_bank_accounts = ref<Record<string, any[]>>({});
+
+		const pendingByDate: Record<string, Array<() => void>> = {
+			"2026-11-29": [],
+			"2026-11-30": [],
+		};
+		const resolveExchangeRate = vi.fn(({ fromCurrency, toCurrency, effectiveDate }) => {
+			if (effectiveDate === "2026-11-28") {
+				return Promise.resolve({
+					found: true,
+					fromCurrency,
+					toCurrency,
+					rate: fromCurrency === "USD" && toCurrency === "UGX" ? 3700 : 3,
+					effectiveDate,
+					rateDate: "2026-11-28",
+					source: "currency_exchange",
+				});
+			}
+			const rateForDate =
+				effectiveDate === "2026-11-29"
+					? fromCurrency === "USD" && toCurrency === "UGX"
+						? 3800
+						: 3.5
+					: fromCurrency === "USD" && toCurrency === "UGX"
+						? 3850
+						: 4;
+			return new Promise((resolve) => {
+				pendingByDate[effectiveDate].push(() =>
+					resolve({
+						found: true,
+						fromCurrency,
+						toCurrency,
+						rate: rateForDate,
+						effectiveDate,
+						rateDate: effectiveDate,
+						source: "currency_exchange",
+					}),
+				);
+			});
+		});
+
+		const fetchExchangeRate = new Function(
+			"exchangeRateLoading",
+			"requiresExchangeRate",
+			"exchangeRate",
+			"invoiceTotalCurrency",
+			"companyCurrencyLocal",
+			"exchangeRateError",
+			"resolveExchangeRate",
+			"pos_profile",
+			"company",
+			"postingDate",
+			"getTodayDate",
+			"__",
+			"exchangeRatePurpose",
+			"exchangeRateRequestKey",
+			`return async () => { ${fetchExchangeBody} };`,
+		)(
+			exchangeRateLoading,
+			requiresExchangeRate,
+			exchangeRate,
+			invoiceTotalCurrency,
+			companyCurrencyLocal,
+			exchangeRateError,
+			resolveExchangeRate,
+			pos_profile,
+			company,
+			postingDate,
+			() => "2026-11-28",
+			(s: string) => s,
+			exchangeRatePurpose,
+			exchangeRateRequestKey,
+		);
+
+		const resolvePaymentMethodRate = new Function(
+			"available_bank_accounts",
+			"getPaymentMethodCurrency",
+			"invoiceTotalCurrency",
+			"companyCurrencyLocal",
+			"pos_profile",
+			"company",
+			"postingDate",
+			"getTodayDate",
+			"resolveExchangeRate",
+			"flt",
+			"exchangeRatePurpose",
+			`return async (method) => { ${resolvePaymentMethodBody} };`,
+		)(
+			available_bank_accounts,
+			() => "EUR",
+			invoiceTotalCurrency,
+			companyCurrencyLocal,
+			pos_profile,
+			company,
+			postingDate,
+			() => "2026-11-28",
+			resolveExchangeRate,
+			(v: unknown) => Number(v || 0),
+			exchangeRatePurpose,
+		);
+
+		const normalizeSelectedPayment = new Function(
+			"pos_profile",
+			"invoiceTotalCurrency",
+			"resolveExchangeRate",
+			"company",
+			"postingDate",
+			"getTodayDate",
+			"flt",
+			"exchangeRatePurpose",
+			`return async (row, amountField) => { ${normalizeSelectedBody} };`,
+		)(
+			pos_profile,
+			invoiceTotalCurrency,
+			resolveExchangeRate,
+			company,
+			postingDate,
+			() => "2026-11-28",
+			(v: unknown) => Number(v || 0),
+			exchangeRatePurpose,
+		);
+
+		const method: any = { mode_of_payment: "Cash EUR", amount: 10, payment_currency: "EUR" };
+		const unallocatedRow: any = {
+			name: "PE-EUR-1",
+			currency: "EUR",
+			unallocated_amount: 10,
+		};
+		const payment_methods = ref<any[]>([method]);
+		const selected_payments = ref<any[]>([unallocatedRow]);
+		const total_payment_methods = computed(() => Number(method.invoice_equivalent || 0));
+		const total_selected_payments = computed(() =>
+			Number(unallocatedRow.invoice_equivalent || 0),
+		);
+		const eventBus = { emit: vi.fn() };
+
+		const { processPayment } = usePosPaySubmission({
+			customerName: ref("CUST-1"),
+			company,
+			companyCurrency: companyCurrencyLocal,
+			posProfile: pos_profile,
+			posOpeningShift: ref({ name: "POS-OPEN-1" }),
+			postingDate,
+			currencyFilter: ref("ALL"),
+			exchangeRate,
+			requiresExchangeRate,
+			exchangeRateLoading,
+			exchangeRateError,
+			exchangeRateRequestKey,
+			invoiceTotalCurrency,
+			referenceNo: ref(""),
+			referenceDate: ref(""),
+			autoAllocatePaymentAmount: ref(false),
+			payment_methods,
+			selected_invoices: ref([]),
+			selected_payments,
+			selected_mpesa_payments: ref([]),
+			total_selected_payments,
+			total_selected_mpesa_payments: ref(0),
+			total_payment_methods,
+			clearSelections: vi.fn(),
+			resetPaymentMethodAmounts: vi.fn(),
+			load_print_page: vi.fn(),
+			eventBus,
+			get_outstanding_invoices: vi.fn(),
+			get_unallocated_payments: vi.fn(),
+			get_draft_mpesa_payments_register: vi.fn(),
+			set_mpesa_search_params: vi.fn(),
+			autoReconcile: vi.fn(),
+		} as any);
+
+		// 1) Settle Nov 28 quotes (rate 3 / equivalent 30 / main 3700).
+		await Promise.all([
+			fetchExchangeRate(),
+			resolvePaymentMethodRate(method),
+			normalizeSelectedPayment(unallocatedRow, "unallocated_amount"),
+		]);
+		expect(exchangeRate.value).toBe(3700);
+		expect(exchangeRateLoading.value).toBe(false);
+		expect(method._rate_loading).toBe(false);
+		expect(unallocatedRow._rate_loading).toBe(false);
+		expect(method.invoice_exchange_rate).toBe(3);
+		expect(method.invoice_equivalent).toBe(30);
+		expect(method.rate_date).toBe("2026-11-28");
+		expect(unallocatedRow.invoice_equivalent).toBe(30);
+
+		// 2) Switch postingDate to Nov 29 and hold lookups pending -> submit must be blocked with 0 RPC calls.
+		postingDate.value = "2026-11-29";
+		const nov29Main = fetchExchangeRate();
+		const nov29Method = resolvePaymentMethodRate(method);
+		const nov29Selected = normalizeSelectedPayment(unallocatedRow, "unallocated_amount");
+
+		expect(exchangeRateLoading.value).toBe(true);
+		expect(method._rate_loading).toBe(true);
+		expect(unallocatedRow._rate_loading).toBe(true);
+		await expect(processPayment()).rejects.toThrow(/exchange rate|in progress|refresh/i);
+		expect((globalThis as any).frappe.call).not.toHaveBeenCalled();
+
+		// 3) Advance to Nov 30 while Nov 29 is still pending; settling superseded Nov 29 must NOT clear Nov 30's loading state.
+		postingDate.value = "2026-11-30";
+		const nov30Main = fetchExchangeRate();
+		const nov30Method = resolvePaymentMethodRate(method);
+		const nov30Selected = normalizeSelectedPayment(unallocatedRow, "unallocated_amount");
+
+		pendingByDate["2026-11-29"].forEach((release) => release());
+		await Promise.all([nov29Main, nov29Method, nov29Selected]);
+
+		expect(exchangeRateLoading.value).toBe(true);
+		expect(method._rate_loading).toBe(true);
+		expect(unallocatedRow._rate_loading).toBe(true);
+		await expect(processPayment()).rejects.toThrow(/exchange rate|in progress|refresh/i);
+		expect((globalThis as any).frappe.call).not.toHaveBeenCalled();
+
+		// 4) Once active Nov 30 lookups settle, loading clears and submit succeeds with Nov 30 rate/date/equivalents.
+		pendingByDate["2026-11-30"].forEach((release) => release());
+		await Promise.all([nov30Main, nov30Method, nov30Selected]);
+
+		expect(exchangeRateLoading.value).toBe(false);
+		expect(method._rate_loading).toBe(false);
+		expect(unallocatedRow._rate_loading).toBe(false);
+		expect(method.invoice_exchange_rate).toBe(4);
+		expect(method.invoice_equivalent).toBe(40);
+		expect(method.rate_date).toBe("2026-11-30");
+		expect(unallocatedRow.invoice_equivalent).toBe(40);
+
+		await processPayment();
+		expect((globalThis as any).frappe.call).toHaveBeenCalledTimes(1);
+		expect(submittedPayload.posting_date).toBe("2026-11-30");
+		expect(submittedPayload.exchange_rate).toBe(3850);
+		expect(submittedPayload.payment_methods[0]).toMatchObject({
+			invoice_exchange_rate: 4,
+			invoice_equivalent: 40,
+			rate_date: "2026-11-30",
+		});
+		expect(submittedPayload.selected_payments[0].invoice_equivalent).toBe(40);
+
+		const submissionWireMatch = /usePosPaySubmission\(\{([\s\S]*?)\}\);/.exec(payViewSource);
+		expect(submissionWireMatch).not.toBeNull();
+		expect(submissionWireMatch?.[1]).toMatch(/\bexchangeRateLoading\b/);
+		expect(submissionWireMatch?.[1]).toMatch(/\bexchangeRateError\b/);
+		expect(submissionWireMatch?.[1]).toMatch(/\brequiresExchangeRate\b/);
+		expect(submissionWireMatch?.[1]).toMatch(/\bcompanyCurrency\s*:\s*companyCurrencyLocal\b/);
 	});
 });
