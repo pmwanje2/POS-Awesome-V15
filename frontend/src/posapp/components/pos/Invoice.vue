@@ -1022,6 +1022,7 @@ export default {
 		sync_exchange_rate() {
 			const companyCurrency =
 				(this.company && this.company.default_currency) ||
+				this.pos_profile?.company_currency ||
 				this.pos_profile?.currency ||
 				"";
 			const selectedCurrency =

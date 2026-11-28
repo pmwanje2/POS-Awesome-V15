@@ -57,7 +57,14 @@ def _allowed_payment_currencies(profile_doc, invoice_currency, company_currency)
     return configured or {invoice_currency, company_currency}
 
 
-def _resolve_rate(from_currency, to_currency, posting_date, cache, manual_rate=None):
+def _resolve_rate(
+    from_currency,
+    to_currency,
+    posting_date,
+    cache,
+    manual_rate=None,
+    purpose="for_selling",
+):
     if from_currency == to_currency:
         return 1.0, getdate(posting_date), "same_currency"
     if manual_rate and flt(manual_rate) > 0:
@@ -67,6 +74,7 @@ def _resolve_rate(from_currency, to_currency, posting_date, cache, manual_rate=N
         to_currency,
         cache=cache,
         transaction_date=posting_date,
+        purpose=purpose,
         silent=True,
     )
     if not rate or flt(rate) <= 0:

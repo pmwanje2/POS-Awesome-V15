@@ -60,6 +60,8 @@ export type ResourceSyncResult = {
 	status: SyncLifecycleState;
 	watermark: string | null;
 	schemaVersion: string | null;
+	scopeSignature?: string | null;
+	syncedCurrencyPairs?: string[] | null;
 	response: SyncResponse;
 };
 
@@ -133,12 +135,22 @@ export function buildResourceSyncResult(
 	status: SyncLifecycleState,
 	response: SyncResponse,
 	watermark?: string | null,
+	extra?: {
+		scopeSignature?: string | null;
+		syncedCurrencyPairs?: string[] | null;
+	},
 ): ResourceSyncResult {
 	return {
 		resourceId,
 		status,
 		watermark: resolveWatermark(response, watermark),
 		schemaVersion: response?.schema_version || null,
+		...(extra?.scopeSignature !== undefined
+			? { scopeSignature: extra.scopeSignature }
+			: {}),
+		...(extra?.syncedCurrencyPairs !== undefined
+			? { syncedCurrencyPairs: extra.syncedCurrencyPairs }
+			: {}),
 		response,
 	};
 }

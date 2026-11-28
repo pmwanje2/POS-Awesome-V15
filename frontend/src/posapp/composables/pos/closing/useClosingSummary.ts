@@ -26,7 +26,13 @@ export function useClosingSummary(
 		const ov = unref(overview);
 		const prof = unref(posProfile);
 		const data = unref(dialogData);
-		return ov?.company_currency || prof?.currency || data?.currency || "";
+		return (
+			ov?.company_currency ||
+			(prof as any)?.company_currency ||
+			prof?.currency ||
+			data?.currency ||
+			""
+		);
 	});
 
 	const companyCurrencySymbol = computed(() => {

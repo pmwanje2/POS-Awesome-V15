@@ -473,6 +473,8 @@ export function get_invoice_doc(context: any) {
 	// Calculate base amounts using the exchange rate
 	const companyCurrency =
 		(context.company && context.company.default_currency) ||
+		context.pos_profile?.company_currency ||
+		context.invoice_doc?.company_currency ||
 		context.pos_profile?.currency ||
 		null;
 	if (context.selected_currency !== companyCurrency) {
@@ -600,7 +602,11 @@ export function get_invoice_items(context: any) {
 		}
 
 		// Handle currency conversion for rates and amounts
-		const companyCurrency = context.pos_profile.currency;
+		const companyCurrency =
+			(context.company && context.company.default_currency) ||
+			context.pos_profile?.company_currency ||
+			item?.company_currency ||
+			context.pos_profile?.currency;
 		if (context.selected_currency !== companyCurrency) {
 			// item.rate is in SC and base_rate should be in CC.
 			new_item.rate = flt(item.rate); // Keep rate in USD

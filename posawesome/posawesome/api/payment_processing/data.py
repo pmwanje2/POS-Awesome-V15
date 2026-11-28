@@ -220,7 +220,12 @@ def get_outstanding_invoices(
             else:
                 # Third currency: convert from party account currency to invoice currency
                 precision = frappe.get_precision("Sales Invoice", "outstanding_amount") or 2
-                party_to_inv = get_exchange_rate(party_account_currency, row_currency, invoice.get("posting_date"))
+                party_to_inv = get_exchange_rate(
+                    party_account_currency,
+                    row_currency,
+                    invoice.get("posting_date"),
+                    "for_buying" if party_type == "Supplier" else "for_selling",
+                )
                 if party_to_inv:
                     outstanding_in_invoice_currency = flt(outstanding_amount / party_to_inv, precision)
                 else:

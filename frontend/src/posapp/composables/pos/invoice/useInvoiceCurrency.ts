@@ -59,14 +59,9 @@ export function useInvoiceCurrency() {
 	const selected_currency = ref("");
 	const exchange_rate = ref(1);
 	const conversion_rate = ref(1);
+	let internalConversionRateUpdate = false;
 	let hasExplicitConversionRate = false;
-	watch(
-		conversion_rate,
-		() => {
-			hasExplicitConversionRate = true;
-		},
-		{ flush: "sync" },
-	);
+	let explicitConversionCompanyCurrency = "";
 	const exchange_rate_date = ref(frappe.datetime.nowdate());
 	const price_lists = ref<string[]>([]);
 	const selected_price_list = ref("");
@@ -80,7 +75,7 @@ export function useInvoiceCurrency() {
 	const pos_profile = computed(() => uiStore.posProfile);
 	const company = computed(() => uiStore.companyDoc);
 
-	const resolveEffectiveCompanyCurrency = (item?: any): string => {
+	const resolveAuthoritativeCompanyCurrency = (item?: any): string => {
 		const fromCompanyDoc = String(
 			company.value?.default_currency || "",
 		).trim();
@@ -95,8 +90,23 @@ export function useInvoiceCurrency() {
 			.map((row: any) => String(row?.company_currency || "").trim())
 			.find(Boolean);
 		if (fromCart) return fromCart;
-		return String(pos_profile.value?.currency || "").trim();
+		return "";
 	};
+
+	const resolveEffectiveCompanyCurrency = (item?: any): string =>
+		resolveAuthoritativeCompanyCurrency(item) ||
+		String(pos_profile.value?.currency || "").trim();
+
+	watch(
+		conversion_rate,
+		() => {
+			if (internalConversionRateUpdate) return;
+			hasExplicitConversionRate = true;
+			explicitConversionCompanyCurrency =
+				resolveAuthoritativeCompanyCurrency();
+		},
+		{ flush: "sync" },
+	);
 
 	// Watch for pos_profile changes to update precision
 	watch(
@@ -255,7 +265,11 @@ export function useInvoiceCurrency() {
 			(typeof frappe !== "undefined" && frappe.datetime?.get_today?.()) ||
 			exchange_rate_date.value ||
 			new Date().toISOString().slice(0, 10);
-		const companyCurrency = resolveEffectiveCompanyCurrency();
+		const authoritativeCompanyCurrency =
+			resolveAuthoritativeCompanyCurrency();
+		const companyCurrency =
+			authoritativeCompanyCurrency ||
+			String(pos_profile.value.currency || "").trim();
 		const plCurrency =
 			price_list_currency.value ||
 			pos_profile.value.currency ||
@@ -278,8 +292,21 @@ export function useInvoiceCurrency() {
 			toCurrency: selected_currency.value,
 		});
 
-		hasExplicitConversionRate = true;
-		conversion_rate.value = companyResult.rate || 0;
+		internalConversionRateUpdate = true;
+		try {
+			conversion_rate.value = companyResult.rate || 0;
+		} finally {
+			internalConversionRateUpdate = false;
+		}
+		if (authoritativeCompanyCurrency) {
+			hasExplicitConversionRate = true;
+			explicitConversionCompanyCurrency = authoritativeCompanyCurrency;
+		} else {
+			// A fallback to pos_profile.currency with no authoritative company_currency
+			// must not lock conversion_rate=1 as explicit and overwrite restored foreign rows.
+			hasExplicitConversionRate = false;
+			explicitConversionCompanyCurrency = "";
+		}
 		exchange_rate.value = displayResult.rate || 0;
 		exchange_rate_date.value =
 			companyResult.rateDate || displayResult.rateDate || rateDate;
@@ -452,22 +479,34 @@ export function useInvoiceCurrency() {
 			pos_profile.value?.currency ||
 			defaultCompanyCurrency;
 
+		let restoredForeignRate: number | null = null;
 		items.forEach((item: any) => {
 			item._skip_calc = true;
+			const authoritativeCompanyCurrency =
+				resolveAuthoritativeCompanyCurrency(item);
 			const companyCurrency =
-				resolveEffectiveCompanyCurrency(item) || defaultCompanyCurrency;
+				authoritativeCompanyCurrency || defaultCompanyCurrency;
 			const existingItemConversionRate = parsePositiveFinite(
 				item?.conversion_rate,
 			);
+			const isExplicitForCompanyCurrency =
+				hasExplicitConversionRate &&
+				(explicitConversionCompanyCurrency === companyCurrency ||
+					(!explicitConversionCompanyCurrency &&
+						rawConversionRate !== null &&
+						rawConversionRate !== 1));
 			let itemConversionRate: number;
 			if (selectedCurrency === companyCurrency) {
 				itemConversionRate = 1;
 			} else if (
-				!hasExplicitConversionRate &&
+				!isExplicitForCompanyCurrency &&
 				item?.currency === selectedCurrency &&
 				existingItemConversionRate !== null
 			) {
 				itemConversionRate = existingItemConversionRate;
+				if (restoredForeignRate === null) {
+					restoredForeignRate = existingItemConversionRate;
+				}
 			} else {
 				itemConversionRate =
 					rawConversionRate !== null ? rawConversionRate : 0;
@@ -592,6 +631,15 @@ export function useInvoiceCurrency() {
 			item.amount = flt(item.qty * item.rate, precision);
 			item.base_amount = flt(item.qty * item.base_rate, precision);
 		});
+
+		if (restoredForeignRate !== null && !hasExplicitConversionRate) {
+			internalConversionRateUpdate = true;
+			try {
+				conversion_rate.value = restoredForeignRate;
+			} finally {
+				internalConversionRateUpdate = false;
+			}
+		}
 
 		if (typeof invoiceStore.recalculateTotals === "function") {
 			invoiceStore.recalculateTotals();

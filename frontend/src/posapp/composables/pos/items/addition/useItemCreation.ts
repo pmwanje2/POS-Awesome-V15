@@ -49,7 +49,11 @@ export function useItemCreation() {
 		new_item.price_list_rate = item.price_list_rate ?? item.rate ?? 0;
 
 		// Setup base rates properly for multi-currency
-		const companyCurrency = context.pos_profile.currency;
+		const companyCurrency =
+			context.company?.default_currency ||
+			context.pos_profile?.company_currency ||
+			item?.company_currency ||
+			context.pos_profile?.currency;
 		const selectedCurrency = context.selected_currency || companyCurrency;
 		if (selectedCurrency !== companyCurrency) {
 			// Store original base currency values (Selected -> Company)

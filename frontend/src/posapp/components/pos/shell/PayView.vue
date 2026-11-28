@@ -485,7 +485,12 @@ export default {
 		});
 
 		const companyCurrencyLocal = computed(
-			() => companyCurrency.value || pos_profile.value?.currency || "",
+			() =>
+				companyCurrency.value ||
+				pos_profile.value?.company_currency ||
+				selected_invoices.value.find((inv) => inv?.company_currency)?.company_currency ||
+				pos_profile.value?.currency ||
+				"",
 		);
 		const requiresExchangeRate = computed(
 			() => invoiceTotalCurrency.value !== companyCurrencyLocal.value,
@@ -511,7 +516,7 @@ export default {
 		const invoice_currencies = computed(() => {
 			const currencies = new Set();
 			if (pos_profile.value?.currency) currencies.add(pos_profile.value.currency);
-			if (companyCurrency.value) currencies.add(companyCurrency.value);
+			if (companyCurrencyLocal.value) currencies.add(companyCurrencyLocal.value);
 
 			// Add currencies from payment methods
 			if (pos_profile.value?.payments) {
@@ -575,7 +580,7 @@ export default {
 			return [...new Set([
 				...(configured.length
 					? configured
-					: [pos_profile.value?.currency, companyCurrency.value]),
+					: [pos_profile.value?.currency, companyCurrencyLocal.value]),
 			].filter(Boolean))];
 		});
 
@@ -718,10 +723,19 @@ export default {
 						fieldname: "default_currency",
 					},
 				});
-				companyCurrency.value = r.message?.default_currency || pos_profile.value?.currency || "";
+				companyCurrency.value =
+					r.message?.default_currency ||
+					pos_profile.value?.company_currency ||
+					selected_invoices.value.find((inv) => inv?.company_currency)?.company_currency ||
+					pos_profile.value?.currency ||
+					"";
 			} catch (e) {
 				console.error("Failed to fetch company currency", e);
-				companyCurrency.value = pos_profile.value?.currency || "";
+				companyCurrency.value =
+					pos_profile.value?.company_currency ||
+					selected_invoices.value.find((inv) => inv?.company_currency)?.company_currency ||
+					pos_profile.value?.currency ||
+					"";
 			}
 		};
 
@@ -956,7 +970,11 @@ export default {
 			pos_profile.value = data.pos_profile;
 			pos_opening_shift.value = data.pos_opening_shift;
 			company.value = data.company?.name || data.pos_profile?.company || "";
-			companyCurrency.value = data.company?.default_currency || data.pos_profile?.currency || null;
+			companyCurrency.value =
+				data.company?.default_currency ||
+				data.pos_profile?.company_currency ||
+				data.pos_profile?.currency ||
+				null;
 			uiStore.setRegisterData(data);
 			proxy?.eventBus?.emit("payments_register_pos_profile", data);
 			set_payment_methods();

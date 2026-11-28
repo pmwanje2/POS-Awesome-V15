@@ -114,7 +114,7 @@ def get_item_detail(item, doc=None, warehouse=None, price_list=None, company=Non
             from erpnext.setup.utils import get_exchange_rate
 
             try:
-                exchange_rate = get_exchange_rate(price_list_currency, company_currency, today)
+                exchange_rate = get_exchange_rate(price_list_currency, company_currency, today, "for_selling")
             except Exception:
                 frappe.log_error(
                     f"Missing exchange rate from {price_list_currency} to {company_currency}",

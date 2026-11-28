@@ -133,11 +133,36 @@ export function usePaymentCurrencies(options: PaymentCurrencyOptions) {
 				? payment.posa_exchange_rate
 				: null;
 		const invoiceRate = await resolveRate(paymentCurrency, invoiceCurrency, manualRate);
-		const companyRate = await resolveRate(paymentCurrency, companyCurrency.value);
-		if (!invoiceRate.found || !invoiceRate.rate || !companyRate.found || !companyRate.rate) {
+		const resolvedCompanyCurrency = companyCurrency.value;
+		let invoiceToCompanyRate: number | null = null;
+		if (
+			invoiceCurrency &&
+			resolvedCompanyCurrency &&
+			invoiceCurrency === resolvedCompanyCurrency
+		) {
+			invoiceToCompanyRate = 1;
+		} else {
+			const docConversionRate = Number(doc.conversion_rate);
+			if (Number.isFinite(docConversionRate) && docConversionRate > 0) {
+				invoiceToCompanyRate = docConversionRate;
+			} else {
+				const invoiceToCompanyResult = await resolveRate(
+					invoiceCurrency,
+					resolvedCompanyCurrency,
+				);
+				if (invoiceToCompanyResult.found && invoiceToCompanyResult.rate) {
+					invoiceToCompanyRate = invoiceToCompanyResult.rate;
+				}
+			}
+		}
+		const derivedCompanyRate =
+			invoiceRate.found && invoiceRate.rate && invoiceToCompanyRate
+				? invoiceRate.rate * invoiceToCompanyRate
+				: null;
+		if (!invoiceRate.found || !invoiceRate.rate || !derivedCompanyRate) {
 			payment._posa_rate_error = "rate_unavailable";
 			payment.posa_exchange_rate = invoiceRate.rate || 0;
-			payment.posa_company_exchange_rate = companyRate.rate || 0;
+			payment.posa_company_exchange_rate = derivedCompanyRate || 0;
 			return false;
 		}
 
@@ -146,7 +171,7 @@ export function usePaymentCurrencies(options: PaymentCurrencyOptions) {
 			original = preciseTenderAmount(flt(payment.amount) / invoiceRate.rate);
 		}
 		const invoiceAmount = convertCurrencyAmount(original, invoiceRate.rate);
-		const baseAmount = convertCurrencyAmount(original, companyRate.rate);
+		const baseAmount = convertCurrencyAmount(original, derivedCompanyRate);
 		if (invoiceAmount === null || baseAmount === null) {
 			payment._posa_rate_error = "rate_unavailable";
 			return false;
@@ -154,7 +179,7 @@ export function usePaymentCurrencies(options: PaymentCurrencyOptions) {
 
 		payment.posa_original_amount = original;
 		payment.posa_exchange_rate = invoiceRate.rate;
-		payment.posa_company_exchange_rate = companyRate.rate;
+		payment.posa_company_exchange_rate = derivedCompanyRate;
 		payment.posa_rate_date = invoiceRate.rateDate || invoiceRate.effectiveDate;
 		payment.posa_rate_source = invoiceRate.source;
 		payment.amount = flt(invoiceAmount);

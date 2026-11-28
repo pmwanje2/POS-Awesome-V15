@@ -1387,16 +1387,13 @@ async function attachOfflineBuyingFloors(profileName: string, items: any[]) {
 		currency: string,
 		companyCurrency: string,
 	): boolean => {
-		if (!currencySyncCompletedForScope) {
+		if (!currencySyncCompletedForScope || !hasExplicitSyncedPairList) {
 			return false;
 		}
-		if (hasExplicitSyncedPairList) {
-			return (
-				syncedCurrencyPairSet.has(`${currency}::${companyCurrency}`) ||
-				syncedCurrencyPairSet.has(`${companyCurrency}::${currency}`)
-			);
-		}
-		return true;
+		return (
+			syncedCurrencyPairSet.has(`${currency}::${companyCurrency}`) ||
+			syncedCurrencyPairSet.has(`${companyCurrency}::${currency}`)
+		);
 	};
 	const currencyRates = new Map<
 		string,

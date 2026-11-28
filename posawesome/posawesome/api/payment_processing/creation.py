@@ -71,6 +71,8 @@ def create_payment_entry(
         and flt(exchange_rate) > 0
     )
 
+    rate_purpose = "for_buying" if payment_type == "Pay" else "for_selling"
+
     account_to_company_rate = (
         1
         if bank.account_currency == company_currency
@@ -79,7 +81,7 @@ def create_payment_entry(
                 bank.account_currency,
                 company_currency,
                 date,
-                "for_buying" if payment_type == "Pay" else "for_selling",
+                rate_purpose,
             )
         )
     )
@@ -96,7 +98,7 @@ def create_payment_entry(
         payment_to_company_rate = flt(exchange_rate)
     else:
         payment_to_company_rate = flt(
-            get_exchange_rate(payment_currency, company_currency, date)
+            get_exchange_rate(payment_currency, company_currency, date, rate_purpose)
         )
     if payment_to_company_rate <= 0:
         frappe.throw(
@@ -111,7 +113,7 @@ def create_payment_entry(
         invoice_to_company_rate = (
             1
             if invoice_currency == company_currency
-            else flt(get_exchange_rate(invoice_currency, company_currency, date))
+            else flt(get_exchange_rate(invoice_currency, company_currency, date, rate_purpose))
         )
         if invoice_to_company_rate <= 0:
             frappe.throw(
@@ -124,7 +126,7 @@ def create_payment_entry(
         )
     else:
         payment_to_invoice_rate = flt(
-            get_exchange_rate(payment_currency, invoice_currency, date)
+            get_exchange_rate(payment_currency, invoice_currency, date, rate_purpose)
         )
         if payment_to_invoice_rate <= 0:
             frappe.throw(
@@ -141,7 +143,7 @@ def create_payment_entry(
         )
     else:
         payment_to_account_rate = flt(
-            get_exchange_rate(payment_currency, bank.account_currency, date)
+            get_exchange_rate(payment_currency, bank.account_currency, date, rate_purpose)
         )
     if payment_to_account_rate <= 0:
         frappe.throw(
@@ -190,7 +192,7 @@ def create_payment_entry(
 
     if party_account_currency != bank.account_currency:
         bank_to_base = account_to_company_rate
-        party_to_base = flt(get_exchange_rate(party_account_currency, company_currency, date))
+        party_to_base = flt(get_exchange_rate(party_account_currency, company_currency, date, rate_purpose))
 
         if payment_type == "Receive":
             pe.received_amount = bank_amount

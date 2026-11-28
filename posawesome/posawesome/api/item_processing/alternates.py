@@ -450,7 +450,7 @@ def _cost_map(
             return value
         if source not in conversion_rates:
             try:
-                exchange_rate = flt(get_exchange_rate(source, target, nowdate()))
+                exchange_rate = flt(get_exchange_rate(source, target, nowdate(), "for_buying"))
                 conversion_rates[source] = exchange_rate if exchange_rate > 0 else None
             except Exception:
                 conversion_rates[source] = None
