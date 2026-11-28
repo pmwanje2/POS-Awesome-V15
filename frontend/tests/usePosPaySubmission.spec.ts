@@ -483,4 +483,157 @@ describe("usePosPaySubmission", () => {
 		const callConfig = (globalThis as any).frappe.call.mock.calls[0][0];
 		expect(callConfig.args.payload.client_request_id).toEqual(expect.any(String));
 	});
+
+	it("blocks submission without calling RPC when selected invoices mix distinct currencies", async () => {
+		(globalThis as any).frappe.call.mockImplementation(({ callback }: any) => {
+			callback({ message: { new_payments_entry: [{ name: "ACC-PAY-MIXED" }] } });
+		});
+		const eventBus = { emit: vi.fn() };
+		const { processPayment } = usePosPaySubmission({
+			customerName: ref("Customer 727"),
+			company: ref("Uganda Co"),
+			posProfile: ref({ name: "POS-USD", currency: "USD" }),
+			posOpeningShift: ref({ name: "POS-OPEN-0001" }),
+			exchangeRate: ref(3700),
+			invoiceTotalCurrency: ref("USD"),
+			referenceNo: ref(""),
+			referenceDate: ref(""),
+			autoAllocatePaymentAmount: ref(false),
+			payment_methods: ref([{ mode_of_payment: "Cash", amount: 10 }]),
+			selected_invoices: ref([
+				{
+					voucher_no: "SINV-USD-10",
+					currency: "USD",
+					party_account_currency: "USD",
+					outstanding_amount: 10,
+					outstanding_amount_in_invoice_currency: 10,
+				},
+				{
+					voucher_no: "SINV-UGX-37000",
+					currency: "UGX",
+					party_account_currency: "UGX",
+					outstanding_amount: 37000,
+					outstanding_amount_in_invoice_currency: 37000,
+				},
+			]),
+			selected_payments: ref([]),
+			selected_mpesa_payments: ref([]),
+			total_selected_payments: ref(0),
+			total_selected_mpesa_payments: ref(0),
+			total_payment_methods: ref(10),
+			clearSelections: vi.fn(),
+			resetPaymentMethodAmounts: vi.fn(),
+			load_print_page: vi.fn(),
+			eventBus,
+			get_outstanding_invoices: vi.fn(),
+			get_unallocated_payments: vi.fn(),
+			get_draft_mpesa_payments_register: vi.fn(),
+			set_mpesa_search_params: vi.fn(),
+			autoReconcile: vi.fn(),
+		});
+
+		await expect(processPayment()).rejects.toThrow(/multiple currencies|single currency/i);
+		expect((globalThis as any).frappe.call).not.toHaveBeenCalled();
+		expect(eventBus.emit).toHaveBeenCalledWith(
+			"show_message",
+			expect.objectContaining({ color: "error" }),
+		);
+	});
+
+	it("blocks submission for unconvertible selected invoices and submits eligible invoice-currency total otherwise", async () => {
+		(globalThis as any).frappe.call.mockImplementation(({ callback }: any) => {
+			callback({ message: { new_payments_entry: [{ name: "ACC-PAY-UNCONV" }] } });
+		});
+		const eventBus = { emit: vi.fn() };
+		const { processPayment: submitUnconvertible } = usePosPaySubmission({
+			customerName: ref("Customer EUR"),
+			company: ref("Uganda Co"),
+			posProfile: ref({ name: "POS-USD", currency: "USD" }),
+			posOpeningShift: ref({ name: "POS-OPEN-0001" }),
+			exchangeRate: ref(3700),
+			invoiceTotalCurrency: ref("USD"),
+			referenceNo: ref(""),
+			referenceDate: ref(""),
+			autoAllocatePaymentAmount: ref(false),
+			payment_methods: ref([{ mode_of_payment: "Cash", amount: 10 }]),
+			selected_invoices: ref([
+				{
+					voucher_no: "SINV-EUR-NOQUOTE",
+					currency: "USD",
+					party_account_currency: "EUR",
+					outstanding_amount: 10,
+					outstanding_amount_in_invoice_currency: null,
+					outstanding_conversion_unavailable: true,
+				},
+			]),
+			selected_payments: ref([]),
+			selected_mpesa_payments: ref([]),
+			total_selected_payments: ref(0),
+			total_selected_mpesa_payments: ref(0),
+			total_payment_methods: ref(10),
+			clearSelections: vi.fn(),
+			resetPaymentMethodAmounts: vi.fn(),
+			load_print_page: vi.fn(),
+			eventBus,
+			get_outstanding_invoices: vi.fn(),
+			get_unallocated_payments: vi.fn(),
+			get_draft_mpesa_payments_register: vi.fn(),
+			set_mpesa_search_params: vi.fn(),
+			autoReconcile: vi.fn(),
+		});
+
+		await expect(submitUnconvertible()).rejects.toThrow(/conversion rate is unavailable/i);
+		expect((globalThis as any).frappe.call).not.toHaveBeenCalled();
+		expect(eventBus.emit).toHaveBeenCalledWith(
+			"show_message",
+			expect.objectContaining({ color: "error" }),
+		);
+
+		// For a converted USD 10 invoice whose party account is UGX 37,000, payload total_selected_invoices must match display (10, not 37,000).
+		let submittedPayload: any = null;
+		(globalThis as any).frappe.call.mockImplementation(({ args, callback }: any) => {
+			submittedPayload = args.payload;
+			callback({ message: { new_payments_entry: [{ name: "ACC-PAY-CONVERTED" }] } });
+		});
+
+		const { processPayment: submitConverted } = usePosPaySubmission({
+			customerName: ref("Customer UGX"),
+			company: ref("Uganda Co"),
+			posProfile: ref({ name: "POS-USD", currency: "USD" }),
+			posOpeningShift: ref({ name: "POS-OPEN-0001" }),
+			exchangeRate: ref(3700),
+			invoiceTotalCurrency: ref("USD"),
+			referenceNo: ref(""),
+			referenceDate: ref(""),
+			autoAllocatePaymentAmount: ref(false),
+			payment_methods: ref([{ mode_of_payment: "Cash", amount: 10 }]),
+			selected_invoices: ref([
+				{
+					voucher_no: "SINV-USD-UGX",
+					currency: "USD",
+					party_account_currency: "UGX",
+					outstanding_amount: 37000,
+					outstanding_amount_in_invoice_currency: 10,
+					outstanding_conversion_unavailable: false,
+				},
+			]),
+			selected_payments: ref([]),
+			selected_mpesa_payments: ref([]),
+			total_selected_payments: ref(0),
+			total_selected_mpesa_payments: ref(0),
+			total_payment_methods: ref(10),
+			clearSelections: vi.fn(),
+			resetPaymentMethodAmounts: vi.fn(),
+			load_print_page: vi.fn(),
+			eventBus: { emit: vi.fn() },
+			get_outstanding_invoices: vi.fn(),
+			get_unallocated_payments: vi.fn(),
+			get_draft_mpesa_payments_register: vi.fn(),
+			set_mpesa_search_params: vi.fn(),
+			autoReconcile: vi.fn(),
+		});
+
+		await submitConverted();
+		expect(submittedPayload.total_selected_invoices).toBe(10);
+	});
 });

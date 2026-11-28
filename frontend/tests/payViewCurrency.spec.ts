@@ -1,4 +1,4 @@
-import { computed, ref } from "vue";
+import { computed, nextTick, ref, watch } from "vue";
 import { describe, expect, it, vi } from "vitest";
 
 import payViewSource from "../src/posapp/components/pos/shell/PayView.vue?raw";
@@ -933,5 +933,315 @@ describe("PayView.vue company currency & selling FX resolution", () => {
 		expect(method.company_exchange_rate).toBe(2);
 		expect(method.invoice_equivalent).toBe(20);
 		expect(unallocatedRow.invoice_equivalent).toBe(20);
+	});
+
+	it("never mixes distinct invoice currencies into one summed total under ALL and blocks mixed selection", () => {
+		const invoiceTotalCurrencyBody = extractBlock(
+			payViewSource,
+			/\bconst invoiceTotalCurrency\s*=\s*computed\(\(\)\s*=>\s*\{/,
+			"invoiceTotalCurrency",
+		);
+
+		(globalThis as any).flt = (v: unknown) => Number(v || 0);
+		const pos_profile = ref<any>({
+			name: "POS-USD",
+			company: "Uganda Co",
+			currency: "USD",
+			company_currency: "UGX",
+		});
+		const currency_filter = ref("ALL");
+		const selection = usePosPaySelection({
+			posProfile: pos_profile,
+			currency_filter,
+		});
+		const usdInvoice = {
+			voucher_no: "SINV-USD-10",
+			currency: "USD",
+			party_account_currency: "USD",
+			outstanding_amount: 10,
+			outstanding_amount_in_invoice_currency: 10,
+			outstanding_conversion_unavailable: false,
+		};
+		const ugxInvoice = {
+			voucher_no: "SINV-UGX-37000",
+			currency: "UGX",
+			party_account_currency: "UGX",
+			outstanding_amount: 37000,
+			outstanding_amount_in_invoice_currency: 37000,
+			outstanding_conversion_unavailable: false,
+		};
+
+		const invoiceTotalCurrency = new Function(
+			"computed",
+			"currency_filter",
+			"selected_invoices",
+			"pos_profile",
+			`return computed(() => { ${invoiceTotalCurrencyBody} });`,
+		)(computed, currency_filter, selection.selected_invoices, pos_profile);
+
+		// Even if mixed-currency rows appear in selected_invoices under ALL, never sum USD 10 + UGX 37,000 into USD 37,010.
+		selection.selected_invoices.value = [usdInvoice, ugxInvoice];
+		expect(selection.total_selected_invoices.value).toBe(0);
+		expect((selection as any).hasMixedInvoiceCurrencies?.value).toBe(true);
+		expect(invoiceTotalCurrency.value).toBe("");
+
+		// Selecting via toggleInvoiceSelection must refuse adding a different invoice currency.
+		selection.selected_invoices.value = [usdInvoice];
+		const added = selection.toggleInvoiceSelection(ugxInvoice, ref("CUST-1"));
+		expect(added).toBe(false);
+		expect(selection.selected_invoices.value.map((r: any) => r.voucher_no)).toEqual([
+			"SINV-USD-10",
+		]);
+		expect(selection.total_selected_invoices.value).toBe(10);
+		expect(invoiceTotalCurrency.value).toBe("USD");
+	});
+
+	it("re-fetches both payment-method and selected-payment row FX quotes when postingDate changes", async () => {
+		const pmIdx = payViewSource.indexOf("const resolvePaymentMethodRate");
+		const selIdx = payViewSource.indexOf("const normalizeSelectedPayment");
+		expect(pmIdx).toBeGreaterThan(-1);
+		expect(selIdx).toBeGreaterThan(pmIdx);
+
+		const pmWatchMatch =
+			/watch\(\s*\(\)\s*=>\s*\[([\s\S]*?)\],\s*\(\)\s*=>\s*payment_methods\.value\.forEach/.exec(
+				payViewSource.slice(pmIdx, selIdx),
+			);
+		const selWatchMatch =
+			/watch\(\s*\(\)\s*=>\s*\[([\s\S]*?)\],\s*\(\)\s*=>\s*\{\s*selected_payments\.value\.forEach/.exec(
+				payViewSource.slice(selIdx),
+			);
+		expect(pmWatchMatch).not.toBeNull();
+		expect(selWatchMatch).not.toBeNull();
+
+		const companyCurrencyLocal = ref("UGX");
+		const invoiceTotalCurrency = ref("USD");
+		const exchangeRatePurpose = ref("for_selling");
+		const postingDate = ref("2026-11-28");
+		const payment_methods = ref<any[]>([
+			{ mode_of_payment: "Cash EUR", amount: 10, bank_account: null, payment_currency: "EUR" },
+		]);
+		const selected_payments = ref<any[]>([
+			{ name: "PE-1", unallocated_amount: 10, currency: "EUR" },
+		]);
+		const selected_mpesa_payments = ref<any[]>([]);
+
+		const pmGetter = new Function(
+			"companyCurrencyLocal",
+			"invoiceTotalCurrency",
+			"exchangeRatePurpose",
+			"postingDate",
+			"payment_methods",
+			"getPaymentMethodCurrency",
+			`return () => [${pmWatchMatch![1]}];`,
+		)(
+			companyCurrencyLocal,
+			invoiceTotalCurrency,
+			exchangeRatePurpose,
+			postingDate,
+			payment_methods,
+			() => "EUR",
+		);
+		const selGetter = new Function(
+			"invoiceTotalCurrency",
+			"exchangeRatePurpose",
+			"postingDate",
+			"selected_payments",
+			"selected_mpesa_payments",
+			`return () => [${selWatchMatch![1]}];`,
+		)(
+			invoiceTotalCurrency,
+			exchangeRatePurpose,
+			postingDate,
+			selected_payments,
+			selected_mpesa_payments,
+		);
+
+		const onMethodRefetch = vi.fn();
+		const onSelectedRefetch = vi.fn();
+		const stopPm = watch(pmGetter, onMethodRefetch, { deep: true });
+		const stopSel = watch(selGetter, onSelectedRefetch, { deep: true });
+
+		try {
+			postingDate.value = "2026-11-29";
+			await nextTick();
+			expect(onMethodRefetch).toHaveBeenCalledTimes(1);
+			expect(onSelectedRefetch).toHaveBeenCalledTimes(1);
+		} finally {
+			stopPm();
+			stopSel();
+		}
+	});
+
+	it("clears stale row rates and sets _rate_error=true when a current FX lookup rejects while ignoring superseded rejections", async () => {
+		const resolvePaymentMethodBody = extractBlock(
+			payViewSource,
+			/\bconst resolvePaymentMethodRate\s*=\s*async\s*\(method\)\s*=>\s*\{/,
+			"resolvePaymentMethodRate",
+		);
+		const normalizeSelectedBody = extractBlock(
+			payViewSource,
+			/\bconst normalizeSelectedPayment\s*=\s*async\s*\(row,\s*amountField\)\s*=>\s*\{/,
+			"normalizeSelectedPayment",
+		);
+		const purposeExpr = extractExpression(
+			payViewSource,
+			/\bconst exchangeRatePurpose\s*=\s*computed\(\s*/,
+			"exchangeRatePurpose",
+		);
+
+		const paymentEntryType = ref("Receive");
+		const partyType = ref("Customer");
+		const exchangeRatePurpose = new Function(
+			"computed",
+			"paymentEntryType",
+			"partyType",
+			`return computed(${purposeExpr});`,
+		)(computed, paymentEntryType, partyType);
+
+		const pos_profile = ref<any>({
+			name: "POS-REJECT",
+			company: "Uganda Co",
+			currency: "USD",
+			company_currency: "UGX",
+		});
+		const company = ref("Uganda Co");
+		const companyCurrencyLocal = computed(() => "UGX");
+		const invoiceTotalCurrency = computed(() => "USD");
+		const postingDate = ref("2026-11-28");
+		const available_bank_accounts = ref<Record<string, any[]>>({});
+
+		let rejectSupersededSelling: Array<() => void> = [];
+		let mode: "sell_ok" | "buy_reject" | "sell_hang_reject" | "buy_ok" = "sell_ok";
+		const resolveExchangeRate = vi.fn(({ fromCurrency, toCurrency }) => {
+			if (mode === "sell_ok") {
+				return Promise.resolve({
+					found: true,
+					fromCurrency,
+					toCurrency,
+					rate: 3,
+					effectiveDate: "2026-11-28",
+					rateDate: "2026-11-28",
+					source: "currency_exchange",
+				});
+			}
+			if (mode === "buy_reject") {
+				return Promise.reject(new Error("network_down"));
+			}
+			if (mode === "sell_hang_reject") {
+				return new Promise((_resolve, reject) => {
+					rejectSupersededSelling.push(() => reject(new Error("stale_sell_error")));
+				});
+			}
+			return Promise.resolve({
+				found: true,
+				fromCurrency,
+				toCurrency,
+				rate: 2,
+				effectiveDate: "2026-11-28",
+				rateDate: "2026-11-28",
+				source: "currency_exchange",
+			});
+		});
+
+		const resolvePaymentMethodRate = new Function(
+			"available_bank_accounts",
+			"getPaymentMethodCurrency",
+			"invoiceTotalCurrency",
+			"companyCurrencyLocal",
+			"pos_profile",
+			"company",
+			"postingDate",
+			"getTodayDate",
+			"resolveExchangeRate",
+			"flt",
+			"exchangeRatePurpose",
+			`return async (method) => { ${resolvePaymentMethodBody} };`,
+		)(
+			available_bank_accounts,
+			() => "EUR",
+			invoiceTotalCurrency,
+			companyCurrencyLocal,
+			pos_profile,
+			company,
+			postingDate,
+			() => "2026-11-28",
+			resolveExchangeRate,
+			(v: unknown) => Number(v || 0),
+			exchangeRatePurpose,
+		);
+
+		const normalizeSelectedPayment = new Function(
+			"pos_profile",
+			"invoiceTotalCurrency",
+			"resolveExchangeRate",
+			"company",
+			"postingDate",
+			"getTodayDate",
+			"flt",
+			"exchangeRatePurpose",
+			`return async (row, amountField) => { ${normalizeSelectedBody} };`,
+		)(
+			pos_profile,
+			invoiceTotalCurrency,
+			resolveExchangeRate,
+			company,
+			postingDate,
+			() => "2026-11-28",
+			(v: unknown) => Number(v || 0),
+			exchangeRatePurpose,
+		);
+
+		const method: any = { mode_of_payment: "Cash EUR", amount: 10, payment_currency: "EUR" };
+		const unallocatedRow: any = { currency: "EUR", unallocated_amount: 10 };
+
+		// 1) Initial for_selling resolves to rate 3 / equivalent 30.
+		await resolvePaymentMethodRate(method);
+		await normalizeSelectedPayment(unallocatedRow, "unallocated_amount");
+		expect(method.invoice_exchange_rate).toBe(3);
+		expect(method.invoice_equivalent).toBe(30);
+		expect(method._rate_error).toBe(false);
+		expect(unallocatedRow.invoice_equivalent).toBe(30);
+		expect(unallocatedRow._rate_error).toBe(false);
+
+		// 2) Switch to Supplier Pay (for_buying) and current lookup REJECTS -> must clear stale 3/30 and set _rate_error=true.
+		paymentEntryType.value = "Pay";
+		partyType.value = "Supplier";
+		mode = "buy_reject";
+		await resolvePaymentMethodRate(method);
+		await normalizeSelectedPayment(unallocatedRow, "unallocated_amount");
+		expect(method._rate_error).toBe(true);
+		expect(method.invoice_exchange_rate).toBeNull();
+		expect(method.company_exchange_rate).toBeNull();
+		expect(method.invoice_equivalent).toBe(0);
+		expect(unallocatedRow._rate_error).toBe(true);
+		expect(unallocatedRow.invoice_equivalent).toBe(0);
+
+		// 3) Superseded rejection must NOT clobber a newer valid quote (2/20).
+		paymentEntryType.value = "Receive";
+		partyType.value = "Customer";
+		mode = "sell_hang_reject";
+		rejectSupersededSelling = [];
+		const staleMethodCall = resolvePaymentMethodRate(method);
+		const staleSelectedCall = normalizeSelectedPayment(unallocatedRow, "unallocated_amount");
+
+		paymentEntryType.value = "Pay";
+		partyType.value = "Supplier";
+		mode = "buy_ok";
+		await resolvePaymentMethodRate(method);
+		await normalizeSelectedPayment(unallocatedRow, "unallocated_amount");
+		expect(method.invoice_exchange_rate).toBe(2);
+		expect(method.invoice_equivalent).toBe(20);
+		expect(method._rate_error).toBe(false);
+		expect(unallocatedRow.invoice_equivalent).toBe(20);
+		expect(unallocatedRow._rate_error).toBe(false);
+
+		rejectSupersededSelling.forEach((rej) => rej());
+		await Promise.all([staleMethodCall, staleSelectedCall]);
+
+		expect(method.invoice_exchange_rate).toBe(2);
+		expect(method.invoice_equivalent).toBe(20);
+		expect(method._rate_error).toBe(false);
+		expect(unallocatedRow.invoice_equivalent).toBe(20);
+		expect(unallocatedRow._rate_error).toBe(false);
 	});
 });
