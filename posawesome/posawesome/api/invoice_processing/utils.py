@@ -140,13 +140,15 @@ def get_latest_rate(
         if key in cache:
             return cache[key]
 
-    filters = {
-        "from_currency": from_currency,
-        "to_currency": to_currency,
-        "date": ["<=", transaction_date],
-    }
+    # Mirror ERPNext erpnext/setup/utils.py:72-88: strict lower bound `date > cutoff`
+    # with inclusive upper bound `date <= transaction_date` when stale rates are disallowed.
+    filters = [
+        ["from_currency", "=", from_currency],
+        ["to_currency", "=", to_currency],
+        ["date", "<=", transaction_date],
+    ]
     if purpose in {"for_buying", "for_selling"}:
-        filters[purpose] = 1
+        filters.append([purpose, "=", 1])
 
     try:
         accounts_settings = frappe.get_cached_doc("Accounts Settings")
@@ -154,7 +156,8 @@ def get_latest_rate(
         accounts_settings = None
     if accounts_settings and not cint(accounts_settings.get("allow_stale")):
         stale_days = cint(accounts_settings.get("stale_days"))
-        filters["date"] = ["between", [add_days(transaction_date, -stale_days), transaction_date]]
+        checkpoint_date = getdate(add_days(transaction_date, -stale_days))
+        filters.append(["date", ">", checkpoint_date])
 
     # Mirror ERPNext erpnext/setup/utils.py:66-98 so same-day purpose-specific
     # rates (e.g. for_selling=1, for_buying=0) outrank dual-purpose entries.

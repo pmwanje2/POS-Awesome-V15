@@ -252,48 +252,47 @@ function mergeDocItemsWithCartCostFallback(
 		const matched = matchedIndex !== -1 ? liveCartItems[matchedIndex] : null;
 		const merged: Record<string, any> = { ...docItem };
 
-		// Apply authoritative invoice-level currency & FX metadata before cart fallback
-		// so stale or pending-zero cart FX never overrides a valid invoice conversion_rate.
+		// Mirror ERPNext taxes_and_totals.py:344: parent invoice header currency & FX
+		// are authoritative for every child item, overriding any stale child-row or
+		// cart-row currency / conversion_rate (including stale positive values like 1).
 		if (doc && typeof doc === "object") {
-			for (const docField of [
-				"currency",
-				"price_list_currency",
-				"company_currency",
-			] as const) {
-				if (isBlankValue(merged[docField]) && !isBlankValue(doc[docField])) {
-					merged[docField] = doc[docField];
+			const originalRowCurrency = String(merged.currency || "").trim();
+			const docCurrency = String(doc.currency || "").trim();
+			if (docCurrency) {
+				if (
+					originalRowCurrency &&
+					originalRowCurrency !== docCurrency &&
+					isBlankValue(merged.buying_rate_currency) &&
+					isBlankValue(merged._source_buying_currency) &&
+					(Number(merged.trade_price) > 0 ||
+						Number(merged.buying_price) > 0 ||
+						Number(merged.buying_rate) > 0)
+				) {
+					merged._source_buying_currency = originalRowCurrency;
+				}
+				merged.currency = doc.currency;
+				if (
+					originalRowCurrency &&
+					originalRowCurrency !== docCurrency &&
+					isBlankValue(doc.conversion_rate)
+				) {
+					merged.conversion_rate = undefined;
 				}
 			}
-			const docCurrency = String(doc.currency || "").trim();
-			const mergedCurrency = String(merged.currency || "").trim();
-			if (
-				isPositiveFinite(doc.conversion_rate) &&
-				(isBlankValue(merged.conversion_rate) ||
-					!isPositiveFinite(merged.conversion_rate)) &&
-				(!docCurrency || !mergedCurrency || docCurrency === mergedCurrency)
-			) {
+			if (!isBlankValue(doc.price_list_currency)) {
+				merged.price_list_currency = doc.price_list_currency;
+			}
+			if (!isBlankValue(doc.company_currency)) {
+				merged.company_currency = doc.company_currency;
+			}
+			if (isPositiveFinite(doc.conversion_rate)) {
 				merged.conversion_rate = doc.conversion_rate;
-			} else if (
-				isBlankValue(merged.conversion_rate) &&
-				!isBlankValue(doc.conversion_rate)
-			) {
+			} else if (!isBlankValue(doc.conversion_rate)) {
 				merged.conversion_rate = doc.conversion_rate;
 			}
-			const docPlcCurrency = String(doc.price_list_currency || "").trim();
-			const mergedPlcCurrency = String(merged.price_list_currency || "").trim();
-			if (
-				isPositiveFinite(doc.plc_conversion_rate) &&
-				(isBlankValue(merged.plc_conversion_rate) ||
-					!isPositiveFinite(merged.plc_conversion_rate)) &&
-				(!docPlcCurrency ||
-					!mergedPlcCurrency ||
-					docPlcCurrency === mergedPlcCurrency)
-			) {
+			if (isPositiveFinite(doc.plc_conversion_rate)) {
 				merged.plc_conversion_rate = doc.plc_conversion_rate;
-			} else if (
-				isBlankValue(merged.plc_conversion_rate) &&
-				!isBlankValue(doc.plc_conversion_rate)
-			) {
+			} else if (!isBlankValue(doc.plc_conversion_rate)) {
 				merged.plc_conversion_rate = doc.plc_conversion_rate;
 			}
 		}

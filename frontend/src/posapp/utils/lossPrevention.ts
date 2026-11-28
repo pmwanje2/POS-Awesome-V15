@@ -366,12 +366,7 @@ export function resolveInvoiceDiscountPercentage(
 	let eligibleFixedQtyTaxTotal = 0;
 
 	for (const item of itemList) {
-		if (
-			!item ||
-			item.is_return ||
-			item.posa_is_replace ||
-			isPricingRuleFreeLine(item)
-		) {
+		if (!item || item.is_return || item.posa_is_replace) {
 			continue;
 		}
 		const qty = toFiniteNumber(item.qty) || 0;
@@ -855,12 +850,7 @@ function areNativeNetAmountsReconciled(
 	let hasZeroAboveHalfUlp = false;
 
 	for (const item of items) {
-		if (
-			!item ||
-			item.is_return ||
-			item.posa_is_replace ||
-			isPricingRuleFreeLine(item)
-		) {
+		if (!item || item.is_return || item.posa_is_replace) {
 			continue;
 		}
 		const qty = toFiniteNumber(item.qty) || 0;
@@ -874,9 +864,13 @@ function areNativeNetAmountsReconciled(
 		const preAmount = preDiscountNet * qty;
 		const computedAmount =
 			preDiscountNet * (1 - invoiceDiscountPercentage / 100) * qty;
-		const nativeAmount = resolveNativeNetAmount(item, grossRate, qty, true);
+		let nativeAmount = resolveNativeNetAmount(item, grossRate, qty, true);
 		if (nativeAmount === null) {
-			return false;
+			if (isPricingRuleFreeLine(item) && grossRate <= 0) {
+				nativeAmount = 0;
+			} else {
+				return false;
+			}
 		}
 		if (
 			nativeAmount === 0 &&
@@ -909,7 +903,12 @@ function areNativeNetAmountsReconciled(
 			Math.abs(nativeSum - expectedSum) <= 0.5 * ulp + 1e-9
 		);
 	}
-	return !hasUnappliedDiscount && Math.abs(nativeSum - expectedSum) <= ulp + 1e-9;
+	// ERPNext taxes_and_totals.py:1105-1116 applies a running rounding adjustment so
+	// sum(item.net_amount) stays within 0.5 ULP of the unrounded discounted net total.
+	return (
+		!hasUnappliedDiscount &&
+		Math.abs(nativeSum - expectedSum) <= 0.5 * ulp + 1e-9
+	);
 }
 
 export function getItemLossRisk(
@@ -957,8 +956,9 @@ export function getItemLossRisk(
 		preDiscountNetRate * (1 - invoiceDiscountPercentage / 100);
 	const halfUlp = 0.5 * 10 ** -precision;
 	const allowZeroNativeNet =
-		Boolean(options.reconciledNativeNet) ||
-		computedNetRate <= halfUlp + 1e-9;
+		options.reconciledNativeNet === true ||
+		(options.reconciledNativeNet === undefined &&
+			computedNetRate <= halfUlp + 1e-9);
 	const nativeUnitNetRate = resolveNativeUnitNetRate(
 		item,
 		grossSellingRate,

@@ -513,6 +513,33 @@ def _select_price(
     return next(iter(price_rows.values()), frappe._dict())
 
 
+def _select_buying_price(
+    price_rows: Dict[str, frappe._dict],
+    requested_uom: Optional[str],
+    stock_uom: Optional[str],
+) -> tuple[frappe._dict, bool]:
+    """Select a buying price strictly matching the requested, stock, or unspecified UOM.
+
+    Mirrors ERPNext ``get_price_list_rate_for`` (``get_item_details.py:1569``):
+    never leak an unrelated UOM buying price (e.g. a Box price onto an Each row).
+    Returns ``(price_row, matched_exact_requested_uom)``.
+    """
+
+    if not price_rows:
+        return frappe._dict(), False
+
+    if requested_uom and requested_uom in price_rows:
+        return price_rows[requested_uom], True
+
+    if stock_uom and stock_uom in price_rows:
+        return price_rows[stock_uom], not requested_uom or requested_uom == stock_uom
+
+    if "None" in price_rows:
+        return price_rows["None"], not requested_uom or requested_uom == stock_uom
+
+    return frappe._dict(), False
+
+
 def _ensure_stock_uom(uoms: List[Dict[str, Any]], stock_uom: Optional[str]) -> List[Dict[str, Any]]:
     """Make sure the stock UOM is always present in the UOM listing."""
 
@@ -536,12 +563,13 @@ def merge_item_row(
         return dict(item)
 
     meta = lookup_data.meta_map.get(item_code, frappe._dict())
-    uoms = _ensure_stock_uom(lookup_data.uom_map.get(item_code, []), meta.get("stock_uom"))
+    stock_uom = meta.get("stock_uom") or item.get("stock_uom")
+    uoms = _ensure_stock_uom(lookup_data.uom_map.get(item_code, []), stock_uom)
     price_row = _select_price(
-        lookup_data.price_map.get(item_code, {}), item.get("uom"), meta.get("stock_uom")
+        lookup_data.price_map.get(item_code, {}), item.get("uom"), stock_uom
     )
-    buying_price_row = _select_price(
-        lookup_data.buying_price_map.get(item_code, {}), item.get("uom"), meta.get("stock_uom")
+    buying_price_row, buying_exact_uom = _select_buying_price(
+        lookup_data.buying_price_map.get(item_code, {}), item.get("uom"), stock_uom
     )
     price_currency = price_row.get("currency") if price_row else None
 
@@ -560,6 +588,16 @@ def merge_item_row(
         if buying_price_row and buying_price_row.get("price_list_rate") is not None
         else None
     )
+    if raw_buying_rate is not None and not buying_exact_uom and item.get("uom"):
+        uom_factor = next(
+            (
+                flt(entry.get("conversion_factor"))
+                for entry in uoms
+                if entry.get("uom") == item.get("uom") and flt(entry.get("conversion_factor")) > 0
+            ),
+            0.0,
+        )
+        raw_buying_rate = raw_buying_rate * uom_factor if uom_factor > 0 else None
     base_buying_rate = (
         raw_buying_rate * flt(buying_exchange_rate)
         if raw_buying_rate is not None and flt(buying_exchange_rate) > 0
@@ -582,6 +620,7 @@ def merge_item_row(
     row.update(
         {
             "item_uoms": uoms,
+            "stock_uom": stock_uom,
             "item_barcode": lookup_data.barcode_map.get(item_code, []),
             "actual_qty": actual_qty,
             "has_batch_no": meta.get("has_batch_no"),
@@ -711,7 +750,9 @@ class ItemDetailAggregator:
             and allow_multi_currency
         ):
             try:
-                return get_exchange_rate(price_list_currency, company_currency, self.today)
+                return get_exchange_rate(
+                    price_list_currency, company_currency, self.today, "for_selling"
+                )
             except Exception:
                 frappe.log_error(
                     f"Missing exchange rate from {price_list_currency} to {company_currency}",
@@ -757,7 +798,7 @@ class ItemDetailAggregator:
         if buying_price_currency and company_currency and buying_price_currency != company_currency:
             try:
                 self.buying_exchange_rate = get_exchange_rate(
-                    buying_price_currency, company_currency, self.today
+                    buying_price_currency, company_currency, self.today, "for_buying"
                 )
             except Exception:
                 self.buying_exchange_rate = None

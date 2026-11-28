@@ -380,7 +380,7 @@ def _resolve_floor_rates(
     source_to_company = (
         1.0
         if source_currency == company_currency
-        else flt(get_exchange_rate(source_currency, company_currency, posting_date))
+        else flt(get_exchange_rate(source_currency, company_currency, posting_date, "for_buying"))
     )
     invoice_to_company = (
         1.0
@@ -1204,15 +1204,21 @@ def _server_applied_free_row_indexes(
                     from erpnext.accounts.doctype.pricing_rule.utils import (
                         get_cumulative_qty_and_amount_for_row,
                     )
-                except Exception:
+                except ImportError:
                     return None
 
                 pr_doc = None
                 get_cached_doc = getattr(frappe, "get_cached_doc", None)
                 if callable(get_cached_doc) and rule_name:
+                    does_not_exist = getattr(frappe, "DoesNotExistError", None)
+                    catch_missing = (
+                        (does_not_exist, KeyError)
+                        if isinstance(does_not_exist, type) and issubclass(does_not_exist, Exception)
+                        else (KeyError,)
+                    )
                     try:
                         pr_doc = get_cached_doc("Pricing Rule", rule_name)
-                    except Exception:
+                    except catch_missing:
                         pr_doc = None
                 if pr_doc is None:
                     pr_doc = _RuleAttrDict(rule)
@@ -1262,16 +1268,17 @@ def _server_applied_free_row_indexes(
                         ),
                     }
                 )
-                try:
-                    result = get_cumulative_qty_and_amount_for_row(
-                        pr_doc,
-                        row_args,
-                        invoice_doc if has_doc else None,
-                    )
-                except Exception:
-                    return None
+                # Mirror ERPNext pricing_rule/utils.py:324-327: do not swallow
+                # cumulative history lookup errors or silently fall back.
+                result = get_cumulative_qty_and_amount_for_row(
+                    pr_doc,
+                    row_args,
+                    invoice_doc if has_doc else None,
+                )
                 if not isinstance(result, (tuple, list)) or len(result) < 2:
-                    return None
+                    raise TypeError(
+                        "get_cumulative_qty_and_amount_for_row returned an invalid cumulative tuple"
+                    )
                 return flt(result[0]), flt(result[1])
 
             if is_mixed:
@@ -1290,11 +1297,11 @@ def _server_applied_free_row_indexes(
                     valid_count += 1
                 if not valid_count:
                     continue
-                if min_qty > 0 and total_threshold_qty < min_qty - 1e-9:
+                if total_threshold_qty < min_qty - 1e-9:
                     continue
                 if max_qty > 0 and total_threshold_qty > max_qty + 1e-9:
                     continue
-                if min_amt > 0 and total_threshold_amt < min_amt - 1e-9:
+                if total_threshold_amt < min_amt - 1e-9:
                     continue
                 if max_amt > 0 and total_threshold_amt > max_amt + 1e-9:
                     continue
@@ -1320,11 +1327,14 @@ def _server_applied_free_row_indexes(
                         row_threshold_qty = q_stock_qty / qty_cf
                         row_threshold_amt = row_amt
                         enforce_min = not is_cumulative
-                    if min_qty > 0 and enforce_min and row_threshold_qty < min_qty - 1e-9:
+                    # ERPNext pricing_rule/utils.py:433-445 always enforces min_qty/min_amt
+                    # even when 0 (rejecting negative cumulative totals after returns);
+                    # max_qty/max_amt treat 0 as unbounded.
+                    if enforce_min and row_threshold_qty < min_qty - 1e-9:
                         continue
                     if max_qty > 0 and row_threshold_qty > max_qty + 1e-9:
                         continue
-                    if min_amt > 0 and enforce_min and row_threshold_amt < (min_amt * amt_cf) - 1e-9:
+                    if enforce_min and row_threshold_amt < (min_amt * amt_cf) - 1e-9:
                         continue
                     if max_amt > 0 and row_threshold_amt > (max_amt * amt_cf) + 1e-9:
                         continue
@@ -1480,10 +1490,12 @@ def collect_below_buying_price_errors(
         gross_rate = abs(flt(item.get("rate")))
         pre_discount_net = max((gross_rate - incl_b) / (1.0 + incl_a), 0.0)
         pre_discount_nets[index] = pre_discount_net
+        # Include verified promotional rows in the invoice discount allocation base
+        # (ERPNext taxes_and_totals.py:1130 includes rows with nonzero free_item_rate
+        # in net_total), while keeping promotional_free_rows floor-exempt below.
         if (
             not item.get("is_return")
             and not item.get("posa_is_replace")
-            and index not in promotional_free_rows
             and flt(item.get("qty")) > 0
         ):
             eligible_indexes.append(index)
@@ -1547,8 +1559,11 @@ def collect_below_buying_price_errors(
             el_qty = abs(flt(el_row.get("qty")))
             el_native_amount = _row_native_net_amount(el_row, el_gross, el_qty)
             if el_native_amount is None:
-                all_rows_reconciled = False
-                break
+                if idx in promotional_free_rows and el_gross <= 0:
+                    el_native_amount = 0.0
+                else:
+                    all_rows_reconciled = False
+                    break
             el_pre_amount = pre_discount_nets.get(idx, 0.0) * el_qty
             el_computed_amount = computed_net_rates.get(idx, 0.0) * el_qty
             el_prec = _resolve_currency_precision(el_row, invoice_doc, "net_amount")
@@ -1569,10 +1584,12 @@ def collect_below_buying_price_errors(
             expected_sum < pre_discount_sum - 0.5 * invoice_ulp - 1e-9
             and native_sum >= pre_discount_sum - 1e-9
         )
+        # ERPNext taxes_and_totals.py:1105-1116 applies a running rounding adjustment so
+        # sum(item.net_amount) stays within 0.5 ULP of the unrounded discounted net total.
         if (
             all_rows_reconciled
             and not has_unapplied_discount
-            and abs(native_sum - expected_sum) <= invoice_ulp + 1e-9
+            and abs(native_sum - expected_sum) <= 0.5 * invoice_ulp + 1e-9
         ):
             reconciled_native_nets = True
 
