@@ -32,10 +32,11 @@ const COST_CANDIDATES: Array<{
 	label: string;
 	baseCurrency?: boolean;
 	stockUomRate?: boolean;
+	buyingListField?: boolean;
 }> = [
-	{ field: "trade_price", label: "Trade Price" },
-	{ field: "buying_price", label: "Buying Price" },
-	{ field: "buying_rate", label: "Buying Rate" },
+	{ field: "trade_price", label: "Trade Price", buyingListField: true },
+	{ field: "buying_price", label: "Buying Price", buyingListField: true },
+	{ field: "buying_rate", label: "Buying Rate", buyingListField: true },
 	{ field: "last_buying_rate", label: "Last Buying Rate" },
 	{
 		field: "valuation_rate",
@@ -112,6 +113,7 @@ export function getItemCostFloor(
 		rawUomFactor !== null && rawUomFactor > EPSILON ? rawUomFactor : 1;
 
 	const resolvedCandidates: LossCostFloor[] = [];
+	let hasNormalizedBuyingPrice = false;
 
 	const pricesByUom = item._buying_prices_by_uom;
 	if (pricesByUom && typeof pricesByUom === "object") {
@@ -133,22 +135,72 @@ export function getItemCostFloor(
 				rate: baseRate * conversionFactor,
 				baseCurrency: true,
 			});
+			hasNormalizedBuyingPrice = true;
 		}
 	}
 
+	const invoiceCurrency = String(
+		item.currency || item.price_list_currency || "",
+	).trim();
+	const buyingPriceCurrency = String(item.buying_price_currency || "").trim();
+	const buyingRateCurrency = String(item.buying_rate_currency || "").trim();
+	const companyCurrency = String(item.company_currency || "").trim();
+	const rawBuyingExchangeRate = toFiniteNumber(item.buying_exchange_rate);
+
 	for (const candidate of COST_CANDIDATES) {
 		const rawRate = toFiniteNumber(item[candidate.field]);
-		if (rawRate !== null && rawRate > EPSILON) {
-			const scaledRate = candidate.stockUomRate
-				? rawRate * uomConversionFactor
-				: rawRate;
-			resolvedCandidates.push({
-				field: candidate.field,
-				label: candidate.label,
-				rate: scaledRate,
-				baseCurrency: candidate.baseCurrency,
-			});
+		if (rawRate === null || rawRate <= EPSILON) {
+			continue;
 		}
+		if (candidate.buyingListField) {
+			if (hasNormalizedBuyingPrice) {
+				continue;
+			}
+			const alreadyInInvoiceCurrency = Boolean(
+				buyingRateCurrency &&
+					invoiceCurrency &&
+					buyingRateCurrency === invoiceCurrency,
+			);
+			const currencyMismatch = Boolean(
+				!alreadyInInvoiceCurrency &&
+					buyingPriceCurrency &&
+					invoiceCurrency &&
+					buyingPriceCurrency !== invoiceCurrency,
+			);
+			if (currencyMismatch) {
+				if (
+					rawBuyingExchangeRate !== null &&
+					rawBuyingExchangeRate > EPSILON
+				) {
+					resolvedCandidates.push({
+						field: candidate.field,
+						label: candidate.label,
+						rate: rawRate * rawBuyingExchangeRate,
+						baseCurrency: true,
+					});
+				} else if (
+					companyCurrency &&
+					buyingPriceCurrency === companyCurrency
+				) {
+					resolvedCandidates.push({
+						field: candidate.field,
+						label: candidate.label,
+						rate: rawRate,
+						baseCurrency: true,
+					});
+				}
+				continue;
+			}
+		}
+		const scaledRate = candidate.stockUomRate
+			? rawRate * uomConversionFactor
+			: rawRate;
+		resolvedCandidates.push({
+			field: candidate.field,
+			label: candidate.label,
+			rate: scaledRate,
+			baseCurrency: candidate.baseCurrency,
+		});
 	}
 
 	if (!resolvedCandidates.length) {

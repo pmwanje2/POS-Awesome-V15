@@ -353,9 +353,12 @@ def _deduplicate_free_items(invoice_doc):
 
 
 def _strip_client_freebies_from_payload(payload):
-    """Remove auto-applied POS freebies from inbound payloads before saving."""
+    """Remove auto-applied POS freebies and unverified client free/rule flags from inbound payloads."""
 
     if not payload or not isinstance(payload, dict):
+        return
+
+    if cint(payload.get("is_return")):
         return
 
     items = payload.get("items")
@@ -381,6 +384,15 @@ def _strip_client_freebies_from_payload(payload):
         if auto_marker or (is_free and pricing_rule_marker):
             modified = True
             continue
+
+        if is_free:
+            row["is_free_item"] = 0
+            modified = True
+
+        for marker_field in ("pricing_rules", "pricing_rule", "source_rule"):
+            if row.get(marker_field):
+                row[marker_field] = None
+                modified = True
 
         cleaned.append(row)
 

@@ -553,6 +553,26 @@ def merge_item_row(
     warehouse_valuation = flt((lookup_data.valuation_map or {}).get(item_code) or 0)
     effective_valuation = warehouse_valuation if warehouse_valuation > 0 else meta.get("valuation_rate")
 
+    row_currency = price_currency or price_list_currency
+    buying_currency = buying_price_row.get("currency") if buying_price_row else None
+    raw_buying_rate = (
+        flt(buying_price_row.get("price_list_rate"))
+        if buying_price_row and buying_price_row.get("price_list_rate") is not None
+        else None
+    )
+    if raw_buying_rate is None:
+        normalized_buying_rate = None
+        buying_rate_currency = None
+    elif not buying_currency or not row_currency or buying_currency == row_currency:
+        normalized_buying_rate = raw_buying_rate
+        buying_rate_currency = row_currency or buying_currency
+    elif flt(buying_exchange_rate) > 0 and flt(exchange_rate) > 0:
+        normalized_buying_rate = raw_buying_rate * flt(buying_exchange_rate) / flt(exchange_rate)
+        buying_rate_currency = row_currency
+    else:
+        normalized_buying_rate = None
+        buying_rate_currency = None
+
     row = dict(item)
     row.update(
         {
@@ -567,16 +587,18 @@ def merge_item_row(
             "valuation_rate": effective_valuation,
             "warehouse_valuation_rate": warehouse_valuation if warehouse_valuation > 0 else None,
             "last_purchase_rate": meta.get("last_purchase_rate"),
-            "trade_price": buying_price_row.get("price_list_rate") if buying_price_row else None,
-            "buying_rate": buying_price_row.get("price_list_rate") if buying_price_row else None,
+            "trade_price": normalized_buying_rate,
+            "buying_rate": normalized_buying_rate,
+            "buying_rate_currency": buying_rate_currency,
             "buying_price_list": buying_price_row.get("price_list") if buying_price_row else None,
-            "buying_price_currency": buying_price_row.get("currency") if buying_price_row else None,
+            "buying_price_currency": buying_currency,
+            "buying_exchange_rate": flt(buying_exchange_rate) if flt(buying_exchange_rate) > 0 else None,
             "default_bom": meta.get("default_bom"),
             "batch_no_data": batch_rows,
             "serial_no_data": lookup_data.serial_map.get(item_code, []),
             "rate": price_row.get("price_list_rate") if price_row else 0,
             "price_list_rate": price_row.get("price_list_rate") if price_row else 0,
-            "currency": price_currency or price_list_currency,
+            "currency": row_currency,
             "price_list_currency": price_list_currency,
             "plc_conversion_rate": exchange_rate,
             "conversion_rate": exchange_rate,
