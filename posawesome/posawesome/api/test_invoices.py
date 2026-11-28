@@ -401,6 +401,22 @@ class TestInvoicesApi(unittest.TestCase):
         self.assertEqual(doc.taxes[1]["included_in_print_rate"], 0)
         self.assertEqual(doc.calculate_calls, 0)
 
+    def test_fetch_exchange_rate_pair_forwards_for_selling_purpose_by_default(self):
+        calls = []
+        orig_get_latest_rate = self.invoices.get_latest_rate
+        try:
+            def fake_get_latest_rate(from_currency, to_currency, **kwargs):
+                calls.append((from_currency, to_currency, kwargs))
+                return 3700.0, "2026-11-28"
+
+            self.invoices.get_latest_rate = fake_get_latest_rate
+
+            payload = self.invoices.fetch_exchange_rate_pair("USD", "UGX", "2026-11-28")
+            self.assertEqual(payload, {"exchange_rate": 3700.0, "date": "2026-11-28"})
+            self.assertEqual(calls[0][2].get("purpose"), "for_selling")
+        finally:
+            self.invoices.get_latest_rate = orig_get_latest_rate
+
 
 if __name__ == "__main__":
     unittest.main()

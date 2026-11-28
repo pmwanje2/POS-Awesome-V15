@@ -594,6 +594,117 @@ class TestItemFetchers(unittest.TestCase):
         self.assertEqual(box_row["base_buying_rate"], 80.0)
         self.assertEqual(box_row["trade_price"], 80.0)
 
+    def test_merge_item_row_uses_buying_vs_selling_fx_ratio_for_same_foreign_currency(self):
+        lookup = self.module.ItemLookupData(
+            price_map={
+                "ITEM-USD-SPREAD": {
+                    "Nos": AttrDict(
+                        {
+                            "price_list_rate": 10.50,
+                            "currency": "USD",
+                            "price_list": "USD Selling",
+                        }
+                    )
+                }
+            },
+            buying_price_map={
+                "ITEM-USD-SPREAD": {
+                    "Nos": AttrDict(
+                        {
+                            "price_list_rate": 10.0,
+                            "currency": "USD",
+                            "price_list": "USD Buying",
+                        }
+                    )
+                }
+            },
+            stock_map={},
+            meta_map={"ITEM-USD-SPREAD": AttrDict({"name": "ITEM-USD-SPREAD", "stock_uom": "Nos"})},
+            uom_map={},
+            barcode_map={},
+            batch_map={},
+            serial_map={},
+            bom_map={},
+        )
+
+        # Same foreign currency USD with buying FX 4,050 and selling FX 3,700 -> USD floor is 10 * 4050 / 3700.
+        row = self.module.merge_item_row(
+            {"item_code": "ITEM-USD-SPREAD"},
+            lookup,
+            "USD",
+            exchange_rate=3700.0,
+            buying_exchange_rate=4050.0,
+        )
+        expected_invoice_floor = 10.0 * 4050.0 / 3700.0
+        self.assertAlmostEqual(row["base_buying_rate"], 40500.0, places=4)
+        self.assertAlmostEqual(row["trade_price"], expected_invoice_floor, places=4)
+        self.assertAlmostEqual(row["buying_rate"], expected_invoice_floor, places=4)
+
+    def test_merge_item_row_respects_buying_price_list_price_not_uom_dependent(self):
+        orig_db_get_value = self.module.frappe.db.get_value
+        try:
+            lookup = self.module.ItemLookupData(
+                price_map={
+                    "ITEM-PNUD": {
+                        "Box": AttrDict(
+                            {
+                                "price_list_rate": 10.0,
+                                "currency": "USD",
+                                "price_list": "USD Selling",
+                            }
+                        )
+                    }
+                },
+                buying_price_map={
+                    "ITEM-PNUD": {
+                        "Each": AttrDict(
+                            {
+                                "price_list_rate": 8.0,
+                                "currency": "USD",
+                                "price_list": "Flat Buying",
+                            }
+                        )
+                    }
+                },
+                stock_map={},
+                meta_map={"ITEM-PNUD": AttrDict({"name": "ITEM-PNUD", "stock_uom": "Each"})},
+                uom_map={"ITEM-PNUD": [{"uom": "Box", "conversion_factor": 10.0}]},
+                barcode_map={},
+                batch_map={},
+                serial_map={},
+                bom_map={},
+            )
+
+            self.module.frappe.db.get_value = lambda doctype, name, fieldname=None: (
+                1
+                if doctype == "Price List" and name == "Flat Buying" and fieldname == "price_not_uom_dependent"
+                else None
+            )
+            flat_row = self.module.merge_item_row(
+                {"item_code": "ITEM-PNUD", "uom": "Box"},
+                lookup,
+                "USD",
+                exchange_rate=1.0,
+                buying_exchange_rate=1.0,
+            )
+            self.assertAlmostEqual(flat_row["base_buying_rate"], 8.0, places=4)
+            self.assertAlmostEqual(flat_row["trade_price"], 8.0, places=4)
+            self.assertEqual(flat_row["_buying_prices_by_uom"]["Each"]["price_not_uom_dependent"], 1)
+
+            # With price_not_uom_dependent=0, stock-UOM fallback scales 8 * 10 = 80.
+            self.module.frappe.db.get_value = lambda doctype, name, fieldname=None: 0
+            scaled_row = self.module.merge_item_row(
+                {"item_code": "ITEM-PNUD", "uom": "Box"},
+                lookup,
+                "USD",
+                exchange_rate=1.0,
+                buying_exchange_rate=1.0,
+            )
+            self.assertAlmostEqual(scaled_row["base_buying_rate"], 80.0, places=4)
+            self.assertAlmostEqual(scaled_row["trade_price"], 80.0, places=4)
+        finally:
+            self.module.frappe.db.get_value = orig_db_get_value
+
 
 if __name__ == "__main__":
     unittest.main()

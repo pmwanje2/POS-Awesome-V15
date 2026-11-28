@@ -316,6 +316,43 @@ class TestInvoiceCurrencyRates(unittest.TestCase):
         finally:
             self.frappe.get_cached_doc = orig_get_cached_doc
 
+    def test_get_latest_rate_orders_same_day_rows_by_name_desc_when_purpose_omitted(self):
+        # Mirror ERPNext erpnext/setup/utils.py:77-95: order_by="date desc, name desc"
+        # selects Z (3,700, older creation) ahead of A (3,900, newer creation).
+        rows = [
+            _AttrDict(
+                name="Z",
+                date="2026-11-28",
+                from_currency="USD",
+                to_currency="UGX",
+                for_selling=1,
+                for_buying=1,
+                exchange_rate=3700.0,
+                creation="2026-11-28 08:00:00",
+            ),
+            _AttrDict(
+                name="A",
+                date="2026-11-28",
+                from_currency="USD",
+                to_currency="UGX",
+                for_selling=1,
+                for_buying=1,
+                exchange_rate=3900.0,
+                creation="2026-11-28 12:00:00",
+            ),
+        ]
+        self._install_exchange_rows(rows)
+
+        rate, rate_date = self.utils.get_latest_rate(
+            "USD",
+            "UGX",
+            transaction_date="2026-11-28",
+            purpose=None,
+            allow_external=False,
+        )
+        self.assertEqual(rate, 3700.0)
+        self.assertEqual(rate_date, "2026-11-28")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -3950,25 +3950,41 @@ class TestItemSaleControls(unittest.TestCase):
 
             free_six = self._promo_free_row(rate=0)
             free_six["qty"] = 6
-            self.assertEqual(
-                self.controls.collect_below_buying_price_errors(
-                    [line_a, line_b, free_six],
-                    invoice_doc=dict(self.PROMO_INVOICE),
-                ),
-                [],
+            erpnext_pkg = types.ModuleType("erpnext")
+            erpnext_accounts = types.ModuleType("erpnext.accounts")
+            erpnext_doctype = types.ModuleType("erpnext.accounts.doctype")
+            erpnext_pr = types.ModuleType("erpnext.accounts.doctype.pricing_rule")
+            erpnext_pr_utils = types.ModuleType("erpnext.accounts.doctype.pricing_rule.utils")
+            erpnext_pr_utils.get_cumulative_qty_and_amount_for_row = (
+                lambda _pr_doc, _args, _doc=None: (0.0, 0.0)
             )
-
-            free_seven = self._promo_free_row(rate=0)
-            free_seven["qty"] = 7
-            self.assertEqual(
-                len(
+            zero_history_modules = {
+                "erpnext": erpnext_pkg,
+                "erpnext.accounts": erpnext_accounts,
+                "erpnext.accounts.doctype": erpnext_doctype,
+                "erpnext.accounts.doctype.pricing_rule": erpnext_pr,
+                "erpnext.accounts.doctype.pricing_rule.utils": erpnext_pr_utils,
+            }
+            with patch.dict(sys.modules, zero_history_modules):
+                self.assertEqual(
                     self.controls.collect_below_buying_price_errors(
-                        [line_a, line_b, free_seven],
+                        [line_a, line_b, free_six],
                         invoice_doc=dict(self.PROMO_INVOICE),
-                    )
-                ),
-                1,
-            )
+                    ),
+                    [],
+                )
+
+                free_seven = self._promo_free_row(rate=0)
+                free_seven["qty"] = 7
+                self.assertEqual(
+                    len(
+                        self.controls.collect_below_buying_price_errors(
+                            [line_a, line_b, free_seven],
+                            invoice_doc=dict(self.PROMO_INVOICE),
+                        )
+                    ),
+                    1,
+                )
 
     def test_cumulative_recursive_pricing_rule_includes_historical_returns_in_thresholds(self):
         def _pricing_rule_utils_modules(historical_qty, historical_amt=0.0):
@@ -4451,6 +4467,240 @@ class TestItemSaleControls(unittest.TestCase):
                         [line, free_one],
                         invoice_doc={**self.PROMO_INVOICE, "doctype": "POS Invoice"},
                     )
+
+    def test_same_foreign_currency_buying_price_uses_for_buying_fx_instead_of_selling_rate(self):
+        self._install_buying_price(rate=10.0, uom="Nos", currency="USD")
+        self.frappe.db.get_value = lambda doctype, name, fieldname=None: (
+            "UGX"
+            if doctype == "Company" and fieldname == "default_currency"
+            else ("USD" if doctype == "Price List" and fieldname == "currency" else None)
+        )
+
+        fx_calls = []
+
+        def fake_get_exchange_rate(from_curr, to_curr, transaction_date=None, args=None):
+            fx_calls.append((from_curr, to_curr, args))
+            if (from_curr, to_curr) == ("USD", "UGX"):
+                return 4050.0 if args == "for_buying" else 3700.0
+            return 1.0
+
+        erpnext_pkg = types.ModuleType("erpnext")
+        erpnext_setup = types.ModuleType("erpnext.setup")
+        erpnext_utils = types.ModuleType("erpnext.setup.utils")
+        erpnext_utils.get_exchange_rate = fake_get_exchange_rate
+
+        invoice_doc = {
+            "company": "Test Co",
+            "currency": "USD",
+            "conversion_rate": 3700.0,
+            "posting_date": "2026-11-28",
+        }
+        with patch.dict(
+            sys.modules,
+            {
+                "erpnext": erpnext_pkg,
+                "erpnext.setup": erpnext_setup,
+                "erpnext.setup.utils": erpnext_utils,
+            },
+        ):
+            # USD 10.50 @ selling 3,700 = UGX 38,850 < USD 10 buying @ 4,050 = UGX 40,500.
+            errors = self.controls.collect_below_buying_price_errors(
+                [{"item_code": "LOW", "item_name": "USD Same-Curr Item", "qty": 1, "rate": 10.50, "uom": "Nos"}],
+                invoice_doc=invoice_doc,
+            )
+            self.assertEqual(len(errors), 1)
+            self.assertAlmostEqual(errors[0]["base_buying_rate"], 40500.0, places=2)
+            self.assertIn(("USD", "UGX", "for_buying"), fx_calls)
+
+            # USD 11.00 @ selling 3,700 = UGX 40,700 >= UGX 40,500 passes.
+            self.assertEqual(
+                self.controls.collect_below_buying_price_errors(
+                    [{"item_code": "LOW", "item_name": "USD Same-Curr Item", "qty": 1, "rate": 11.00, "uom": "Nos"}],
+                    invoice_doc=invoice_doc,
+                ),
+                [],
+            )
+
+    def test_uncalculated_all_zero_draft_with_base_net_zeros_does_not_falsely_block(self):
+        self._install_bin_valuation(valuation_rate=10.0, company_currency="UGX")
+        erpnext_pkg = types.ModuleType("erpnext")
+        erpnext_setup = types.ModuleType("erpnext.setup")
+        erpnext_utils = types.ModuleType("erpnext.setup.utils")
+        erpnext_utils.get_exchange_rate = (
+            lambda from_curr, to_curr, *_args, **_kwargs: 3700.0
+            if (from_curr, to_curr) == ("USD", "UGX")
+            else 1.0
+        )
+
+        with patch.dict(
+            sys.modules,
+            {
+                "erpnext": erpnext_pkg,
+                "erpnext.setup": erpnext_setup,
+                "erpnext.setup.utils": erpnext_utils,
+            },
+        ):
+            # creation.py:1989-2010 derives base_net_amount=0 and base_net_rate=0 from zero net fields;
+            # on an uncalculated [0, 0, 0] draft with expected net total 0.01, none of the 3 rows should block.
+            draft_rows = [
+                PrecisionDoc(
+                    item_code="LOW",
+                    item_name=f"Zero Base Draft {idx}",
+                    qty=1,
+                    rate=0.01,
+                    amount=0.01,
+                    net_amount=0.0,
+                    net_rate=0.0,
+                    base_net_amount=0.0,
+                    base_net_rate=0.0,
+                    uom="Nos",
+                    warehouse="Shop Floor - JBS",
+                    precision_value=2,
+                )
+                for idx in (1, 2, 3)
+            ]
+            invoice = PrecisionDoc(
+                company="Test Co",
+                currency="USD",
+                conversion_rate=3700.0,
+                apply_discount_on="Net Total",
+                discount_amount=0.02,
+                precision_value=2,
+            )
+            self.assertEqual(
+                self.controls.collect_below_buying_price_errors(
+                    draft_rows,
+                    invoice_doc=invoice,
+                ),
+                [],
+            )
+
+    def test_buying_price_list_price_not_uom_dependent_does_not_scale_stock_uom_fallback(self):
+        self._install_buying_price(rate=8.0, uom="Each", currency="USD")
+        base_get_all = self.frappe.get_all
+
+        def get_all_with_uom(doctype, *args, **kwargs):
+            if doctype == "Item":
+                return [{"item_code": "LOW", "stock_uom": "Each", "is_stock_item": 1}]
+            if doctype == "UOM Conversion Detail":
+                return [{"parent": "LOW", "uom": "Box", "conversion_factor": 10.0}]
+            return base_get_all(doctype, *args, **kwargs)
+
+        self.frappe.get_all = get_all_with_uom
+
+        def fake_db_get_value(doctype, name, fieldname=None):
+            if doctype == "Company" and fieldname == "default_currency":
+                return "USD"
+            if doctype == "Price List" and fieldname == "currency":
+                return "USD"
+            if doctype == "Price List" and fieldname == "price_not_uom_dependent":
+                return 1
+            return None
+
+        self.frappe.db.get_value = fake_db_get_value
+        invoice_doc = {"company": "Test Co", "currency": "USD", "conversion_rate": 1.0}
+
+        # With price_not_uom_dependent=1, stock-UOM fallback stays 8 (not 8 * 10 = 80).
+        self.assertEqual(
+            self.controls.collect_below_buying_price_errors(
+                [{"item_code": "LOW", "item_name": "Boxed PNUD Item", "qty": 1, "rate": 10.0, "uom": "Box"}],
+                invoice_doc=invoice_doc,
+            ),
+            [],
+        )
+        low_errors = self.controls.collect_below_buying_price_errors(
+            [{"item_code": "LOW", "item_name": "Boxed PNUD Item", "qty": 1, "rate": 7.0, "uom": "Box"}],
+            invoice_doc=invoice_doc,
+        )
+        self.assertEqual(len(low_errors), 1)
+        self.assertAlmostEqual(low_errors[0]["buying_rate"], 8.0, places=2)
+
+    def test_legitimately_rounded_tax_inclusive_net_passes_server_floor(self):
+        self._install_bin_valuation(valuation_rate=35.0, company_currency="UGX")
+        erpnext_pkg = types.ModuleType("erpnext")
+        erpnext_setup = types.ModuleType("erpnext.setup")
+        erpnext_utils = types.ModuleType("erpnext.setup.utils")
+        erpnext_utils.get_exchange_rate = (
+            lambda from_curr, to_curr, *_args, **_kwargs: 3700.0
+            if (from_curr, to_curr) == ("USD", "UGX")
+            else 1.0
+        )
+
+        # 1 x USD 0.01 with 18% inclusive VAT -> ERPNext rounds net_amount to 0.01 -> base_net_amount = UGX 37 >= UGX 35.
+        row = PrecisionDoc(
+            item_code="LOW",
+            item_name="Rounded Inclusive Item",
+            qty=1,
+            rate=0.01,
+            amount=0.01,
+            net_amount=0.01,
+            net_rate=0.01,
+            base_net_amount=37.0,
+            base_net_rate=37.0,
+            uom="Nos",
+            warehouse="Shop Floor - JBS",
+            precision_value=2,
+        )
+        invoice = PrecisionDoc(
+            company="Test Co",
+            currency="USD",
+            conversion_rate=3700.0,
+            taxes=[
+                {
+                    "charge_type": "On Net Total",
+                    "account_head": "VAT 18% - CO",
+                    "rate": 18,
+                    "included_in_print_rate": 1,
+                }
+            ],
+            precision_value=2,
+        )
+        with patch.dict(
+            sys.modules,
+            {
+                "erpnext": erpnext_pkg,
+                "erpnext.setup": erpnext_setup,
+                "erpnext.setup.utils": erpnext_utils,
+            },
+        ):
+            self.assertEqual(
+                self.controls.collect_below_buying_price_errors([row], invoice_doc=invoice),
+                [],
+            )
+
+            # Floor of UGX 38 > UGX 37 still blocks.
+            self._install_bin_valuation(valuation_rate=38.0, company_currency="UGX")
+            self.assertEqual(
+                len(self.controls.collect_below_buying_price_errors([row], invoice_doc=invoice)),
+                1,
+            )
+
+    def test_cumulative_pricing_rule_fails_closed_when_history_helper_unimportable(self):
+        self._install_promotional_rule(
+            apply_on="Item Code",
+            mixed_conditions=0,
+            is_cumulative=1,
+            is_recursive=1,
+            min_qty=10,
+            max_qty=0,
+            recurse_for=1,
+            free_qty=1,
+            round_free_qty=1,
+        )
+        line = self._promo_trigger_row()
+        line["qty"] = 1
+        free_one = self._promo_free_row(rate=0)
+        free_one["qty"] = 1
+
+        # Blocking erpnext.accounts.doctype.pricing_rule.utils with None forces ImportError;
+        # cumulative promotion MUST fail closed rather than setting enforce_min=False.
+        with patch.dict(sys.modules, {"erpnext.accounts.doctype.pricing_rule.utils": None}):
+            errors = self.controls.collect_below_buying_price_errors(
+                [line, free_one],
+                invoice_doc={**self.PROMO_INVOICE, "doctype": "POS Invoice"},
+            )
+            self.assertEqual(len(errors), 1)
+            self.assertEqual(errors[0]["item_code"], "LOW")
 
 
 if __name__ == "__main__":

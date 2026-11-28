@@ -1631,6 +1631,181 @@ describe("usePaymentSubmission", () => {
 		).rejects.toThrow(/Cent Checkout Item 1 is selling at 0/i);
 	});
 
+	it("applies authoritative invoice header FX to cart-only checkout when invoiceDoc.items is empty", async () => {
+		const buildSubmission = (sellingRate: number) => {
+			const invoiceDoc = ref<any>({
+				is_return: 0,
+				currency: "USD",
+				conversion_rate: 3700,
+				items: [],
+				payments: [
+					{ mode_of_payment: "Cash", amount: sellingRate, type: "Cash" },
+				],
+				rounded_total: sellingRate,
+				grand_total: sellingRate,
+			});
+
+			const cartItems = ref([
+				{
+					item_code: "CART-ONLY-FX",
+					item_name: "Cart Only Stale FX Item",
+					qty: 1,
+					rate: sellingRate,
+					currency: "USD",
+					company_currency: "UGX",
+					conversion_rate: 1,
+					valuation_rate: 37000,
+				},
+			]);
+
+			return usePaymentSubmission({
+				invoiceDoc,
+				posProfile: ref({
+					posa_below_cost_action: "Block",
+					posa_missing_cost_action: "Block",
+				}),
+				stockSettings: ref({}),
+				invoiceType: ref("Invoice"),
+				formatFloat: (value) => Number(value || 0),
+				stores: {
+					toastStore: { show: vi.fn() },
+					invoiceStore: {
+						invoiceDoc: invoiceDoc.value,
+						items: cartItems,
+					},
+				},
+				currencyPrecision: ref(2),
+				diff_payment: ref(0) as any,
+				isCashback: ref(true),
+			});
+		};
+
+		await expect(buildSubmission(15).validateSubmission(true)).resolves.toBe(
+			true,
+		);
+		await expect(buildSubmission(8).validateSubmission(true)).rejects.toThrow(
+			/Cart Only Stale FX Item is selling at 8, below Warehouse Valuation 10/i,
+		);
+	});
+
+	it("matches reordered anonymous duplicate-SKU rows by UOM before positional/SKU fallback", async () => {
+		const buildSubmission = (eachRate: number) => {
+			const invoiceDoc = ref<any>({
+				is_return: 0,
+				currency: "USD",
+				items: [
+					{
+						item_code: "UOM-DUP-SKU",
+						item_name: "UOM Dup Each",
+						uom: "Each",
+						qty: 1,
+						rate: eachRate,
+					},
+					{
+						item_code: "UOM-DUP-SKU",
+						item_name: "UOM Dup Box",
+						uom: "Box",
+						qty: 1,
+						rate: 90,
+					},
+				],
+				payments: [
+					{
+						mode_of_payment: "Cash",
+						amount: eachRate + 90,
+						type: "Cash",
+					},
+				],
+				rounded_total: eachRate + 90,
+				grand_total: eachRate + 90,
+			});
+
+			const cartItems = ref([
+				{
+					item_code: "UOM-DUP-SKU",
+					item_name: "UOM Dup Box",
+					uom: "Box",
+					qty: 1,
+					rate: 90,
+					trade_price: 80,
+				},
+				{
+					item_code: "UOM-DUP-SKU",
+					item_name: "UOM Dup Each",
+					uom: "Each",
+					qty: 1,
+					rate: 10,
+					trade_price: 8,
+				},
+			]);
+
+			return usePaymentSubmission({
+				invoiceDoc,
+				posProfile: ref({ posa_below_cost_action: "Block" }),
+				stockSettings: ref({}),
+				invoiceType: ref("Invoice"),
+				formatFloat: (value) => Number(value || 0),
+				stores: {
+					toastStore: { show: vi.fn() },
+					invoiceStore: {
+						invoiceDoc: invoiceDoc.value,
+						items: cartItems,
+					},
+				},
+				currencyPrecision: ref(2),
+				diff_payment: ref(0) as any,
+				isCashback: ref(true),
+			});
+		};
+
+		await expect(buildSubmission(10).validateSubmission(true)).resolves.toBe(
+			true,
+		);
+		await expect(buildSubmission(6).validateSubmission(true)).rejects.toThrow(
+			/UOM Dup Each is selling at 6, below Trade Price 8/i,
+		);
+	});
+
+	it("accepts selling rate 10.00 against valuation 10.004 at 2-decimal currency precision", async () => {
+		const buildSubmission = (valuationRate: number) => {
+			const invoiceDoc = ref<any>({
+				is_return: 0,
+				currency: "USD",
+				items: [
+					{
+						item_code: "PREC-CHECKOUT",
+						item_name: "Precision Checkout Item",
+						qty: 1,
+						rate: 10.0,
+						valuation_rate: valuationRate,
+					},
+				],
+				payments: [{ mode_of_payment: "Cash", amount: 10, type: "Cash" }],
+				rounded_total: 10,
+				grand_total: 10,
+			});
+
+			return usePaymentSubmission({
+				invoiceDoc,
+				posProfile: ref({ posa_below_cost_action: "Block" }),
+				stockSettings: ref({}),
+				invoiceType: ref("Invoice"),
+				formatFloat: (value) => Number(value || 0),
+				stores: { toastStore: { show: vi.fn() } },
+				currencyPrecision: ref(2),
+				diff_payment: ref(0) as any,
+				isCashback: ref(true),
+			});
+		};
+
+		await expect(
+			buildSubmission(10.004).validateSubmission(true),
+		).resolves.toBe(true);
+		await expect(
+			buildSubmission(10.006).validateSubmission(true),
+		).rejects.toThrow(/Precision Checkout Item is selling at 10/i);
+	});
+
 	it("defers print and schedules background wait when invoice submission is queued", async () => {
 		const invoiceService = (
 			await import("../src/posapp/services/invoiceService")

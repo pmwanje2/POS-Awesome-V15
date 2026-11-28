@@ -1387,4 +1387,114 @@ describe("loss prevention", () => {
 			}),
 		).toEqual([]);
 	});
+
+	it("honors legitimately rounded ERPNext tax-inclusive net_amount (1 x USD 0.01 @ 18% VAT -> UGX 37 >= UGX 35)", () => {
+		const taxes = [
+			{
+				charge_type: "On Net Total",
+				account_head: "VAT 18% - CO",
+				rate: 18,
+				included_in_print_rate: 1,
+			},
+		];
+		const baseItem = {
+			item_code: "INCL-ROUNDED",
+			item_name: "Rounded Inclusive Item",
+			qty: 1,
+			rate: 0.01,
+			net_amount: 0.01,
+			net_rate: 0.01,
+			base_net_rate: 37,
+			currency: "USD",
+			company_currency: "UGX",
+			conversion_rate: 3700,
+		};
+
+		expect(
+			findLossRiskItems([{ ...baseItem, valuation_rate: 35 }], {
+				taxes,
+				currencyPrecision: 2,
+			}),
+		).toEqual([]);
+
+		const blocked = findLossRiskItems([{ ...baseItem, valuation_rate: 38 }], {
+			taxes,
+			currencyPrecision: 2,
+		});
+		expect(blocked).toHaveLength(1);
+		expect(blocked[0]?.itemCode).toBe("INCL-ROUNDED");
+	});
+
+	it("compares selling rate and cost floor at ERPNext currency precision rather than fixed 0.0001 epsilon", () => {
+		// At 2 decimals, 10.00 vs 10.004 both round to 10.00 (passes), whereas 10.00 vs 10.006 rounds to 10.00 < 10.01 (blocks).
+		expect(
+			getItemLossRisk(
+				{
+					item_code: "PREC-2DP-OK",
+					qty: 1,
+					rate: 10.0,
+					valuation_rate: 10.004,
+				},
+				{ currencyPrecision: 2 },
+			),
+		).toBeNull();
+
+		expect(
+			getItemLossRisk(
+				{
+					item_code: "PREC-2DP-LOW",
+					qty: 1,
+					rate: 10.0,
+					valuation_rate: 10.006,
+				},
+				{ currencyPrecision: 2 },
+			)?.belowCost,
+		).toBe(true);
+
+		// At 0 decimals (UGX), 4500 vs 4500.4 both round to 4500 (passes), whereas 4500 vs 4500.6 blocks.
+		expect(
+			getItemLossRisk(
+				{
+					item_code: "PREC-0DP-OK",
+					qty: 1,
+					rate: 4500,
+					valuation_rate: 4500.4,
+				},
+				{ currencyPrecision: 0 },
+			),
+		).toBeNull();
+
+		expect(
+			getItemLossRisk(
+				{
+					item_code: "PREC-0DP-LOW",
+					qty: 1,
+					rate: 4500,
+					valuation_rate: 4500.6,
+				},
+				{ currencyPrecision: 0 },
+			)?.belowCost,
+		).toBe(true);
+	});
+
+	it("does not multiply stock-UOM _buying_prices_by_uom fallback by conversion_factor when price_not_uom_dependent=1", () => {
+		const floor = getItemCostFloor({
+			item_code: "PNUD-TABLE",
+			uom: "Box",
+			stock_uom: "Each",
+			conversion_factor: 10,
+			currency: "USD",
+			company_currency: "USD",
+			conversion_rate: 1,
+			_buying_prices_by_uom: {
+				Each: {
+					price_list_rate: 8,
+					base_price_list_rate: 8,
+					currency: "USD",
+					price_not_uom_dependent: 1,
+				},
+			},
+		});
+		expect(floor?.rate).toBeCloseTo(8);
+	});
 });
