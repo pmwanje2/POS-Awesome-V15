@@ -145,6 +145,107 @@ class TestStripClientFreebies(unittest.TestCase):
         self.assertEqual(len(payload["items"]), 1)
         self.assertEqual(payload["items"][0]["is_free_item"], 1)
 
+    def test_merge_duplicate_taxes_preserves_distinct_chained_row_id_rows_for_zero_net_floor_check(
+        self,
+    ):
+        class InvoiceStub(dict):
+            def set(self, key, value):
+                self[key] = value
+
+            def calculate_taxes_and_totals(self):
+                return None
+
+        taxes = [
+            {
+                "charge_type": "On Item Quantity",
+                "account_head": "Excise 1 - CO",
+                "rate": 10.0,
+                "included_in_print_rate": 1,
+            },
+            {
+                "charge_type": "On Item Quantity",
+                "account_head": "Excise 2 - CO",
+                "rate": 20.0,
+                "included_in_print_rate": 1,
+            },
+            {
+                "charge_type": "On Previous Row Amount",
+                "account_head": "VAT - CO",
+                "row_id": "1",
+                "rate": 10.0,
+                "included_in_print_rate": 1,
+            },
+            {
+                "charge_type": "On Previous Row Amount",
+                "account_head": "VAT - CO",
+                "row_id": "2",
+                "rate": 10.0,
+                "included_in_print_rate": 1,
+            },
+        ]
+        invoice_doc = InvoiceStub(
+            company="Test Co",
+            currency="USD",
+            conversion_rate=1.0,
+            taxes=list(taxes),
+        )
+
+        self.stock._merge_duplicate_taxes(invoice_doc, recalculate=False)
+
+        self.assertEqual(len(invoice_doc["taxes"]), 4)
+        self.assertEqual(
+            [row.get("row_id") for row in invoice_doc["taxes"][2:]],
+            ["1", "2"],
+        )
+
+        # Verify end-to-end that the preserved chained rows yield 0 net at gross 33
+        # and are rejected against a 0.50 floor.
+        frappe_mod = sys.modules["frappe"]
+        frappe_mod.get_meta = lambda _dt: types.SimpleNamespace(has_field=lambda _f: False)
+        frappe_mod.db.get_value = lambda doctype, *args, **kwargs: (
+            "USD" if doctype == "Company" else None
+        )
+        frappe_mod.db.exists = lambda *args, **kwargs: False
+
+        def fake_get_all(doctype, *args, **kwargs):
+            if doctype == "Item":
+                return [{"item_code": "LOW", "stock_uom": "Nos", "is_stock_item": 1}]
+            if doctype == "Bin":
+                return [
+                    {
+                        "item_code": "LOW",
+                        "warehouse": "Shop Floor - JBS",
+                        "valuation_rate": 0.50,
+                    }
+                ]
+            return []
+
+        frappe_mod.get_all = fake_get_all
+
+        controls_path = REPO_ROOT / "posawesome" / "posawesome" / "api" / "item_sale_controls.py"
+        spec = importlib.util.spec_from_file_location(
+            "posawesome.posawesome.api.item_sale_controls", controls_path
+        )
+        controls = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(controls)
+
+        errors = controls.collect_below_buying_price_errors(
+            [
+                {
+                    "item_code": "LOW",
+                    "item_name": "Double Chained Tax Item",
+                    "qty": 1,
+                    "rate": 33.0,
+                    "amount": 33.0,
+                    "uom": "Nos",
+                    "warehouse": "Shop Floor - JBS",
+                }
+            ],
+            invoice_doc=invoice_doc,
+        )
+        self.assertEqual(len(errors), 1)
+        self.assertAlmostEqual(errors[0]["selling_rate"], 0.0, places=2)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -565,4 +565,135 @@ describe("loss prevention", () => {
 			expect(getItemLossRisk(item)).toBeNull();
 		}
 	});
+
+	it("matches ERPNext Grand Total discount distribution on taxed items", () => {
+		const exclusiveTax = [
+			{
+				charge_type: "On Net Total",
+				rate: 10,
+				included_in_print_rate: 0,
+			},
+		];
+		expect(
+			getItemLossRisk(
+				{
+					item_code: "GT-TAX-OK",
+					qty: 1,
+					rate: 100,
+					net_rate: 90,
+					trade_price: 89.5,
+				},
+				{
+					invoiceDiscountPercentage: 11,
+					applyDiscountOn: "Grand Total",
+					taxes: exclusiveTax,
+				},
+			),
+		).toBeNull();
+
+		const below = getItemLossRisk(
+			{
+				item_code: "GT-TAX-LOW",
+				qty: 1,
+				rate: 100,
+				net_rate: 90,
+				trade_price: 90.5,
+			},
+			{
+				invoiceDiscountPercentage: 11,
+				applyDiscountOn: "Grand Total",
+				taxes: exclusiveTax,
+			},
+		);
+		expect(below?.belowCost).toBe(true);
+		expect(below?.sellingRate).toBeCloseTo(90);
+	});
+
+	it("does not poison _company_buying_price with 1:1 when price-list FX is missing in useItemCurrency", () => {
+		const { applyCurrencyConversionToItem } = useItemCurrency();
+		const item: Record<string, unknown> = {
+			item_code: "USD-PL-NO-FX",
+			qty: 1,
+			rate: 15,
+			price_list_rate: 15,
+			currency: "USD",
+			buying_rate_currency: "USD",
+			trade_price: 10,
+			buying_rate: 10,
+			uom: "Nos",
+			stock_uom: "Nos",
+			conversion_factor: 1,
+		};
+
+		applyCurrencyConversionToItem(item, {
+			company: { default_currency: "UGX" },
+			pos_profile: { currency: "UGX" },
+			price_list_currency: "USD",
+			selected_currency: "USD",
+			exchange_rate: 1,
+			conversion_rate: 0,
+			currency_precision: 2,
+		});
+
+		expect(item._company_buying_price).toBeUndefined();
+		expect(item.base_buying_rate).toBeUndefined();
+
+		applyCurrencyConversionToItem(item, {
+			company: { default_currency: "UGX" },
+			pos_profile: { currency: "UGX" },
+			price_list_currency: "USD",
+			selected_currency: "USD",
+			exchange_rate: 1,
+			conversion_rate: 3700,
+			currency_precision: 2,
+		});
+
+		expect(item._company_buying_price).toBeCloseTo(37000);
+		expect(item.base_buying_rate).toBeCloseTo(37000);
+	});
+
+	it("returns null floor when company-currency valuation cannot be converted even if lower invoice-currency trade_price exists", () => {
+		const item = {
+			item_code: "HIDDEN-VALUATION",
+			qty: 1,
+			rate: 15,
+			currency: "USD",
+			company_currency: "UGX",
+			conversion_rate: 0,
+			uom: "Nos",
+			stock_uom: "Nos",
+			conversion_factor: 1,
+			buying_rate_currency: "USD",
+			trade_price: 9,
+			valuation_rate: 74000,
+		};
+
+		expect(getItemCostFloor(item)).toBeNull();
+		expect(getItemLossRisk(item)).toBeNull();
+	});
+
+	it("accepts valid positive FX rates below 0.0001 such as USD/VND 0.00004", () => {
+		const item = {
+			item_code: "VND-FX-SMALL",
+			qty: 1,
+			rate: 20000,
+			currency: "VND",
+			company_currency: "USD",
+			conversion_rate: 0.00004,
+			uom: "Nos",
+			stock_uom: "Nos",
+			conversion_factor: 1,
+			valuation_rate: 1,
+		};
+
+		const floor = getItemCostFloor(item);
+		expect(floor).not.toBeNull();
+		expect(floor?.baseCurrency).toBe(true);
+		expect(floor?.rate).toBeCloseTo(1);
+
+		const risk = getItemLossRisk(item);
+		expect(risk?.belowCost).toBe(true);
+		expect(risk?.sellingRate).toBeCloseTo(20000);
+		expect(risk?.costRate).toBeCloseTo(25000);
+	});
 });

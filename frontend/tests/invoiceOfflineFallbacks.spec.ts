@@ -235,4 +235,60 @@ describe("invoice offline fallbacks", () => {
 		expect(invoiceStore.items[0].rate).toBe(10);
 		expect(invoiceStore.grossTotal).toBe(10);
 	});
+
+	it("does not poison _company_buying_price with 1:1 when price-list FX is missing in useInvoiceCurrency", async () => {
+		const { useUIStore } = await import("../src/posapp/stores/uiStore");
+		const { useInvoiceStore } = await import("../src/posapp/stores/invoiceStore");
+		const { useInvoiceCurrency } = await import(
+			"../src/posapp/composables/pos/invoice/useInvoiceCurrency"
+		);
+
+		const uiStore = useUIStore();
+		uiStore.setPosProfile({
+			name: "POS-1",
+			company: "Test Company",
+			currency: "UGX",
+			selling_price_list: "USD List",
+			posa_decimal_precision: "2",
+		} as any);
+		uiStore.setCompanyDoc({
+			default_currency: "UGX",
+		});
+
+		const invoiceStore = useInvoiceStore();
+		invoiceStore.addItem({
+			item_code: "ITEM-USD-NOFX",
+			qty: 1,
+			rate: 15,
+			price_list_rate: 15,
+			original_rate: 15,
+			original_currency: "USD",
+			currency: "USD",
+			buying_rate_currency: "USD",
+			trade_price: 10,
+			buying_rate: 10,
+			conversion_factor: 1,
+			discount_amount: 0,
+			base_discount_amount: 0,
+			amount: 15,
+			posa_row_id: "row-nofx",
+		} as any);
+
+		const invoiceCurrency = useInvoiceCurrency();
+		invoiceCurrency.price_list_currency.value = "USD";
+		invoiceCurrency.selected_currency.value = "USD";
+		invoiceCurrency.exchange_rate.value = 1;
+		invoiceCurrency.conversion_rate.value = 0;
+
+		await invoiceCurrency.update_item_rates();
+
+		expect(invoiceStore.items[0]._company_buying_price).toBeUndefined();
+		expect(invoiceStore.items[0].base_buying_rate).toBeUndefined();
+
+		invoiceCurrency.conversion_rate.value = 3700;
+		await invoiceCurrency.update_item_rates();
+
+		expect(invoiceStore.items[0]._company_buying_price).toBeCloseTo(37000);
+		expect(invoiceStore.items[0].base_buying_rate).toBeCloseTo(37000);
+	});
 });

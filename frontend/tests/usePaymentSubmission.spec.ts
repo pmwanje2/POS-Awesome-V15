@@ -342,6 +342,143 @@ describe("usePaymentSubmission", () => {
 		await expect(allowSubmit.validateSubmission(true)).resolves.toBe(true);
 	});
 
+	it("matches ERPNext Grand Total discount distribution during checkout validation", async () => {
+		const buildTaxedInvoice = (floor: number, includeNativeNet: boolean) =>
+			ref<any>({
+				is_return: 0,
+				apply_discount_on: "Grand Total",
+				discount_amount: 11,
+				total_taxes_and_charges: 9,
+				grand_total: 99,
+				rounded_total: 99,
+				taxes: [
+					{
+						charge_type: "On Net Total",
+						account_head: "VAT 10% - CO",
+						rate: 10,
+						included_in_print_rate: 0,
+						tax_amount: 9,
+					},
+				],
+				items: [
+					{
+						item_code: "TAXED-100",
+						item_name: "Taxed Item",
+						qty: 1,
+						rate: 100,
+						...(includeNativeNet ? { net_rate: 90 } : {}),
+						trade_price: floor,
+					},
+				],
+				payments: [{ mode_of_payment: "Cash", amount: 99, type: "Cash" }],
+			});
+
+		for (const includeNativeNet of [true, false]) {
+			const acceptSubmit = usePaymentSubmission({
+				invoiceDoc: buildTaxedInvoice(89.5, includeNativeNet),
+				posProfile: ref({}),
+				stockSettings: ref({}),
+				invoiceType: ref("Invoice"),
+				formatFloat: (value) => Number(value || 0),
+				stores: { toastStore: { show: vi.fn() } },
+				diff_payment: ref(0) as any,
+				isCashback: ref(true),
+			});
+			await expect(acceptSubmit.validateSubmission(true)).resolves.toBe(true);
+
+			const blockSubmit = usePaymentSubmission({
+				invoiceDoc: buildTaxedInvoice(90.5, includeNativeNet),
+				posProfile: ref({}),
+				stockSettings: ref({}),
+				invoiceType: ref("Invoice"),
+				formatFloat: (value) => Number(value || 0),
+				stores: { toastStore: { show: vi.fn() } },
+				diff_payment: ref(0) as any,
+				isCashback: ref(true),
+			});
+			await expect(blockSubmit.validateSubmission(true)).rejects.toThrow(
+				/Taxed Item is selling at 90, below Trade Price 90\.5/i,
+			);
+		}
+	});
+
+	it("blocks checkout when company-currency valuation is unconvertible even if lower invoice-currency trade_price exists", async () => {
+		const invoiceDoc = ref<any>({
+			is_return: 0,
+			currency: "USD",
+			items: [
+				{
+					item_code: "HIDDEN-VAL",
+					item_name: "Hidden Valuation Item",
+					qty: 1,
+					rate: 15,
+					currency: "USD",
+					company_currency: "UGX",
+					conversion_rate: 0,
+					buying_rate_currency: "USD",
+					trade_price: 9,
+					valuation_rate: 74000,
+				},
+			],
+			payments: [{ mode_of_payment: "Cash", amount: 15, type: "Cash" }],
+			rounded_total: 15,
+			grand_total: 15,
+		});
+
+		const blockSubmit = usePaymentSubmission({
+			invoiceDoc,
+			posProfile: ref({ posa_missing_cost_action: "Block" }),
+			stockSettings: ref({}),
+			invoiceType: ref("Invoice"),
+			formatFloat: (value) => Number(value || 0),
+			stores: { toastStore: { show: vi.fn() } },
+			diff_payment: ref(0) as any,
+			isCashback: ref(true),
+		});
+		await expect(blockSubmit.validateSubmission(true)).rejects.toThrow(
+			/no valid buying floor is available for Hidden Valuation Item/i,
+		);
+	});
+
+	it("blocks below-cost VND sale at 0.00004 USD/VND under both Block and Allow missing-cost policies", async () => {
+		const buildVndInvoice = () =>
+			ref<any>({
+				is_return: 0,
+				currency: "VND",
+				items: [
+					{
+						item_code: "VND-SMALL-FX",
+						item_name: "VND Item",
+						qty: 1,
+						rate: 20000,
+						currency: "VND",
+						company_currency: "USD",
+						conversion_rate: 0.00004,
+						valuation_rate: 1,
+					},
+				],
+				payments: [{ mode_of_payment: "Cash", amount: 20000, type: "Cash" }],
+				rounded_total: 20000,
+				grand_total: 20000,
+			});
+
+		for (const missingCostAction of ["Block", "Allow"] as const) {
+			const submission = usePaymentSubmission({
+				invoiceDoc: buildVndInvoice(),
+				posProfile: ref({ posa_missing_cost_action: missingCostAction }),
+				stockSettings: ref({}),
+				invoiceType: ref("Invoice"),
+				formatFloat: (value) => Number(value || 0),
+				stores: { toastStore: { show: vi.fn() } },
+				diff_payment: ref(0) as any,
+				isCashback: ref(true),
+			});
+			await expect(submission.validateSubmission(true)).rejects.toThrow(
+				/VND Item is selling at 20000, below Warehouse Valuation 25000/i,
+			);
+		}
+	});
+
 	it("defers print and schedules background wait when invoice submission is queued", async () => {
 		const invoiceService = (
 			await import("../src/posapp/services/invoiceService")
