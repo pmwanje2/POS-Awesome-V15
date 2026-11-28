@@ -23,6 +23,7 @@ type CurrencyPair = {
 type CurrencyMatrixFetcher = (_args: {
 	posProfile: SyncScopedProfile;
 	currencyPairs?: CurrencyPair[];
+	backfillPairs?: CurrencyPair[];
 	watermark?: string | null;
 	offset?: number;
 	schemaVersion?: string | null;
@@ -31,10 +32,24 @@ type CurrencyMatrixFetcher = (_args: {
 type CurrencyMatrixSyncArgs = {
 	posProfile: SyncScopedProfile;
 	currencyPairs?: CurrencyPair[];
+	backfillPairs?: CurrencyPair[];
+	syncedCurrencyPairs?: string[] | null;
 	watermark?: string | null;
 	schemaVersion?: string | null;
 	fetcher: CurrencyMatrixFetcher;
 };
+
+function toCanonicalPairKey(
+	fromCurrency: unknown,
+	toCurrency: unknown,
+): string | null {
+	const from = String(fromCurrency || "").trim();
+	const to = String(toCurrency || "").trim();
+	if (!from || !to || from === to) {
+		return null;
+	}
+	return `${from}::${to}`;
+}
 
 export async function syncCurrencyMatrixResource(
 	args: CurrencyMatrixSyncArgs,
@@ -47,11 +62,26 @@ export async function syncCurrencyMatrixResource(
 	let exchangeRateCount = 0;
 	let offset = 0;
 	let finalResponse: SyncResponse = {};
+	const observedPairs = new Set<string>(
+		args.watermark && Array.isArray(args.syncedCurrencyPairs)
+			? args.syncedCurrencyPairs.filter(Boolean)
+			: [],
+	);
+	for (const pair of [
+		...(args.currencyPairs || []),
+		...(args.backfillPairs || []),
+	]) {
+		const key = toCanonicalPairKey(pair?.from_currency, pair?.to_currency);
+		if (key) observedPairs.add(key);
+	}
 
 	while (true) {
 		const response = await args.fetcher({
 			posProfile: args.posProfile,
 			currencyPairs: args.currencyPairs || [],
+			...(args.backfillPairs?.length
+				? { backfillPairs: args.backfillPairs }
+				: {}),
 			watermark: args.watermark || null,
 			offset,
 			schemaVersion: args.schemaVersion,
@@ -72,6 +102,7 @@ export async function syncCurrencyMatrixResource(
 				posProfile: args.posProfile,
 				response,
 				watermark: args.watermark,
+				syncedCurrencyPairs: [],
 			});
 			return buildResourceSyncResult(
 				"currency_matrix",
@@ -79,6 +110,14 @@ export async function syncCurrencyMatrixResource(
 				response,
 				args.watermark,
 			);
+		}
+
+		for (const pair of response?.synced_pairs || []) {
+			const key = toCanonicalPairKey(
+				pair?.from_currency,
+				pair?.to_currency,
+			);
+			if (key) observedPairs.add(key);
 		}
 
 		for (const change of response?.changes || []) {
@@ -94,6 +133,11 @@ export async function syncCurrencyMatrixResource(
 			if (!String(change?.key || "").startsWith("exchange_rate::")) {
 				if (String(change?.key || "").startsWith("currency_rate::")) {
 					const row = change?.data || {};
+					const key = toCanonicalPairKey(
+						row.from_currency,
+						row.to_currency,
+					);
+					if (key) observedPairs.add(key);
 					await currencyRateRepository.upsertMany([
 						{
 							...row,
@@ -106,12 +150,18 @@ export async function syncCurrencyMatrixResource(
 			}
 
 			const rate = change?.data || {};
+			const pairKey = toCanonicalPairKey(
+				rate.from_currency,
+				rate.to_currency,
+			);
+			if (pairKey) observedPairs.add(pairKey);
 			saveExchangeRateCache({
 				profileName: args.posProfile.name,
 				company: args.posProfile.company || undefined,
 				fromCurrency: rate.from_currency,
 				toCurrency: rate.to_currency,
 				date: rate.date,
+				...(rate.purpose ? { purpose: rate.purpose } : {}),
 				exchange_rate: rate.exchange_rate,
 			});
 			exchangeRateCount += 1;
@@ -162,6 +212,7 @@ export async function syncCurrencyMatrixResource(
 		posProfile: args.posProfile,
 		response: finalResponse,
 		watermark: args.watermark,
+		syncedCurrencyPairs: Array.from(observedPairs).sort(),
 	});
 	return buildResourceSyncResult(
 		"currency_matrix",

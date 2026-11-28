@@ -207,7 +207,7 @@ class CurrencyRateRepository {
 		}
 	}
 
-	async findLatestOnOrBefore(
+	async findDirectLatestOnOrBefore(
 		lookup: CurrencyRateLookup,
 	): Promise<OfflineCurrencyRateRecord | null> {
 		const rows = await this.findForPair(lookup);
@@ -218,46 +218,66 @@ class CurrencyRateRepository {
 						staleDays: lookup.staleDays,
 					}
 				: await this.getExchangeSettings();
-		const direct = selectCurrencyRateRecord(
+		return selectCurrencyRateRecord(
 			rows,
 			lookup.date,
 			lookup.purpose,
 			selectionOptions,
 		);
+	}
+
+	async findInverseLatestOnOrBefore(
+		lookup: CurrencyRateLookup,
+	): Promise<OfflineCurrencyRateRecord | null> {
+		if (
+			!lookup.fromCurrency ||
+			!lookup.toCurrency ||
+			lookup.fromCurrency === lookup.toCurrency
+		) {
+			return null;
+		}
+		const selectionOptions =
+			lookup.allowStale !== undefined
+				? {
+						allowStale: lookup.allowStale,
+						staleDays: lookup.staleDays,
+					}
+				: await this.getExchangeSettings();
+		// Mirror ERPNext setup/utils.py:128-134: when direct rate is unavailable,
+		// fall back to reverse pair with the opposite purpose (for_buying <-> for_selling).
+		const reverseRows = await this.findForPair({
+			...lookup,
+			fromCurrency: lookup.toCurrency,
+			toCurrency: lookup.fromCurrency,
+		});
+		const reversePurpose = oppositeCurrencyPurpose(lookup.purpose);
+		const reverse = selectCurrencyRateRecord(
+			reverseRows,
+			lookup.date,
+			reversePurpose,
+			selectionOptions,
+		);
+		const reverseRate = Number(reverse?.exchange_rate || 0);
+		if (reverse && Number.isFinite(reverseRate) && reverseRate > 0) {
+			return {
+				...reverse,
+				from_currency: lookup.fromCurrency,
+				to_currency: lookup.toCurrency,
+				exchange_rate: 1 / reverseRate,
+				_inverted: true,
+			};
+		}
+		return null;
+	}
+
+	async findLatestOnOrBefore(
+		lookup: CurrencyRateLookup,
+	): Promise<OfflineCurrencyRateRecord | null> {
+		const direct = await this.findDirectLatestOnOrBefore(lookup);
 		if (direct) {
 			return direct;
 		}
-		if (
-			lookup.fromCurrency &&
-			lookup.toCurrency &&
-			lookup.fromCurrency !== lookup.toCurrency
-		) {
-			// Mirror ERPNext setup/utils.py:128-134: when direct rate is unavailable,
-			// fall back to reverse pair with the opposite purpose (for_buying <-> for_selling).
-			const reverseRows = await this.findForPair({
-				...lookup,
-				fromCurrency: lookup.toCurrency,
-				toCurrency: lookup.fromCurrency,
-			});
-			const reversePurpose = oppositeCurrencyPurpose(lookup.purpose);
-			const reverse = selectCurrencyRateRecord(
-				reverseRows,
-				lookup.date,
-				reversePurpose,
-				selectionOptions,
-			);
-			const reverseRate = Number(reverse?.exchange_rate || 0);
-			if (reverse && Number.isFinite(reverseRate) && reverseRate > 0) {
-				return {
-					...reverse,
-					from_currency: lookup.fromCurrency,
-					to_currency: lookup.toCurrency,
-					exchange_rate: 1 / reverseRate,
-					_inverted: true,
-				};
-			}
-		}
-		return null;
+		return this.findInverseLatestOnOrBefore(lookup);
 	}
 }
 

@@ -1749,10 +1749,28 @@ def collect_below_buying_price_errors(
         net_rate_precision = _resolve_currency_precision(row, invoice_doc, "net_rate")
         base_precision = _resolve_currency_precision(row, invoice_doc, "base_net_rate")
 
+        row_incl_a, row_incl_b, _row_all_a, _row_all_b = row_tax_params.get(
+            index, (0.0, 0.0, 0.0, 0.0)
+        )
+        row_has_inclusive_tax = row_incl_a > 0 or row_incl_b > 0
+        row_has_invoice_discount = (
+            abs(computed_net_rate - pre_discount_nets.get(index, 0.0)) > 1e-9
+        )
+        row_line_gross_amount = line_gross_amounts.get(index, gross_rate * row_qty)
+        row_preserve_unit_net_rate = (
+            not row_has_inclusive_tax
+            and not row_has_invoice_discount
+            and row_qty > 0
+        )
+
         honored_native_net_rate = False
         if reconciled_native_nets:
             has_net_amount = _has_populated_net_field(row, "net_amount", gross_rate) and row_qty > 0
             has_net_rate = _has_populated_net_field(row, "net_rate", gross_rate)
+            net_amount_matches_line_gross = (
+                has_net_amount
+                and abs(abs(flt(row.get("net_amount"))) - row_line_gross_amount) <= 1e-9
+            )
             row_net_from_amount = (
                 abs(flt(row.get("net_amount"))) / row_qty if has_net_amount else None
             )
@@ -1762,13 +1780,32 @@ def collect_below_buying_price_errors(
                 if net_rate_precision is not None
                 else 1e-9
             )
+            # ERPNext taxes_and_totals.py:275-291 keeps net_rate = rate when there is no
+            # inclusive tax and no invoice discount, while rounding net_amount = flt(rate * qty, prec).
+            # On weighed/fractional lines (e.g. 0.10 kg x $1.03 = $0.10), preserve unit net_rate
+            # rather than dividing the rounded line amount by qty.
+            if (
+                row_net_rate is not None
+                and row_preserve_unit_net_rate
+                and net_amount_matches_line_gross
+                and row_net_rate <= gross_rate + 1e-9
+            ):
+                selling_rate = row_net_rate
+                honored_native_net_rate = True
             # ERPNext taxes_and_totals.py:1118-1123 sets net_rate = flt(net_amount / qty, prec).
             # Honor native net_rate when it is consistent with net_amount / qty within 0.5 ULP.
-            if row_net_rate is not None and (
+            elif row_net_rate is not None and (
                 row_net_from_amount is None
                 or abs(row_net_rate - row_net_from_amount) <= half_ulp + 1e-9
             ):
                 selling_rate = row_net_rate
+                honored_native_net_rate = True
+            elif (
+                row_net_rate is None
+                and row_preserve_unit_net_rate
+                and net_amount_matches_line_gross
+            ):
+                selling_rate = gross_rate
                 honored_native_net_rate = True
             elif row_net_from_amount is not None:
                 selling_rate = (

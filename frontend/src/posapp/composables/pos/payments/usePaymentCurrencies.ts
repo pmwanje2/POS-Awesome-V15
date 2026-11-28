@@ -42,7 +42,13 @@ export function usePaymentCurrencies(options: PaymentCurrencyOptions) {
 	const companyCurrency = computed(() => {
 		const profile = unref(options.posProfile) || {};
 		const doc = unref(options.invoiceDoc) || {};
-		return profile.company_currency || profile.currency || doc.company_currency || doc.currency || "";
+		return (
+			profile.company_currency ||
+			doc.company_currency ||
+			profile.currency ||
+			doc.currency ||
+			""
+		);
 	});
 
 	const allowedPaymentCurrencies = computed(() => {
@@ -80,6 +86,7 @@ export function usePaymentCurrencies(options: PaymentCurrencyOptions) {
 			fromCurrency,
 			toCurrency,
 			effectiveDate: doc.posting_date || window.frappe?.datetime?.nowdate?.(),
+			purpose: "for_selling" as const,
 			allowManualRate: allowManualRate.value,
 			manualRate: manualRate as number | string | null | undefined,
 		};

@@ -224,14 +224,32 @@ async function runSupportedOfflineSyncResourceOnce({
 		case "currency_matrix": {
 			const discoveredCurrencyPairs =
 				await collectCurrencyMatrixPairs(posProfile);
+			const previousSyncedPairs = new Set(
+				Array.isArray(persistedState?.syncedCurrencyPairs)
+					? persistedState.syncedCurrencyPairs.filter(Boolean)
+					: [],
+			);
+			const backfillPairs = sharedArgs.watermark
+				? discoveredCurrencyPairs.filter(
+						(pair) =>
+							!previousSyncedPairs.has(
+								`${pair.from_currency}::${pair.to_currency}`,
+							),
+					)
+				: [];
 			return syncCurrencyMatrixResource({
 				...sharedArgs,
 				...(discoveredCurrencyPairs.length
 					? { currencyPairs: discoveredCurrencyPairs }
 					: {}),
+				...(backfillPairs.length ? { backfillPairs } : {}),
+				...(Array.isArray(persistedState?.syncedCurrencyPairs)
+					? { syncedCurrencyPairs: persistedState.syncedCurrencyPairs }
+					: {}),
 				fetcher: ({
 					posProfile,
 					currencyPairs = [],
+					backfillPairs = [],
 					watermark,
 					offset,
 					schemaVersion,
@@ -242,6 +260,9 @@ async function runSupportedOfflineSyncResourceOnce({
 							pos_profile: posProfile,
 							watermark,
 							currency_pairs: currencyPairs,
+							...(backfillPairs.length
+								? { backfill_pairs: backfillPairs }
+								: {}),
 							offset: offset || 0,
 							schema_version: schemaVersion,
 						},

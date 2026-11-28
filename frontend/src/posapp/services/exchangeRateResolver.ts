@@ -1,14 +1,53 @@
+import * as offlineModule from "../../offline/index";
 import {
-	getCachedExchangeRate,
-	saveExchangeRateCache,
-} from "../../offline/index";
-import {
+	isCurrencyFlagEnabled,
 	isCurrencyRateDateWithinStalePolicy,
 	oppositeCurrencyPurpose,
+	type CurrencyRateStalePolicy,
 } from "../../offline/currencyRatePolicy";
 import { currencyRateRepository } from "../../offline/repositories";
 
 declare const frappe: any;
+
+const isOfflineMode = (): boolean =>
+	typeof (offlineModule as any)?.isOffline === "function" &&
+	Boolean((offlineModule as any).isOffline());
+
+const getCurrentExchangeSettings =
+	async (): Promise<CurrencyRateStalePolicy | null> => {
+		if (
+			typeof currencyRateRepository?.getExchangeSettings !== "function"
+		) {
+			return null;
+		}
+		try {
+			return await currencyRateRepository.getExchangeSettings();
+		} catch {
+			return null;
+		}
+	};
+
+const buildPolicyKey = (
+	settings: CurrencyRateStalePolicy | null | undefined,
+): string => {
+	if (!settings) {
+		return "default";
+	}
+	const allowStale =
+		settings.allowStale === undefined || settings.allowStale === null
+			? 1
+			: isCurrencyFlagEnabled(settings.allowStale)
+				? 1
+				: 0;
+	const staleDays =
+		settings.staleDays !== undefined &&
+		settings.staleDays !== null &&
+		Number.isFinite(Number(settings.staleDays)) &&
+		Number(settings.staleDays) >= 0
+			? Math.trunc(Number(settings.staleDays))
+			: 1;
+	return `${allowStale}:${staleDays}`;
+};
 
 export type ExchangeRateSource =
 	| "same_currency"
@@ -41,7 +80,12 @@ export type ResolveExchangeRateArgs = {
 	forceRefresh?: boolean;
 };
 
-const resolvedRates = new Map<string, ExchangeRateResult>();
+type CachedResolvedRate = {
+	result: ExchangeRateResult;
+	policyKey: string;
+};
+
+const resolvedRates = new Map<string, CachedResolvedRate>();
 const pendingRates = new Map<string, Promise<ExchangeRateResult>>();
 
 const positiveFinite = (value: unknown): number | null => {
@@ -76,6 +120,7 @@ const unavailable = (
 
 const resolveUncached = async (
 	args: ResolveExchangeRateArgs,
+	exchangeSettings: CurrencyRateStalePolicy | null,
 ): Promise<ExchangeRateResult> => {
 	const manualRate = positiveFinite(args.manualRate);
 	if (args.allowManualRate && manualRate) {
@@ -90,25 +135,139 @@ const resolveUncached = async (
 		};
 	}
 
-	const exchangeSettings =
-		typeof currencyRateRepository?.getExchangeSettings === "function"
-			? await currencyRateRepository.getExchangeSettings()
-			: null;
 	const reversePurpose = oppositeCurrencyPurpose(args.purpose);
 
-	const inverse = resolvedRates.get(
+	// ERPNext setup/utils.py:124-134 precedence: exhaust ALL direct sources first
+	// (warm direct -> persistent direct -> online direct when online), and ONLY consult
+	// inverse sources after no direct rate is found.
+	const directWarmCached = offlineModule.getCachedExchangeRate({
+		profileName: args.profileName,
+		company: args.company,
+		fromCurrency: args.fromCurrency,
+		toCurrency: args.toCurrency,
+		rateDate: args.effectiveDate,
+		...(args.purpose ? { purpose: args.purpose } : {}),
+	});
+	const directWarmMatchesPurpose =
+		!args.purpose || directWarmCached?.purpose === args.purpose;
+	const directWarmWithinPolicy = isCurrencyRateDateWithinStalePolicy(
+		directWarmCached?.date,
+		args.effectiveDate,
+		exchangeSettings,
+	);
+	const directWarmRate =
+		directWarmMatchesPurpose && directWarmWithinPolicy
+			? positiveFinite(directWarmCached?.exchange_rate)
+			: null;
+	if (directWarmRate) {
+		return {
+			found: true,
+			fromCurrency: args.fromCurrency,
+			toCurrency: args.toCurrency,
+			rate: directWarmRate,
+			effectiveDate: args.effectiveDate,
+			rateDate: directWarmCached?.date || args.effectiveDate,
+			source: "offline_cache",
+		};
+	}
+
+	let deferredPersistentInverse: any = null;
+	const hasSplitRepoLookup =
+		typeof (currencyRateRepository as any)?.findDirectLatestOnOrBefore ===
+		"function";
+	if (args.profileName) {
+		try {
+			const lookup = {
+				profileName: args.profileName,
+				company: args.company || "",
+				fromCurrency: args.fromCurrency,
+				toCurrency: args.toCurrency,
+				date: args.effectiveDate,
+				...(args.purpose ? { purpose: args.purpose } : {}),
+			};
+			const directRecord = hasSplitRepoLookup
+				? await (
+						currencyRateRepository as any
+					).findDirectLatestOnOrBefore(lookup)
+				: await currencyRateRepository.findLatestOnOrBefore(lookup);
+			if (directRecord?._inverted) {
+				deferredPersistentInverse = directRecord;
+			} else {
+				const directRate = positiveFinite(directRecord?.exchange_rate);
+				if (directRate) {
+					return {
+						found: true,
+						fromCurrency: args.fromCurrency,
+						toCurrency: args.toCurrency,
+						rate: directRate,
+						effectiveDate: args.effectiveDate,
+						rateDate: directRecord?.date,
+						source: "offline_cache",
+					};
+				}
+			}
+		} catch (error) {
+			console.warn("Unable to read cached exchange rate", error);
+		}
+	}
+
+	let onlineError: string | undefined;
+	if (!isOfflineMode()) {
+		try {
+			const response = await frappe.call({
+				method: "posawesome.posawesome.api.invoices.resolve_exchange_rate",
+				args: {
+					from_currency: args.fromCurrency,
+					to_currency: args.toCurrency,
+					transaction_date: args.effectiveDate,
+					purpose: args.purpose || null,
+					allow_external: args.allowExternal === false ? 0 : 1,
+				},
+			});
+			const payload = response?.message || {};
+			const rate = positiveFinite(payload.exchange_rate);
+			if (payload.found && rate) {
+				const result: ExchangeRateResult = {
+					found: true,
+					fromCurrency: args.fromCurrency,
+					toCurrency: args.toCurrency,
+					rate,
+					effectiveDate: args.effectiveDate,
+					rateDate: payload.date || args.effectiveDate,
+					source: payload.source || "currency_exchange",
+				};
+				offlineModule.saveExchangeRateCache({
+					profileName: args.profileName,
+					company: args.company,
+					fromCurrency: args.fromCurrency,
+					toCurrency: args.toCurrency,
+					rateDate: args.effectiveDate,
+					date: result.rateDate || args.effectiveDate,
+					...(args.purpose ? { purpose: args.purpose } : {}),
+					exchange_rate: rate,
+				});
+				return result;
+			}
+			onlineError = payload.error || "rate_unavailable";
+		} catch (error: any) {
+			onlineError = error?.message || "rate_unavailable";
+		}
+	}
+
+	// No direct rate found — fall back to inverse sources with opposite purpose.
+	const inMemoryInverse = resolvedRates.get(
 		cacheKey({
 			...args,
 			fromCurrency: args.toCurrency,
 			toCurrency: args.fromCurrency,
 			purpose: reversePurpose,
 		}),
-	);
+	)?.result;
 	if (
-		inverse?.found &&
-		inverse.rate &&
+		inMemoryInverse?.found &&
+		inMemoryInverse.rate &&
 		isCurrencyRateDateWithinStalePolicy(
-			inverse.rateDate,
+			inMemoryInverse.rateDate,
 			args.effectiveDate,
 			exchangeSettings,
 		)
@@ -117,47 +276,14 @@ const resolveUncached = async (
 			found: true,
 			fromCurrency: args.fromCurrency,
 			toCurrency: args.toCurrency,
-			rate: 1 / inverse.rate,
+			rate: 1 / inMemoryInverse.rate,
 			effectiveDate: args.effectiveDate,
-			rateDate: inverse.rateDate,
+			rateDate: inMemoryInverse.rateDate,
 			source: "derived_inverse",
 		};
 	}
 
-	const legacyCached = getCachedExchangeRate({
-		profileName: args.profileName,
-		company: args.company,
-		fromCurrency: args.fromCurrency,
-		toCurrency: args.toCurrency,
-		rateDate: args.effectiveDate,
-		...(args.purpose ? { purpose: args.purpose } : {}),
-	});
-	// Never let an unqualified/mismatched or stale warm-cache entry override
-	// an explicit purpose lookup or Accounts Settings stale_days policy.
-	const legacyMatchesPurpose =
-		!args.purpose || legacyCached?.purpose === args.purpose;
-	const legacyWithinStalePolicy = isCurrencyRateDateWithinStalePolicy(
-		legacyCached?.date,
-		args.effectiveDate,
-		exchangeSettings,
-	);
-	const legacyRate =
-		legacyMatchesPurpose && legacyWithinStalePolicy
-			? positiveFinite(legacyCached?.exchange_rate)
-			: null;
-	if (legacyRate) {
-		return {
-			found: true,
-			fromCurrency: args.fromCurrency,
-			toCurrency: args.toCurrency,
-			rate: legacyRate,
-			effectiveDate: args.effectiveDate,
-			rateDate: legacyCached?.date || args.effectiveDate,
-			source: "offline_cache",
-		};
-	}
-
-	const reverseWarmCached = getCachedExchangeRate({
+	const reverseWarmCached = offlineModule.getCachedExchangeRate({
 		profileName: args.profileName,
 		company: args.company,
 		fromCurrency: args.toCurrency,
@@ -190,73 +316,39 @@ const resolveUncached = async (
 
 	if (args.profileName) {
 		try {
-			const cachedRecord = await currencyRateRepository.findLatestOnOrBefore({
-				profileName: args.profileName,
-				company: args.company || "",
-				fromCurrency: args.fromCurrency,
-				toCurrency: args.toCurrency,
-				date: args.effectiveDate,
-				...(args.purpose ? { purpose: args.purpose } : {}),
-			});
-			const cachedRate = positiveFinite(cachedRecord?.exchange_rate);
-			if (cachedRate) {
+			const inverseRecord =
+				deferredPersistentInverse ??
+				(typeof (currencyRateRepository as any)
+					?.findInverseLatestOnOrBefore === "function"
+					? await (
+							currencyRateRepository as any
+						).findInverseLatestOnOrBefore({
+							profileName: args.profileName,
+							company: args.company || "",
+							fromCurrency: args.fromCurrency,
+							toCurrency: args.toCurrency,
+							date: args.effectiveDate,
+							...(args.purpose ? { purpose: args.purpose } : {}),
+						})
+					: null);
+			const inverseRate = positiveFinite(inverseRecord?.exchange_rate);
+			if (inverseRate) {
 				return {
 					found: true,
 					fromCurrency: args.fromCurrency,
 					toCurrency: args.toCurrency,
-					rate: cachedRate,
+					rate: inverseRate,
 					effectiveDate: args.effectiveDate,
-					rateDate: cachedRecord?.date,
-					source: cachedRecord?._inverted
-						? "derived_inverse"
-						: "offline_cache",
+					rateDate: inverseRecord?.date,
+					source: "derived_inverse",
 				};
 			}
 		} catch (error) {
-			console.warn("Unable to read cached exchange rate", error);
+			console.warn("Unable to read cached inverse exchange rate", error);
 		}
 	}
 
-	try {
-		const response = await frappe.call({
-			method: "posawesome.posawesome.api.invoices.resolve_exchange_rate",
-			args: {
-				from_currency: args.fromCurrency,
-				to_currency: args.toCurrency,
-				transaction_date: args.effectiveDate,
-				purpose: args.purpose || null,
-				allow_external: args.allowExternal === false ? 0 : 1,
-			},
-		});
-		const payload = response?.message || {};
-		const rate = positiveFinite(payload.exchange_rate);
-		if (!payload.found || !rate) {
-			return unavailable(args, payload.error || "rate_unavailable");
-		}
-
-		const result: ExchangeRateResult = {
-			found: true,
-			fromCurrency: args.fromCurrency,
-			toCurrency: args.toCurrency,
-			rate,
-			effectiveDate: args.effectiveDate,
-			rateDate: payload.date || args.effectiveDate,
-			source: payload.source || "currency_exchange",
-		};
-		saveExchangeRateCache({
-			profileName: args.profileName,
-			company: args.company,
-			fromCurrency: args.fromCurrency,
-			toCurrency: args.toCurrency,
-			rateDate: args.effectiveDate,
-			date: result.rateDate || args.effectiveDate,
-			...(args.purpose ? { purpose: args.purpose } : {}),
-			exchange_rate: rate,
-		});
-		return result;
-	} catch (error: any) {
-		return unavailable(args, error?.message || "rate_unavailable");
-	}
+	return unavailable(args, onlineError || "rate_unavailable");
 };
 
 export async function resolveExchangeRate(
@@ -278,17 +370,45 @@ export async function resolveExchangeRate(
 	}
 
 	const key = cacheKey(args);
-	if (!args.forceRefresh && resolvedRates.has(key)) {
-		return resolvedRates.get(key)!;
-	}
 	if (!args.forceRefresh && pendingRates.has(key)) {
 		return pendingRates.get(key)!;
 	}
 
-	const pending = resolveUncached(args).then((result) => {
-		resolvedRates.set(key, result);
-		pendingRates.delete(key);
+	const existing = !args.forceRefresh ? resolvedRates.get(key) : undefined;
+	if (
+		existing &&
+		(existing.result.source === "manual" ||
+			existing.result.source === "same_currency")
+	) {
+		return existing.result;
+	}
+
+	const pending = (async () => {
+		const exchangeSettings = await getCurrentExchangeSettings();
+		const policyKey = buildPolicyKey(exchangeSettings);
+		if (existing) {
+			if (
+				existing.result.found &&
+				(existing.result.source !== "derived_inverse" ||
+					existing.policyKey === policyKey) &&
+				isCurrencyRateDateWithinStalePolicy(
+					existing.result.rateDate,
+					args.effectiveDate,
+					exchangeSettings,
+				)
+			) {
+				return existing.result;
+			}
+			if (!existing.result.found && existing.policyKey === policyKey) {
+				return existing.result;
+			}
+			resolvedRates.delete(key);
+		}
+		const result = await resolveUncached(args, exchangeSettings);
+		resolvedRates.set(key, { result, policyKey });
 		return result;
+	})().finally(() => {
+		pendingRates.delete(key);
 	});
 	pendingRates.set(key, pending);
 	return pending;

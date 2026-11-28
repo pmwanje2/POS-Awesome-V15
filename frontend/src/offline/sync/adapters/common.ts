@@ -32,6 +32,10 @@ export type SyncResponse<T = any> = {
 		allow_stale?: number | boolean | null;
 		stale_days?: number | null;
 	} | null;
+	synced_pairs?: Array<{
+		from_currency: string;
+		to_currency: string;
+	}> | null;
 	schema_version?: string | null;
 	full_resync_required?: boolean;
 };
@@ -43,6 +47,7 @@ type PersistSyncStateArgs = {
 	response: SyncResponse;
 	watermark?: string | null;
 	error?: string | null;
+	syncedCurrencyPairs?: string[] | null;
 };
 
 type RefreshSnapshotArgs = {
@@ -83,6 +88,7 @@ export async function persistResourceSyncState({
 	response,
 	watermark,
 	error = null,
+	syncedCurrencyPairs,
 }: PersistSyncStateArgs) {
 	await setSyncResourceState({
 		resourceId,
@@ -94,6 +100,7 @@ export async function persistResourceSyncState({
 		consecutiveFailures: status === "error" ? 1 : 0,
 		scopeSignature: buildScopeSignature(posProfile),
 		schemaVersion: response?.schema_version || null,
+		...(syncedCurrencyPairs !== undefined ? { syncedCurrencyPairs } : {}),
 	});
 }
 

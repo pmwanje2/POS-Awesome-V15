@@ -783,6 +783,7 @@ export default {
 				company: company.value,
 				fromCurrency: paymentCurrency,
 				effectiveDate: postingDate.value || getTodayDate(),
+				purpose: "for_selling",
 			};
 			const [invoiceResult, companyResult] = await Promise.all([
 				resolveExchangeRate({ ...common, toCurrency: invoiceTotalCurrency.value }),
@@ -815,6 +816,7 @@ export default {
 				fromCurrency,
 				toCurrency,
 				effectiveDate: postingDate.value || getTodayDate(),
+				purpose: "for_selling",
 			});
 			row._rate_error = !result.found;
 			row.invoice_equivalent = result.rate ? flt(row?.[amountField] || 0) * result.rate : 0;

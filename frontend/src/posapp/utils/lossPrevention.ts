@@ -954,8 +954,17 @@ function resolveNativeUnitNetRate(
 	qty: number | null,
 	precision = 2,
 	allowZero = false,
+	preserveUnitNetRate = false,
 ): number | null {
 	const rawNetAmount = toFiniteNumber(item.net_amount);
+	const lineGrossAmount =
+		qty !== null && qty > 0
+			? roundToPrecision(grossSellingRate * qty, precision)
+			: null;
+	const netAmountMatchesLineGross =
+		rawNetAmount !== null &&
+		lineGrossAmount !== null &&
+		Math.abs(Math.abs(rawNetAmount) - lineGrossAmount) <= 1e-9;
 	const netFromAmount =
 		rawNetAmount !== null &&
 		rawNetAmount >= 0 &&
@@ -976,6 +985,17 @@ function resolveNativeUnitNetRate(
 				Math.abs(Math.abs(rawNetRate) - netFromAmount) <= halfUlp + 1e-9));
 	if (hasValidNetRate) {
 		const normalizedNetRate = Math.abs(rawNetRate!);
+		// ERPNext taxes_and_totals.py:275-291 keeps net_rate = rate (unmodified unit rate)
+		// when there is no inclusive tax and no invoice discount, while rounding net_amount =
+		// flt(rate * qty, prec). On fractional/weighed qty (e.g. 0.10 kg x $1.03 = $0.10),
+		// preserve net_rate instead of dividing the rounded line amount by qty.
+		if (
+			preserveUnitNetRate &&
+			netAmountMatchesLineGross &&
+			normalizedNetRate <= grossSellingRate + 1e-9
+		) {
+			return normalizedNetRate;
+		}
 		// ERPNext taxes_and_totals.py:1118-1121 rounds net_rate = flt(net_amount / qty, prec).
 		// Honor native rounded net_rate (including 0.00) when consistent with net_amount / qty within 0.5 ULP.
 		if (
@@ -985,6 +1005,9 @@ function resolveNativeUnitNetRate(
 			return normalizedNetRate;
 		}
 		return Math.min(netFromAmount, roundToPrecision(netFromAmount, precision));
+	}
+	if (preserveUnitNetRate && netAmountMatchesLineGross) {
+		return grossSellingRate;
 	}
 	return netFromAmount;
 }
@@ -1195,12 +1218,15 @@ export function getItemLossRisk(
 		options.reconciledNativeNet === true ||
 		(options.reconciledNativeNet === undefined &&
 			computedNetRate <= halfUlp + 1e-9);
+	const preserveUnitNetRate =
+		inclA === 0 && inclB === 0 && invoiceDiscountPercentage <= 0;
 	const nativeUnitNetRate = resolveNativeUnitNetRate(
 		item,
 		grossSellingRate,
 		qty,
 		precision,
 		allowZeroNativeNet,
+		preserveUnitNetRate,
 	);
 	const maxUnreconciledNetRate =
 		options.reconciledNativeNet === false

@@ -115,6 +115,7 @@ export interface SyncResourceState {
 	lastTrigger?: SyncTrigger | null;
 	scopeSignature: string | null;
 	schemaVersion: string | null;
+	syncedCurrencyPairs?: string[] | null;
 }
 
 export interface SyncTriggerResourceSummary {

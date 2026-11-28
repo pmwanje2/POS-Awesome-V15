@@ -1326,6 +1326,78 @@ async function attachOfflineBuyingFloors(profileName: string, items: any[]) {
 		typeof currencyRateRepository?.getExchangeSettings === "function"
 			? await currencyRateRepository.getExchangeSettings()
 			: null;
+	let currencySyncState: Record<string, any> | null = null;
+	try {
+		const syncRow = await db
+			.table("sync_state")
+			.get("posa_sync_state::currency_matrix");
+		if (syncRow?.value && typeof syncRow.value === "object") {
+			currencySyncState = syncRow.value;
+		}
+	} catch {
+		currencySyncState = null;
+	}
+	const profileCompanyName = String(profile?.company || "");
+	let currencySyncCompletedForScope = false;
+	let hasExplicitSyncedPairList = false;
+	const syncedCurrencyPairSet = new Set<string>();
+	if (
+		currencySyncState &&
+		(currencySyncState.status === "fresh" ||
+			Boolean(currencySyncState.watermark) ||
+			Boolean(currencySyncState.lastSyncedAt))
+	) {
+		let scopeMatches = true;
+		if (currencySyncState.scopeSignature) {
+			try {
+				const parsedScope = JSON.parse(
+					String(currencySyncState.scopeSignature),
+				);
+				if (
+					parsedScope?.profile &&
+					String(parsedScope.profile) !== profileName
+				) {
+					scopeMatches = false;
+				}
+				if (
+					scopeMatches &&
+					profileCompanyName &&
+					parsedScope?.company &&
+					String(parsedScope.company) !== profileCompanyName
+				) {
+					scopeMatches = false;
+				}
+			} catch {
+				// Ignore malformed scope signature and treat as completed.
+			}
+		}
+		if (scopeMatches) {
+			currencySyncCompletedForScope = true;
+			if (Array.isArray(currencySyncState.syncedCurrencyPairs)) {
+				hasExplicitSyncedPairList = true;
+				for (const pairKey of currencySyncState.syncedCurrencyPairs) {
+					if (pairKey) {
+						syncedCurrencyPairSet.add(String(pairKey));
+					}
+				}
+			}
+		}
+	}
+	const isPairCoveredByCompletedCurrencySync = (
+		currency: string,
+		companyCurrency: string,
+	): boolean => {
+		if (!currencySyncCompletedForScope) {
+			return false;
+		}
+		if (hasExplicitSyncedPairList) {
+			return (
+				syncedCurrencyPairSet.has(`${currency}::${companyCurrency}`) ||
+				syncedCurrencyPairSet.has(`${companyCurrency}::${currency}`)
+			);
+		}
+		return true;
+	};
 	const currencyRates = new Map<
 		string,
 		{ rate: number; hasSyncedRows: boolean }
@@ -1483,8 +1555,13 @@ async function attachOfflineBuyingFloors(profileName: string, items: any[]) {
 				const existingPriceList = String(
 					existingEntry?.price_list || "",
 				).trim();
+				const pairSyncedAndEmpty = isPairCoveredByCompletedCurrencySync(
+					rowCurrency || companyCurrency,
+					companyCurrency,
+				);
 				const canPreserveVerifiedServerFloor =
 					!hasSyncedRows &&
+					!pairSyncedAndEmpty &&
 					existingEntry?.unresolved_fx !== true &&
 					Number.isFinite(existingBaseRate) &&
 					existingBaseRate > 0 &&
@@ -1529,6 +1606,9 @@ async function attachOfflineBuyingFloors(profileName: string, items: any[]) {
 				item.buying_price_currency = unresolvedBuyingCurrency;
 				item.buying_exchange_rate = 0;
 				item.base_buying_rate = null;
+				item.trade_price = null;
+				item.buying_rate = null;
+				item.buying_rate_currency = null;
 				delete item._company_buying_price;
 			}
 		}

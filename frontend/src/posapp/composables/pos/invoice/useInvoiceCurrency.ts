@@ -59,6 +59,14 @@ export function useInvoiceCurrency() {
 	const selected_currency = ref("");
 	const exchange_rate = ref(1);
 	const conversion_rate = ref(1);
+	let hasExplicitConversionRate = false;
+	watch(
+		conversion_rate,
+		() => {
+			hasExplicitConversionRate = true;
+		},
+		{ flush: "sync" },
+	);
 	const exchange_rate_date = ref(frappe.datetime.nowdate());
 	const price_lists = ref<string[]>([]);
 	const selected_price_list = ref("");
@@ -71,6 +79,24 @@ export function useInvoiceCurrency() {
 	// Get company and pos_profile from UI store
 	const pos_profile = computed(() => uiStore.posProfile);
 	const company = computed(() => uiStore.companyDoc);
+
+	const resolveEffectiveCompanyCurrency = (item?: any): string => {
+		const fromCompanyDoc = String(
+			company.value?.default_currency || "",
+		).trim();
+		if (fromCompanyDoc) return fromCompanyDoc;
+		const fromProfile = String(
+			(pos_profile.value as any)?.company_currency || "",
+		).trim();
+		if (fromProfile) return fromProfile;
+		const fromItem = String(item?.company_currency || "").trim();
+		if (fromItem) return fromItem;
+		const fromCart = (invoiceStore.items || [])
+			.map((row: any) => String(row?.company_currency || "").trim())
+			.find(Boolean);
+		if (fromCart) return fromCart;
+		return String(pos_profile.value?.currency || "").trim();
+	};
 
 	// Watch for pos_profile changes to update precision
 	watch(
@@ -229,15 +255,17 @@ export function useInvoiceCurrency() {
 			(typeof frappe !== "undefined" && frappe.datetime?.get_today?.()) ||
 			exchange_rate_date.value ||
 			new Date().toISOString().slice(0, 10);
-		const companyCurrency =
-			(company.value && company.value.default_currency) ||
-			pos_profile.value.currency;
-		const plCurrency = price_list_currency.value || companyCurrency;
+		const companyCurrency = resolveEffectiveCompanyCurrency();
+		const plCurrency =
+			price_list_currency.value ||
+			pos_profile.value.currency ||
+			companyCurrency;
 
 		const common = {
 			profileName: pos_profile.value.name,
 			company: pos_profile.value.company,
 			effectiveDate: rateDate,
+			purpose: "for_selling" as const,
 		};
 		const companyResult = await resolveExchangeRate({
 			...common,
@@ -250,6 +278,7 @@ export function useInvoiceCurrency() {
 			toCurrency: selected_currency.value,
 		});
 
+		hasExplicitConversionRate = true;
 		conversion_rate.value = companyResult.rate || 0;
 		exchange_rate.value = displayResult.rate || 0;
 		exchange_rate_date.value =
@@ -412,40 +441,56 @@ export function useInvoiceCurrency() {
 			exchange_rate.value,
 		);
 		const items = invoiceStore.items;
-		const companyCurrency =
-			(company.value && company.value.default_currency) ||
-			pos_profile.value?.currency ||
-			"";
-		const selectedCurrency = selected_currency.value || companyCurrency;
+		const defaultCompanyCurrency = resolveEffectiveCompanyCurrency();
+		const selectedCurrency =
+			selected_currency.value || defaultCompanyCurrency;
 		const rawConversionRate = parsePositiveFinite(conversion_rate.value);
 		const rawExchangeRate = parsePositiveFinite(exchange_rate.value);
-		const itemConversionRate =
-			selectedCurrency === companyCurrency
-				? 1
-				: rawConversionRate !== null
-					? rawConversionRate
-					: 0;
-		const conversionRate = conversion_rate.value || 1;
 		const precision = currency_precision.value;
 		const resolvedPriceListCurrency =
-			price_list_currency.value || companyCurrency;
-		const currencyContext = {
-			pos_profile: pos_profile.value,
-			company: company.value,
-			price_list_currency: resolvedPriceListCurrency,
-			selected_currency: selectedCurrency,
-			exchange_rate: exchange_rate.value || 1,
-			conversion_rate: conversionRate,
-		};
+			price_list_currency.value ||
+			pos_profile.value?.currency ||
+			defaultCompanyCurrency;
 
 		items.forEach((item: any) => {
 			item._skip_calc = true;
+			const companyCurrency =
+				resolveEffectiveCompanyCurrency(item) || defaultCompanyCurrency;
+			const existingItemConversionRate = parsePositiveFinite(
+				item?.conversion_rate,
+			);
+			let itemConversionRate: number;
+			if (selectedCurrency === companyCurrency) {
+				itemConversionRate = 1;
+			} else if (
+				!hasExplicitConversionRate &&
+				item?.currency === selectedCurrency &&
+				existingItemConversionRate !== null
+			) {
+				itemConversionRate = existingItemConversionRate;
+			} else {
+				itemConversionRate =
+					rawConversionRate !== null ? rawConversionRate : 0;
+			}
+			const effectiveRawConversionRate =
+				itemConversionRate > 0 ? itemConversionRate : rawConversionRate;
+			const itemCompanyContext = companyCurrency
+				? { ...(company.value || {}), default_currency: companyCurrency }
+				: company.value;
+			const currencyContext = {
+				pos_profile: pos_profile.value,
+				company: itemCompanyContext,
+				price_list_currency: resolvedPriceListCurrency,
+				selected_currency: selectedCurrency,
+				exchange_rate: exchange_rate.value || 1,
+				conversion_rate: itemConversionRate || 1,
+			};
 			const strictPlcToCompanyRate = resolveStrictPlcToCompanyRate(
 				item,
 				companyCurrency,
 				resolvedPriceListCurrency,
 				selectedCurrency,
-				rawConversionRate,
+				effectiveRawConversionRate,
 				rawExchangeRate,
 			);
 			const companyBuyingPrice = preserveItemCompanyBuyingPrice(

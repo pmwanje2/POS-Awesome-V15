@@ -208,11 +208,10 @@ def _discover_required_floor_pairs(profile):
 
 def _normalize_pairs(currency_pairs, profile, enabled_currencies):
     explicit_pairs = _parse_pairs(currency_pairs)
-    if explicit_pairs:
-        return explicit_pairs, True
     floor_pairs = _discover_required_floor_pairs(profile)
-    if floor_pairs:
-        return floor_pairs, True
+    combined = list(dict.fromkeys([*explicit_pairs, *floor_pairs]))
+    if combined:
+        return combined, True
     # Startup sync on domestic-only profiles stays metadata-only until a
     # transaction selects a foreign currency.
     return [], False
@@ -291,6 +290,7 @@ def sync_currency_scope(
     pos_profile=None,
     watermark=None,
     currency_pairs=None,
+    backfill_pairs=None,
     offset=0,
     limit=200,
     schema_version=None,
@@ -336,19 +336,39 @@ def sync_currency_scope(
         for row in enabled_rows
         if str(row.get("name") or "").strip()
     ]
+    explicit_pair_set = set(_parse_pairs(currency_pairs))
     resolved_pairs, explicit_pairs = _normalize_pairs(
         currency_pairs,
         profile,
         enabled_currencies,
     )
+    parsed_backfill_pairs = _parse_pairs(backfill_pairs)
+    backfill_pair_set = set(parsed_backfill_pairs)
+    if parsed_backfill_pairs:
+        resolved_pairs = list(dict.fromkeys([*resolved_pairs, *parsed_backfill_pairs]))
+        explicit_pairs = True
     exchange_rows_by_pair = _get_exchange_rows(resolved_pairs)
     pair_modifications = []
+    synced_pairs = []
     for from_currency, to_currency in resolved_pairs:
+        is_backfill_pair = (from_currency, to_currency) in backfill_pair_set
+        if (
+            not watermark
+            or is_backfill_pair
+            or (from_currency, to_currency) in explicit_pair_set
+        ):
+            synced_pairs.append(
+                {"from_currency": from_currency, "to_currency": to_currency}
+            )
         exchange_rows = exchange_rows_by_pair.get((from_currency, to_currency), [])
         pair_modified = _max_timestamp([row.get("modified") for row in exchange_rows])
         pair_modifications.append(pair_modified)
         for row in exchange_rows:
-            if explicit_pairs and not _should_include(row.get("modified"), watermark):
+            if (
+                not is_backfill_pair
+                and explicit_pairs
+                and not _should_include(row.get("modified"), watermark)
+            ):
                 continue
             if not row.get("name"):
                 continue
@@ -359,7 +379,11 @@ def sync_currency_scope(
                     "data": dict(row),
                 }
             )
-        if explicit_pairs and not _should_include(pair_modified, watermark):
+        if (
+            not is_backfill_pair
+            and explicit_pairs
+            and not _should_include(pair_modified, watermark)
+        ):
             continue
         exchange_rate, rate_date = get_latest_rate(
             from_currency,
@@ -376,6 +400,7 @@ def sync_currency_scope(
                     "to_currency": to_currency,
                     "exchange_rate": exchange_rate,
                     "date": rate_date,
+                    "purpose": "for_selling",
                 },
             }
         )
@@ -413,6 +438,7 @@ def sync_currency_scope(
     next_watermark = None
     if not has_more:
         next_watermark = _max_timestamp(
+            watermark,
             enabled_modified,
             pair_modifications,
             [row.get("creation") for row in deleted_rate_rows],
@@ -425,4 +451,5 @@ def sync_currency_scope(
     )
     response["next_offset"] = resolved_offset + len(changes) if has_more else None
     response["currency_settings"] = _get_currency_exchange_settings()
+    response["synced_pairs"] = synced_pairs
     return response
