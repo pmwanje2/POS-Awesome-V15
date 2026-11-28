@@ -43,6 +43,11 @@ function isObjectPayload(value: unknown): value is Record<string, any> {
 	return Boolean(value && typeof value === "object");
 }
 
+function parsePositiveRate(value: unknown): number {
+	const numeric = Number(value);
+	return Number.isFinite(numeric) && numeric > 0 ? numeric : 0;
+}
+
 export function registerItemsSelectorEvents({
 	eventBus,
 	selectedCurrency,
@@ -61,17 +66,27 @@ export function registerItemsSelectorEvents({
 
 	const handleCurrencyUpdate = (data: CurrencyPayload) => {
 		if (typeof data === "string" && data) {
+			const currencyChanged = selectedCurrency.value !== data;
 			selectedCurrency.value = data;
+			if (currencyChanged) {
+				selectedExchangeRate.value = 0;
+				selectedConversionRate.value = 0;
+			}
 			return;
 		}
 
 		if (isObjectPayload(data) && data.currency) {
+			const currencyChanged = selectedCurrency.value !== data.currency;
 			selectedCurrency.value = data.currency;
-			if (data.exchange_rate) {
-				selectedExchangeRate.value = Number(data.exchange_rate) || 1;
+			if ("exchange_rate" in data) {
+				selectedExchangeRate.value = parsePositiveRate(data.exchange_rate);
+			} else if (currencyChanged) {
+				selectedExchangeRate.value = 0;
 			}
-			if (data.conversion_rate) {
-				selectedConversionRate.value = Number(data.conversion_rate) || 1;
+			if ("conversion_rate" in data) {
+				selectedConversionRate.value = parsePositiveRate(data.conversion_rate);
+			} else if (currencyChanged) {
+				selectedConversionRate.value = 0;
 			}
 		}
 	};

@@ -28,6 +28,8 @@ export type LossPreventionOptions = {
 	applyDiscountOn?: string;
 	isCashOrNonTradeDiscount?: boolean | number;
 	taxes?: Array<Record<string, unknown>>;
+	currencyPrecision?: number;
+	reconciledNativeNet?: boolean;
 };
 
 const COST_CANDIDATES: Array<{
@@ -151,6 +153,14 @@ function parseItemTaxRateMap(
 	if (typeof raw === "object" && !Array.isArray(raw)) {
 		const out: Record<string, number> = {};
 		for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+			// ERPNext taxes_and_totals.py:476-480, 510-517 treats "N/A" (NOT_APPLICABLE_TAX) as 0%.
+			if (
+				v === null ||
+				(typeof v === "string" && v.trim().toUpperCase() === "N/A")
+			) {
+				out[k] = 0;
+				continue;
+			}
 			const parsed = toFiniteNumber(v);
 			if (parsed !== null) {
 				out[k] = parsed;
@@ -384,8 +394,15 @@ export function resolveInvoiceDiscountPercentage(
 	}
 
 	const actualTaxTotal = computeInvoiceActualTaxTotal(taxes);
+	const hasStructuredTaxRows = taxes.some((tax) =>
+		Boolean(
+			tax && typeof tax === "object" && String(tax.charge_type || "").trim(),
+		),
+	);
 	if (
+		!hasStructuredTaxRows &&
 		Math.abs(eligibleScalableGrandTotal - eligibleNetTotal) <= EPSILON &&
+		eligibleFixedQtyTaxTotal === 0 &&
 		actualTaxTotal === 0
 	) {
 		const docGrandTotal = toFiniteNumber(doc.grand_total) || 0;
@@ -546,6 +563,8 @@ export function getItemCostFloor(
 						rate: rawRate * rawBuyingExchangeRate,
 						baseCurrency: true,
 					});
+				} else {
+					hasUnresolvedCrossCurrencyCost = true;
 				}
 				continue;
 			}
@@ -633,6 +652,126 @@ export function isPricingRuleFreeLine(
 	);
 }
 
+function resolveNativeNetAmount(
+	item: Record<string, unknown>,
+	grossSellingRate: number,
+	qty: number,
+): number | null {
+	const rawNetAmount = toFiniteNumber(item.net_amount);
+	if (
+		rawNetAmount !== null &&
+		rawNetAmount >= 0 &&
+		(rawNetAmount > 0 || grossSellingRate <= 0)
+	) {
+		return Math.abs(rawNetAmount);
+	}
+	const rawNetRate = toFiniteNumber(item.net_rate);
+	if (
+		rawNetRate !== null &&
+		rawNetRate >= 0 &&
+		(rawNetRate > 0 || grossSellingRate <= 0)
+	) {
+		return Math.abs(rawNetRate) * qty;
+	}
+	return null;
+}
+
+function resolveNativeUnitNetRate(
+	item: Record<string, unknown>,
+	grossSellingRate: number,
+	qty: number | null,
+): number | null {
+	const rawNetAmount = toFiniteNumber(item.net_amount);
+	if (
+		rawNetAmount !== null &&
+		rawNetAmount >= 0 &&
+		(rawNetAmount > 0 || grossSellingRate <= 0) &&
+		qty !== null &&
+		qty > 0
+	) {
+		return Math.abs(rawNetAmount) / qty;
+	}
+	const rawNetRate = toFiniteNumber(item.net_rate);
+	if (
+		rawNetRate !== null &&
+		rawNetRate >= 0 &&
+		(rawNetRate > 0 || grossSellingRate <= 0)
+	) {
+		return Math.abs(rawNetRate);
+	}
+	return null;
+}
+
+function areNativeNetAmountsReconciled(
+	items: Array<Record<string, unknown>>,
+	options: LossPreventionOptions,
+): boolean {
+	const applyDiscountOn = String(
+		options.applyDiscountOn || "Grand Total",
+	).trim();
+	const isCashDiscount =
+		Boolean(options.isCashOrNonTradeDiscount) &&
+		applyDiscountOn === "Grand Total";
+	const invoiceDiscountPercentage = isCashDiscount
+		? 0
+		: Math.min(
+				Math.max(toFiniteNumber(options.invoiceDiscountPercentage) || 0, 0),
+				100,
+			);
+	const rawPrecision = toFiniteNumber(options.currencyPrecision);
+	const precision =
+		rawPrecision !== null && rawPrecision >= 0 ? Math.trunc(rawPrecision) : 2;
+	const ulp = 10 ** -precision;
+
+	let eligibleCount = 0;
+	let nativeSum = 0;
+	let expectedSum = 0;
+	let preDiscountSum = 0;
+
+	for (const item of items) {
+		if (
+			!item ||
+			item.is_return ||
+			item.posa_is_replace ||
+			isPricingRuleFreeLine(item)
+		) {
+			continue;
+		}
+		const qty = toFiniteNumber(item.qty) || 0;
+		if (qty <= 0) {
+			continue;
+		}
+		eligibleCount += 1;
+		const grossRate = getEffectiveSellingRate(item);
+		const nativeAmount = resolveNativeNetAmount(item, grossRate, qty);
+		if (nativeAmount === null) {
+			return false;
+		}
+		const { inclA, inclB } = computeRowTaxParams(item, options.taxes);
+		const preDiscountNet = Math.max((grossRate - inclB) / (1 + inclA), 0);
+		const preAmount = preDiscountNet * qty;
+		const computedAmount =
+			preDiscountNet * (1 - invoiceDiscountPercentage / 100) * qty;
+		if (
+			nativeAmount > preAmount + 1e-9 ||
+			nativeAmount > computedAmount + ulp + 1e-9
+		) {
+			return false;
+		}
+		nativeSum += nativeAmount;
+		expectedSum += computedAmount;
+		preDiscountSum += preAmount;
+	}
+
+	if (eligibleCount === 0) {
+		return false;
+	}
+	const hasUnappliedDiscount =
+		expectedSum < preDiscountSum - 0.5 * ulp - 1e-9 &&
+		nativeSum >= preDiscountSum - 1e-9;
+	return !hasUnappliedDiscount && Math.abs(nativeSum - expectedSum) <= ulp + 1e-9;
+}
+
 export function getItemLossRisk(
 	item: Record<string, unknown> | null | undefined,
 	options: LossPreventionOptions = {},
@@ -671,19 +810,21 @@ export function getItemLossRisk(
 				Math.max(toFiniteNumber(options.invoiceDiscountPercentage) || 0, 0),
 				100,
 			);
-	const rawNetRate = toFiniteNumber(item.net_rate);
-	const hasPopulatedNetRate =
-		rawNetRate !== null &&
-		rawNetRate >= 0 &&
-		(rawNetRate > 0 || grossSellingRate <= 0);
+	const nativeUnitNetRate = resolveNativeUnitNetRate(
+		item,
+		grossSellingRate,
+		qty,
+	);
 	let effectiveSellingRate: number;
-	if (
-		hasPopulatedNetRate &&
-		(rawNetRate! < preDiscountNetRate - EPSILON ||
+	if (options.reconciledNativeNet && nativeUnitNetRate !== null) {
+		effectiveSellingRate = Math.min(nativeUnitNetRate, preDiscountNetRate);
+	} else if (
+		nativeUnitNetRate !== null &&
+		(nativeUnitNetRate < preDiscountNetRate - EPSILON ||
 			isCashDiscount ||
 			invoiceDiscountPercentage <= 0)
 	) {
-		effectiveSellingRate = Math.min(rawNetRate!, preDiscountNetRate);
+		effectiveSellingRate = Math.min(nativeUnitNetRate, preDiscountNetRate);
 	} else {
 		effectiveSellingRate =
 			preDiscountNetRate * (1 - invoiceDiscountPercentage / 100);
@@ -733,7 +874,14 @@ export function findLossRiskItems(
 	if (!Array.isArray(items)) {
 		return [];
 	}
+	const reconciledNativeNet =
+		options.reconciledNativeNet ??
+		areNativeNetAmountsReconciled(items, options);
+	const effectiveOptions =
+		reconciledNativeNet === options.reconciledNativeNet
+			? options
+			: { ...options, reconciledNativeNet };
 	return items
-		.map((item) => getItemLossRisk(item, options))
+		.map((item) => getItemLossRisk(item, effectiveOptions))
 		.filter((risk): risk is LossRisk => Boolean(risk?.belowCost));
 }

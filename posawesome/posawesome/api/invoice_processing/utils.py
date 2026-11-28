@@ -156,11 +156,21 @@ def get_latest_rate(
         stale_days = cint(accounts_settings.get("stale_days"))
         filters["date"] = ["between", [add_days(transaction_date, -stale_days), transaction_date]]
 
+    # Mirror ERPNext erpnext/setup/utils.py:66-98 so same-day purpose-specific
+    # rates (e.g. for_selling=1, for_buying=0) outrank dual-purpose entries.
+    order_by = "date desc"
+    if purpose == "for_selling":
+        order_by += ", for_buying asc, name desc"
+    elif purpose == "for_buying":
+        order_by += ", for_selling asc, name desc"
+    else:
+        order_by += ", creation desc"
+
     rate_doc = frappe.get_all(
         "Currency Exchange",
         filters=filters,
         fields=["exchange_rate", "date"],
-        order_by="date desc, creation desc",
+        order_by=order_by,
         limit=1,
     )
     if rate_doc:
@@ -200,7 +210,8 @@ def resolve_erpnext_currency_rates(
 
     invoice_currency = invoice_currency or company_currency
     price_list_currency = price_list_currency or company_currency
-    exchange_rate_date = posting_date or nowdate()
+    transaction_date = posting_date or nowdate()
+    exchange_rate_date = transaction_date
 
     conversion_rate = 1.0
     if invoice_currency != company_currency:
@@ -208,7 +219,7 @@ def resolve_erpnext_currency_rates(
             invoice_currency,
             company_currency,
             cache=cache,
-            transaction_date=exchange_rate_date,
+            transaction_date=transaction_date,
             purpose="for_selling",
         )
 
@@ -218,7 +229,7 @@ def resolve_erpnext_currency_rates(
             price_list_currency,
             company_currency,
             cache=cache,
-            transaction_date=exchange_rate_date,
+            transaction_date=transaction_date,
             purpose="for_selling",
         )
 

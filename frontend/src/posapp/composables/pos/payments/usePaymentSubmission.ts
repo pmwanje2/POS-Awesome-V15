@@ -546,6 +546,7 @@ export function usePaymentSubmission(options: PaymentSubmissionOptions) {
 			applyDiscountOn,
 			isCashOrNonTradeDiscount,
 			taxes: Array.isArray(doc?.taxes) ? doc.taxes : [],
+			currencyPrecision: prec,
 		};
 		const docLossRiskItems = saleFloorPolicy.enabled
 			? findLossRiskItems(doc?.items || [], lossOptions)

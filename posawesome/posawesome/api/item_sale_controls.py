@@ -421,12 +421,12 @@ def _convert_floor_to_invoice_currency(
     return invoice_rate
 
 
-def _resolve_buying_floors_with_context(items, pos_profile=None, invoice_doc=None):
-    """Resolve authoritative per-line cost floors and item stock UOM context."""
+def _resolve_buying_floors_with_uom_context(items, pos_profile=None, invoice_doc=None):
+    """Resolve authoritative per-line cost floors, item stock UOMs, and UOM conversion factors."""
 
     item_rows = list(items or [])
     if not item_rows:
-        return {}, {}
+        return {}, {}, {}
 
     price_list, price_rows = _get_buying_price_rows(
         [row.get("item_code") for row in item_rows if hasattr(row, "get")],
@@ -619,6 +619,17 @@ def _resolve_buying_floors_with_context(items, pos_profile=None, invoice_doc=Non
 
         if candidates_floors:
             floors[index] = max(candidates_floors, key=lambda entry: flt(entry.get("base_rate")))
+    return floors, stock_uoms, conversion_factors
+
+
+def _resolve_buying_floors_with_context(items, pos_profile=None, invoice_doc=None):
+    """Resolve authoritative per-line cost floors and item stock UOM context."""
+
+    floors, stock_uoms, _conversion_factors = _resolve_buying_floors_with_uom_context(
+        items,
+        pos_profile=pos_profile,
+        invoice_doc=invoice_doc,
+    )
     return floors, stock_uoms
 
 
@@ -732,11 +743,17 @@ def _row_tax_params(row, invoice_doc):
 
         charge_type = cstr(tax.get("charge_type")).strip()
         account_head = tax.get("account_head")
-        tax_rate = (
-            flt(item_tax_map[account_head])
-            if account_head and account_head in item_tax_map
-            else flt(tax.get("rate"))
-        )
+        if account_head and account_head in item_tax_map:
+            raw_override = item_tax_map[account_head]
+            # ERPNext taxes_and_totals.py:476-480, 510-517 treats "N/A" (NOT_APPLICABLE_TAX) as 0%.
+            if raw_override is None or (
+                isinstance(raw_override, str) and raw_override.strip().upper() == "N/A"
+            ):
+                tax_rate = 0.0
+            else:
+                tax_rate = flt(raw_override)
+        else:
+            tax_rate = flt(tax.get("rate"))
         is_inclusive = bool(cint(tax.get("included_in_print_rate")))
 
         def _compute_term(terms_list):
@@ -838,7 +855,9 @@ def _rule_matches_invoice_party(rule, invoice_doc, has_doc):
     return actual == expected
 
 
-def _server_applied_free_row_indexes(item_rows, invoice_doc=None, stock_uoms=None):
+def _server_applied_free_row_indexes(
+    item_rows, invoice_doc=None, stock_uoms=None, conversion_factors=None
+):
     """Return the free rows ERPNext itself applied from an active promotional rule.
 
     ERPNext marks a promotional free row with ``is_free_item`` and the single
@@ -886,6 +905,7 @@ def _server_applied_free_row_indexes(item_rows, invoice_doc=None, stock_uoms=Non
                 "apply_recursion_over",
                 "round_free_qty",
                 "free_item_uom",
+                "uom",
                 "currency",
                 "applicable_for",
                 "customer",
@@ -907,9 +927,30 @@ def _server_applied_free_row_indexes(item_rows, invoice_doc=None, stock_uoms=Non
         or []
         if rule.get("name")
     }
+    stock_uoms_map = stock_uoms or {}
+    conversion_factors_map = conversion_factors or {}
+
+    def _authoritative_uom_factor(code, uom, stock_uom):
+        if not uom or not stock_uom or uom == stock_uom:
+            return 1.0
+        factor = conversion_factors_map.get((code, uom))
+        if factor is not None and flt(factor) > 0:
+            return flt(factor)
+        try:
+            from erpnext.stock.doctype.item.item import get_uom_conv_factor
+
+            global_factor = flt(get_uom_conv_factor(uom, stock_uom))
+            if global_factor > 0:
+                return global_factor
+        except Exception:
+            pass
+        return 0.0
+
     paid_items_by_rule = {}
     paid_qty_by_rule = {}
     paid_qty_by_rule_item = {}
+    paid_rows_by_rule = {}
+    paid_rows_by_rule_item = {}
     paid_qty = paid_amount = 0.0
     for row in item_rows:
         if (
@@ -918,23 +959,30 @@ def _server_applied_free_row_indexes(item_rows, invoice_doc=None, stock_uoms=Non
             and not cint(row.get("is_free_item"))
             and flt(row.get("qty")) > 0
         ):
+            row_code = row.get("item_code")
             row_qty = flt(row.get("qty"))
+            row_stock_uom = cstr(stock_uoms_map.get(row_code) or row.get("stock_uom")).strip()
+            row_uom = cstr(row.get("uom") or row_stock_uom).strip()
+            row_cf = _authoritative_uom_factor(row_code, row_uom, row_stock_uom)
+            row_stock_qty = row_qty * row_cf if row_cf > 0 else 0.0
             paid_qty += row_qty
             # ERPNext's doc.total: rounded line amounts, then a rounded sum.
             paid_amount += flt(
                 flt(row.get("rate")) * row_qty, _field_precision(row, "amount")
             )
             for rule_name in _applied_pricing_rule_names(row.get("pricing_rules")):
-                paid_items_by_rule.setdefault(rule_name, set()).add(row.get("item_code"))
+                paid_items_by_rule.setdefault(rule_name, set()).add(row_code)
                 paid_qty_by_rule[rule_name] = paid_qty_by_rule.get(rule_name, 0.0) + row_qty
-                key = (rule_name, row.get("item_code"))
+                key = (rule_name, row_code)
                 paid_qty_by_rule_item[key] = paid_qty_by_rule_item.get(key, 0.0) + row_qty
+                entry = (row_code, row_stock_uom, row_stock_qty)
+                paid_rows_by_rule.setdefault(rule_name, []).append(entry)
+                paid_rows_by_rule_item.setdefault(key, []).append(entry)
     paid_amount = flt(paid_amount, _field_precision(invoice_doc, "total"))
 
     posting_date = invoice_doc.get("posting_date") if has_doc else None
     company = invoice_doc.get("company") if has_doc else None
     invoice_currency = cstr(invoice_doc.get("currency")).strip() if has_doc else ""
-    stock_uoms_map = stock_uoms or {}
     authorized = set()
     seen = set()
     for index, rule_name in free_rules.items():
@@ -979,6 +1027,7 @@ def _server_applied_free_row_indexes(item_rows, invoice_doc=None, stock_uoms=Non
                 and (not flt(rule.get("max_amt")) or paid_amount <= flt(rule.get("max_amt")))
             )
             qualifying_qty = paid_qty
+            qualifying_rows = []
         else:
             paid_items = paid_items_by_rule.get(rule_name) or set()
             is_same_item_award = bool(cint(rule.get("same_item")) and item_code in paid_items)
@@ -990,6 +1039,11 @@ def _server_applied_free_row_indexes(item_rows, invoice_doc=None, stock_uoms=Non
                 if is_same_item_award
                 else paid_qty_by_rule.get(rule_name, 0.0)
             )
+            qualifying_rows = (
+                paid_rows_by_rule_item.get((rule_name, item_code), [])
+                if is_same_item_award
+                else paid_rows_by_rule.get(rule_name, [])
+            )
         if not gives_item:
             continue
         raw_free_qty = flt(rule.get("free_qty"))
@@ -998,15 +1052,26 @@ def _server_applied_free_row_indexes(item_rows, invoice_doc=None, stock_uoms=Non
             recurse_for = flt(rule.get("recurse_for"))
             if recurse_for <= 0:
                 continue
+            # ERPNext pricing_rule/utils.py:312-332, 423-441 evaluates min_qty/max_qty
+            # against stock_qty (scaled by rule.uom conversion when rule.uom is set),
+            # while get_product_discount_rule:845-866 awards recursively from row.qty.
+            rule_uom = cstr(rule.get("uom")).strip()
+            qualifying_threshold_qty = 0.0
+            for q_code, q_stock_uom, q_stock_qty in qualifying_rows:
+                if not rule_uom or rule_uom == q_stock_uom:
+                    qualifying_threshold_qty += q_stock_qty
+                else:
+                    rule_uom_cf = _authoritative_uom_factor(q_code, rule_uom, q_stock_uom)
+                    if rule_uom_cf > 0:
+                        qualifying_threshold_qty += q_stock_qty / rule_uom_cf
             min_qty = flt(rule.get("min_qty"))
-            if min_qty > 0 and qualifying_qty < min_qty:
+            if min_qty > 0 and qualifying_threshold_qty < min_qty - 1e-9:
                 continue
-            effective_qty = qualifying_qty
             max_qty = flt(rule.get("max_qty"))
-            if max_qty > 0:
-                effective_qty = min(effective_qty, max_qty)
+            if max_qty > 0 and qualifying_threshold_qty > max_qty + 1e-9:
+                continue
             recursion_over = flt(rule.get("apply_recursion_over"))
-            transaction_qty = effective_qty - recursion_over
+            transaction_qty = qualifying_qty - recursion_over
             if transaction_qty > 0:
                 if cint(rule.get("round_free_qty")):
                     max_awarded_qty = (flt(transaction_qty) // recurse_for) * base_free_qty
@@ -1091,6 +1156,16 @@ def _has_populated_net_field(row, fieldname, gross_rate):
     )
 
 
+def _row_native_net_amount(row, gross_rate, qty):
+    """Return native row net amount, preferring ``net_amount`` over ``net_rate * qty``."""
+
+    if _has_populated_net_field(row, "net_amount", gross_rate):
+        return abs(flt(row.get("net_amount")))
+    if _has_populated_net_field(row, "net_rate", gross_rate):
+        return abs(flt(row.get("net_rate"))) * qty
+    return None
+
+
 def collect_below_buying_price_errors(
     items, is_return=False, pos_profile=None, invoice_doc=None, policy=None
 ):
@@ -1101,7 +1176,7 @@ def collect_below_buying_price_errors(
     policy = policy or resolve_sale_floor_policy(pos_profile)
     if not policy.get("enabled"):
         return []
-    buying_floors, stock_uoms = _resolve_buying_floors_with_context(
+    buying_floors, stock_uoms, conversion_factors = _resolve_buying_floors_with_uom_context(
         item_rows,
         pos_profile=pos_profile,
         invoice_doc=invoice_doc,
@@ -1124,6 +1199,7 @@ def collect_below_buying_price_errors(
         item_rows,
         invoice_doc,
         stock_uoms=stock_uoms,
+        conversion_factors=conversion_factors,
     )
 
     row_tax_params = {}
@@ -1191,34 +1267,49 @@ def collect_below_buying_price_errors(
 
     # ERPNext distributes rounding differences (+1 ULP) onto individual lines so
     # sum(item.net_amount) matches the discounted net total (taxes_and_totals.py:1105-1116).
-    # Honor native calculated item net rates directly when every eligible row is
-    # populated, stays <= pre_discount_net, stays within 1 ULP of its computed share,
-    # and reconciles to the invoice's expected net total.
+    # Reconcile via native ``net_amount`` (falling back to ``net_rate * qty``) so
+    # multi-qty lines whose rounded ``net_rate * qty`` differs from ``net_amount``
+    # still preserve ERPNext's exact allocation.
     reconciled_native_nets = False
     if eligible_indexes:
         native_sum = 0.0
         expected_sum = 0.0
+        pre_discount_sum = 0.0
         invoice_ulp = 1e-9
         all_rows_reconciled = True
         for idx in eligible_indexes:
             el_row = item_rows[idx]
             el_gross = abs(flt(el_row.get("rate")))
-            if not _has_populated_net_field(el_row, "net_rate", el_gross):
+            el_qty = abs(flt(el_row.get("qty")))
+            el_native_amount = _row_native_net_amount(el_row, el_gross, el_qty)
+            if el_native_amount is None:
                 all_rows_reconciled = False
                 break
-            el_qty = abs(flt(el_row.get("qty")))
-            el_native = abs(flt(el_row.get("net_rate")))
-            el_pre = pre_discount_nets.get(idx, 0.0)
-            el_computed = computed_net_rates.get(idx, 0.0)
-            el_prec = _resolve_currency_precision(el_row, invoice_doc, "net_rate")
+            el_pre_amount = pre_discount_nets.get(idx, 0.0) * el_qty
+            el_computed_amount = computed_net_rates.get(idx, 0.0) * el_qty
+            el_prec = _resolve_currency_precision(el_row, invoice_doc, "net_amount")
+            if el_prec is None:
+                el_prec = _resolve_currency_precision(el_row, invoice_doc, "net_rate")
             row_ulp = (10.0 ** (-el_prec)) if el_prec is not None else 1e-9
             invoice_ulp = max(invoice_ulp, row_ulp)
-            if el_native > el_pre + 1e-9 or (el_native * el_qty) > (el_computed * el_qty) + row_ulp + 1e-9:
+            if (
+                el_native_amount > el_pre_amount + 1e-9
+                or el_native_amount > el_computed_amount + row_ulp + 1e-9
+            ):
                 all_rows_reconciled = False
                 break
-            native_sum += el_native * el_qty
-            expected_sum += el_computed * el_qty
-        if all_rows_reconciled and abs(native_sum - expected_sum) <= invoice_ulp + 1e-9:
+            native_sum += el_native_amount
+            expected_sum += el_computed_amount
+            pre_discount_sum += el_pre_amount
+        has_unapplied_discount = (
+            expected_sum < pre_discount_sum - 0.5 * invoice_ulp - 1e-9
+            and native_sum >= pre_discount_sum - 1e-9
+        )
+        if (
+            all_rows_reconciled
+            and not has_unapplied_discount
+            and abs(native_sum - expected_sum) <= invoice_ulp + 1e-9
+        ):
             reconciled_native_nets = True
 
     for index, row in enumerate(item_rows):
@@ -1272,14 +1363,29 @@ def collect_below_buying_price_errors(
         base_minimum_selling_rate = base_floor * (1 + minimum_margin / 100)
 
         gross_rate = abs(flt(row.get("rate")))
+        row_qty = abs(flt(row.get("qty")))
         computed_net_rate = computed_net_rates.get(index, 0.0)
         net_rate_precision = _resolve_currency_precision(row, invoice_doc, "net_rate")
         base_precision = _resolve_currency_precision(row, invoice_doc, "base_net_rate")
 
-        if reconciled_native_nets and _has_populated_net_field(row, "net_rate", gross_rate):
-            selling_rate = abs(flt(row.get("net_rate")))
+        if reconciled_native_nets:
+            if _has_populated_net_field(row, "net_amount", gross_rate) and row_qty > 0:
+                selling_rate = abs(flt(row.get("net_amount"))) / row_qty
+            elif _has_populated_net_field(row, "net_rate", gross_rate):
+                selling_rate = abs(flt(row.get("net_rate")))
+            else:
+                selling_rate = computed_net_rate
         else:
             selling_rate = computed_net_rate
+            if _has_populated_net_field(row, "net_amount", gross_rate) and row_qty > 0:
+                row_net_from_amount = abs(flt(row.get("net_amount"))) / row_qty
+                if net_rate_precision is not None:
+                    if flt(row_net_from_amount, net_rate_precision) < flt(
+                        selling_rate, net_rate_precision
+                    ):
+                        selling_rate = row_net_from_amount
+                elif row_net_from_amount < selling_rate:
+                    selling_rate = row_net_from_amount
             if _has_populated_net_field(row, "net_rate", gross_rate):
                 row_net_rate = abs(flt(row.get("net_rate")))
                 if net_rate_precision is not None:
@@ -1291,6 +1397,17 @@ def collect_below_buying_price_errors(
                     selling_rate = row_net_rate
 
         base_selling_rate = selling_rate * invoice_to_company
+        if _has_populated_net_field(row, "base_net_amount", gross_rate) and row_qty > 0:
+            row_base_from_amount = abs(flt(row.get("base_net_amount"))) / row_qty
+            if base_precision is not None:
+                if flt(row_base_from_amount, base_precision) < flt(
+                    base_selling_rate, base_precision
+                ):
+                    base_selling_rate = row_base_from_amount
+                    selling_rate = row_base_from_amount / invoice_to_company
+            elif row_base_from_amount < base_selling_rate:
+                base_selling_rate = row_base_from_amount
+                selling_rate = row_base_from_amount / invoice_to_company
         if _has_populated_net_field(row, "base_net_rate", gross_rate):
             row_base_net_rate = abs(flt(row.get("base_net_rate")))
             if base_precision is not None:
