@@ -25,6 +25,12 @@ export function resolveInvoiceCurrency(
 	return String(invoice?.currency || fallbackCurrency || "").trim();
 }
 
+export function hasPositivePaymentMethodAmount(
+	method: { amount?: unknown } | null | undefined,
+): boolean {
+	return flt(method?.amount) > 0;
+}
+
 export function getSelectedInvoiceCurrencies(
 	invoices: any[],
 	fallbackCurrency?: string | null,
@@ -112,8 +118,8 @@ export function usePosPaySelection({
 	});
 
 	const total_payment_methods = computed(() => {
-		if (!payment_methods.value.length) return 0;
 		return payment_methods.value.reduce((acc: number, cur: any) => {
+			if (!hasPositivePaymentMethodAmount(cur)) return acc;
 			const amount = parseFloat(cur?.invoice_equivalent ?? cur?.amount ?? 0);
 			return acc + (isNaN(amount) ? 0 : amount);
 		}, 0);
@@ -188,6 +194,8 @@ export function usePosPaySelection({
 		payment_methods.value = payment_methods.value.map((method: any) => ({
 			...method,
 			amount: 0,
+			invoice_amount: 0,
+			invoice_equivalent: 0,
 			base_amount:
 				method?.base_amount !== undefined ? 0 : method?.base_amount,
 		}));

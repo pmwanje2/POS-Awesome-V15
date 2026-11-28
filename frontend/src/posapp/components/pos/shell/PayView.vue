@@ -879,6 +879,10 @@ export default {
 
 		const resolvePaymentMethodRate = async (method) => {
 			if (!method) return;
+			if (!(flt(method.amount) > 0)) {
+				method.invoice_amount = 0;
+				method.invoice_equivalent = 0;
+			}
 			const selectedAccount = (available_bank_accounts.value?.[method.mode_of_payment] || []).find(
 				(account) => account.account === method.bank_account,
 			);
@@ -945,8 +949,9 @@ export default {
 				}
 				method.payment_currency = paymentCurrency;
 				method._rate_error = !invoiceResult.found || !companyResult.found;
-				method.invoice_equivalent = invoiceResult.rate
-					? flt(flt(method.amount) * invoiceResult.rate)
+				const amount = flt(method.amount);
+				method.invoice_equivalent = invoiceResult.rate && amount > 0
+					? flt(amount * invoiceResult.rate)
 					: 0;
 				method.company_exchange_rate = companyResult.rate || null;
 				method.invoice_exchange_rate = invoiceResult.rate || null;

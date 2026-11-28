@@ -1,5 +1,5 @@
 import { computed, nextTick, ref, watch } from "vue";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import payViewSource from "../src/posapp/components/pos/shell/PayView.vue?raw";
 import {
@@ -50,6 +50,265 @@ function extractExpression(source: string, marker: RegExp, label: string): strin
 	}
 	return source.slice(start, end);
 }
+
+describe("cleared PayView payment methods", () => {
+	afterEach(() => vi.unstubAllGlobals());
+
+	function setup() {
+		const flt = (value: unknown) => Number.parseFloat(String(value)) || 0;
+		const translate = (value: string) => value;
+		const paymentRpc = vi.fn(({ callback }) => callback({}));
+		vi.stubGlobal("flt", flt);
+		vi.stubGlobal("__", translate);
+		vi.stubGlobal("frappe", {
+			call: paymentRpc,
+			throw: (message: string) => {
+				throw new Error(message);
+			},
+		});
+
+		const posProfile = ref({
+			name: "Till",
+			currency: "USD",
+			company_currency: "UGX",
+		});
+		const currencyFilter = ref("ALL");
+		const selection = usePosPaySelection({
+			posProfile,
+			currency_filter: currencyFilter,
+		});
+		selection.payment_methods.value = [
+			{
+				mode_of_payment: "Cash EUR",
+				amount: 10,
+				payment_currency: "EUR",
+			},
+		];
+		const method = selection.payment_methods.value[0];
+		const postingDate = ref("2026-11-28");
+		const companyCurrencyLocal = ref("UGX");
+		const invoiceTotalCurrency = ref("USD");
+		const exchangeRateLoading = ref(false);
+		const exchangeRateError = ref<string | null>(null);
+		const exchangeRateRequestKey = ref("");
+		const exchangeRate = ref<number | null>(null);
+		const requiresExchangeRate = ref(true);
+		const company = ref("Test Company");
+		let releaseMethodQuotes!: () => void;
+		const methodQuotesPending = new Promise<void>((resolve) => {
+			releaseMethodQuotes = resolve;
+		});
+		const globals = {
+			available_bank_accounts: ref({}),
+			getPaymentMethodCurrency: () => "EUR",
+			paymentMethodRateSeqs: new WeakMap(),
+			companyCurrencyLocal,
+			invoiceTotalCurrency,
+			pos_profile: posProfile,
+			company,
+			postingDate,
+			getTodayDate: () => "2026-11-28",
+			exchangeRatePurpose: ref("for_selling"),
+			exchangeRate,
+			exchangeRateLoading,
+			exchangeRateError,
+			exchangeRateRequestKey,
+			requiresExchangeRate,
+			resolveExchangeRate: async ({
+				fromCurrency,
+				toCurrency,
+				effectiveDate,
+			}: Record<string, string>) => {
+				const nextDay = effectiveDate === "2026-11-29";
+				if (nextDay && fromCurrency === "EUR")
+					await methodQuotesPending;
+				return {
+					found: true,
+					rate:
+						toCurrency === "USD"
+							? nextDay
+								? 4
+								: 3
+							: nextDay
+								? 3800
+								: 3700,
+					rateDate: effectiveDate,
+					source: "currency_exchange",
+				};
+			},
+		};
+		const fetchExchangeRateBody = extractBlock(
+			payViewSource,
+			/\bconst fetchExchangeRate\s*=\s*async\s*\(\)\s*=>\s*\{/,
+			"fetchExchangeRate",
+		);
+		const resolvePaymentMethodRateBody = extractBlock(
+			payViewSource,
+			/\bconst resolvePaymentMethodRate\s*=\s*async\s*\(method\)\s*=>\s*\{/,
+			"resolvePaymentMethodRate",
+		);
+		const { fetchExchangeRate, resolvePaymentMethodRate } = new Function(
+			...Object.keys(globals),
+			`return {
+				fetchExchangeRate: async () => { ${fetchExchangeRateBody} },
+				resolvePaymentMethodRate: async (method) => { ${resolvePaymentMethodRateBody} },
+			};`,
+		)(...Object.values(globals));
+		const { processPayment } = usePosPaySubmission({
+			...selection,
+			customerName: ref("CUST-1"),
+			company,
+			companyCurrency: companyCurrencyLocal,
+			posProfile,
+			posOpeningShift: ref({ name: "SHIFT-1" }),
+			postingDate,
+			currencyFilter,
+			exchangeRate,
+			requiresExchangeRate,
+			exchangeRateLoading,
+			exchangeRateError,
+			exchangeRateRequestKey,
+			invoiceTotalCurrency,
+			referenceNo: ref(""),
+			referenceDate: ref(""),
+			autoAllocatePaymentAmount: ref(false),
+			load_print_page: vi.fn(),
+			eventBus: { emit: vi.fn() },
+			get_outstanding_invoices: vi.fn(),
+			get_unallocated_payments: vi.fn(),
+			get_draft_mpesa_payments_register: vi.fn(),
+			set_mpesa_search_params: vi.fn(),
+			autoReconcile: vi.fn(),
+		});
+		return {
+			selection,
+			method,
+			postingDate,
+			exchangeRate,
+			exchangeRateLoading,
+			resolvePaymentMethodRate,
+			fetchExchangeRate,
+			processPayment,
+			paymentRpc,
+			releaseMethodQuotes,
+		};
+	}
+
+	it("blocks submission after clearing a method while its new posting-date quote is pending", async () => {
+		const pay = setup();
+		await Promise.all([
+			pay.fetchExchangeRate(),
+			pay.resolvePaymentMethodRate(pay.method),
+		]);
+		expect(pay.method.invoice_exchange_rate).toBe(3);
+		expect(pay.selection.total_payment_methods.value).toBe(30);
+		pay.method.invoice_amount = 30;
+
+		pay.method.amount = 0;
+		pay.postingDate.value = "2026-11-29";
+		const pendingMethod = pay.resolvePaymentMethodRate(pay.method);
+		await pay.fetchExchangeRate();
+		expect(pay.exchangeRate.value).toBe(3800);
+		expect(pay.exchangeRateLoading.value).toBe(false);
+		expect(pay.method._rate_loading).toBe(true);
+
+		expect.soft(pay.selection.total_payment_methods.value).toBe(0);
+		expect.soft(pay.method.invoice_amount).toBe(0);
+		expect.soft(pay.method.invoice_equivalent).toBe(0);
+		const submissionError = await pay
+			.processPayment()
+			.catch((error: Error) => error.message);
+		expect
+			.soft(
+				pay.paymentRpc.mock.calls.map(([rpc]) => ({
+					payment_methods: rpc.args.payload.payment_methods,
+					total_payment_methods:
+						rpc.args.payload.total_payment_methods,
+				})),
+			)
+			.toEqual([]);
+		expect
+			.soft(submissionError)
+			.toBe("Please make a payment or select a payment");
+
+		pay.method.amount = 5;
+		const reenteredMethod = pay.resolvePaymentMethodRate(pay.method);
+		pay.releaseMethodQuotes();
+		await Promise.all([pendingMethod, reenteredMethod]);
+		expect(pay.method.invoice_exchange_rate).toBe(4);
+		expect(pay.method.rate_date).toBe("2026-11-29");
+		expect(pay.selection.total_payment_methods.value).toBe(20);
+	});
+
+	it("uses only positive methods in the total and submission payload even if a cleared row has a cached equivalent", async () => {
+		const pay = setup();
+		await pay.fetchExchangeRate();
+		pay.selection.payment_methods.value = [
+			{
+				mode_of_payment: "Cash EUR",
+				amount: 2,
+				invoice_equivalent: 6.125,
+			},
+			{
+				mode_of_payment: "Cash USD",
+				amount: 0,
+				invoice_equivalent: 30,
+				invoice_amount: 30,
+			},
+		];
+
+		expect.soft(pay.selection.total_payment_methods.value).toBe(6.125);
+		await pay.processPayment();
+		expect(pay.paymentRpc).toHaveBeenCalledTimes(1);
+		expect(pay.paymentRpc).toHaveBeenCalledWith(
+			expect.objectContaining({
+				args: {
+					payload: expect.objectContaining({
+						payment_methods: [
+							expect.objectContaining({
+								mode_of_payment: "Cash EUR",
+								amount: 2,
+							}),
+						],
+						total_payment_methods: 6.125,
+					}),
+				},
+			}),
+		);
+	});
+
+	it.each([-1, "", Number.NaN])(
+		"clears cached amounts when the method amount is %s",
+		async (input) => {
+			const pay = setup();
+			await pay.resolvePaymentMethodRate(pay.method);
+			pay.method.invoice_amount = 30;
+			pay.method.amount = input;
+			await pay.resolvePaymentMethodRate(pay.method);
+
+			expect(pay.method).toMatchObject({
+				amount: input,
+				invoice_amount: 0,
+				invoice_equivalent: 0,
+			});
+			expect(pay.selection.total_payment_methods.value).toBe(0);
+		},
+	);
+
+	it("clears cached amounts when resetting payment methods after submission", async () => {
+		const pay = setup();
+		await pay.resolvePaymentMethodRate(pay.method);
+		pay.method.invoice_amount = 30;
+		pay.selection.resetPaymentMethodAmounts();
+
+		expect(pay.selection.payment_methods.value[0]).toMatchObject({
+			amount: 0,
+			invoice_amount: 0,
+			invoice_equivalent: 0,
+		});
+		expect(pay.selection.total_payment_methods.value).toBe(0);
+	});
+});
 
 describe("PayView.vue company currency & selling FX resolution", () => {
 	it("resolves company currency from pos_profile.company_currency and fetches selling FX when opening companyDoc is absent", async () => {
