@@ -160,14 +160,13 @@ def get_latest_rate(
         filters.append(["date", ">", checkpoint_date])
 
     # Mirror ERPNext erpnext/setup/utils.py:66-98 so same-day purpose-specific
-    # rates (e.g. for_selling=1, for_buying=0) outrank dual-purpose entries.
+    # rates outrank dual-purpose entries and ties always break by `name desc`.
     order_by = "date desc"
     if purpose == "for_selling":
-        order_by += ", for_buying asc, name desc"
+        order_by += ", for_buying asc"
     elif purpose == "for_buying":
-        order_by += ", for_selling asc, name desc"
-    else:
-        order_by += ", creation desc"
+        order_by += ", for_selling asc"
+    order_by += ", name desc"
 
     rate_doc = frappe.get_all(
         "Currency Exchange",

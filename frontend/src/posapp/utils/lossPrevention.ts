@@ -102,6 +102,14 @@ export function toFiniteNumber(value: unknown): number | null {
 	return Number.isFinite(parsed) ? parsed : null;
 }
 
+function roundToPrecision(value: number, precision: number): number {
+	if (!Number.isFinite(value)) {
+		return value;
+	}
+	const factor = 10 ** precision;
+	return Math.round((value + Math.sign(value) * 1e-12) * factor) / factor;
+}
+
 function resolveInvoiceToCompanyRate(
 	item: Record<string, unknown>,
 	buyingTableCurrency = "",
@@ -475,7 +483,12 @@ export function getItemCostFloor(
 			toFiniteNumber(selected?.base_price_list_rate) ??
 			toFiniteNumber(selected?.base_rate);
 		const rawTableRate = toFiniteNumber(selected?.price_list_rate);
-		const conversionFactor = exact ? 1 : uomConversionFactor;
+		const priceNotUomDependent =
+			selected?.price_not_uom_dependent === true ||
+			selected?.price_not_uom_dependent === 1 ||
+			selected?.price_not_uom_dependent === "1";
+		const conversionFactor =
+			exact || priceNotUomDependent ? 1 : uomConversionFactor;
 		if (baseRate !== null && baseRate > 0) {
 			selectedTableRate = baseRate * conversionFactor;
 			hasNormalizedBuyingPrice = true;
@@ -493,9 +506,6 @@ export function getItemCostFloor(
 			if (sameAsCompany) {
 				selectedTableRate = rawTableRate * conversionFactor;
 				hasNormalizedBuyingPrice = true;
-			} else if (sameAsInvoice) {
-				selectedTableInvoiceRate = rawTableRate * conversionFactor;
-				hasNormalizedBuyingPrice = true;
 			} else if (
 				buyingPriceCurrency &&
 				selectedTableCurrency === buyingPriceCurrency &&
@@ -504,6 +514,9 @@ export function getItemCostFloor(
 			) {
 				selectedTableRate =
 					rawTableRate * conversionFactor * rawBuyingExchangeRate;
+				hasNormalizedBuyingPrice = true;
+			} else if (sameAsInvoice) {
+				selectedTableInvoiceRate = rawTableRate * conversionFactor;
 				hasNormalizedBuyingPrice = true;
 			} else if (selectedTableCurrency) {
 				hasUnresolvedCrossCurrencyCost = true;
@@ -879,8 +892,15 @@ function areNativeNetAmountsReconciled(
 		) {
 			hasZeroAboveHalfUlp = true;
 		}
+		// ERPNext taxes_and_totals.py:438-462 rounds inclusive-tax net_amount to
+		// currency precision (e.g. flt(0.01 / 1.18, 2) == 0.01), which may exceed
+		// unrounded preAmount while staying <= gross line amount.
+		const maxPreAmount = Math.min(
+			grossRate * qty,
+			Math.max(preAmount, roundToPrecision(preAmount, precision)),
+		);
 		if (
-			nativeAmount > preAmount + 1e-9 ||
+			nativeAmount > maxPreAmount + 1e-9 ||
 			nativeAmount > computedAmount + ulp + 1e-9
 		) {
 			return false;
@@ -949,7 +969,9 @@ export function getItemLossRisk(
 				Math.max(toFiniteNumber(options.invoiceDiscountPercentage) || 0, 0),
 				100,
 			);
-	const rawPrecision = toFiniteNumber(options.currencyPrecision);
+	const rawPrecision = toFiniteNumber(
+		options.currencyPrecision ?? item.currency_precision,
+	);
 	const precision =
 		rawPrecision !== null && rawPrecision >= 0 ? Math.trunc(rawPrecision) : 2;
 	const computedNetRate =
@@ -966,16 +988,20 @@ export function getItemLossRisk(
 		precision,
 		allowZeroNativeNet,
 	);
+	const maxPreDiscountNetRate = Math.min(
+		grossSellingRate,
+		Math.max(preDiscountNetRate, roundToPrecision(preDiscountNetRate, precision)),
+	);
 	let effectiveSellingRate: number;
 	if (options.reconciledNativeNet && nativeUnitNetRate !== null) {
-		effectiveSellingRate = Math.min(nativeUnitNetRate, preDiscountNetRate);
+		effectiveSellingRate = nativeUnitNetRate;
 	} else if (
 		nativeUnitNetRate !== null &&
 		(nativeUnitNetRate < preDiscountNetRate - EPSILON ||
 			isCashDiscount ||
 			invoiceDiscountPercentage <= 0)
 	) {
-		effectiveSellingRate = Math.min(nativeUnitNetRate, preDiscountNetRate);
+		effectiveSellingRate = Math.min(nativeUnitNetRate, maxPreDiscountNetRate);
 	} else {
 		effectiveSellingRate =
 			preDiscountNetRate * (1 - invoiceDiscountPercentage / 100);
@@ -997,7 +1023,11 @@ export function getItemLossRisk(
 	const comparisonSellingRate = cost.baseCurrency
 		? effectiveSellingRate * currencyConversionRate
 		: effectiveSellingRate;
-	if (comparisonSellingRate + EPSILON >= minimumCostRate) {
+	// Mirror ERPNext selling_controller.py:473-487: round both selling rate and
+	// cost floor to currency precision before comparison rather than fixed 0.0001.
+	const comparedSellingRate = roundToPrecision(comparisonSellingRate, precision);
+	const comparedMinimumRate = roundToPrecision(minimumCostRate, precision);
+	if (comparedSellingRate >= comparedMinimumRate) {
 		return null;
 	}
 	const rawDisplayCostRate = cost.baseCurrency

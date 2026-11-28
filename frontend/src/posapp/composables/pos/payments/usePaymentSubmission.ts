@@ -137,6 +137,19 @@ const BUYING_LIST_SCALAR_FIELDS = new Set<string>([
 	"buying_rate",
 ]);
 
+function normalizeRowUom(row: Record<string, any> | null | undefined): string {
+	return String(row?.uom || row?.stock_uom || "").trim();
+}
+
+function areRowUomsCompatible(
+	docItem: Record<string, any>,
+	cartItem: Record<string, any>,
+): boolean {
+	const docUom = normalizeRowUom(docItem);
+	const cartUom = normalizeRowUom(cartItem);
+	return !docUom || !cartUom || docUom === cartUom;
+}
+
 function resolveCartItemMatches(
 	docItems: Array<Record<string, any>>,
 	liveCartItems: Array<Record<string, any>>,
@@ -186,7 +199,54 @@ function resolveCartItemMatches(
 		}
 	}
 
-	// Pass 2a: positional fallback for unmatched rows whose same-index cart slot is still unclaimed.
+	// Pass 2a: positional exact (item_code, uom) match for anonymous rows carrying an explicit UOM.
+	for (let i = 0; i < docItems.length; i++) {
+		if (matchedIndexes[i] !== -1 || usedCartIndexes.has(i)) {
+			continue;
+		}
+		const docItem = docItems[i];
+		const docUom = normalizeRowUom(docItem);
+		const sameIndex = liveCartItems[i];
+		if (
+			docItem &&
+			typeof docItem === "object" &&
+			docUom &&
+			sameIndex &&
+			sameIndex.item_code === docItem.item_code &&
+			normalizeRowUom(sameIndex) === docUom
+		) {
+			matchedIndexes[i] = i;
+			usedCartIndexes.add(i);
+		}
+	}
+
+	// Pass 2b: unclaimed exact (item_code, uom) match so reordered same-SKU different-UOM rows never swap costs.
+	for (let i = 0; i < docItems.length; i++) {
+		if (matchedIndexes[i] !== -1) {
+			continue;
+		}
+		const docItem = docItems[i];
+		if (!docItem || typeof docItem !== "object" || !docItem.item_code) {
+			continue;
+		}
+		const docUom = normalizeRowUom(docItem);
+		if (!docUom) {
+			continue;
+		}
+		const unclaimedBySkuAndUom = liveCartItems.findIndex(
+			(cartItem, idx) =>
+				!usedCartIndexes.has(idx) &&
+				cartItem &&
+				cartItem.item_code === docItem.item_code &&
+				normalizeRowUom(cartItem) === docUom,
+		);
+		if (unclaimedBySkuAndUom !== -1) {
+			matchedIndexes[i] = unclaimedBySkuAndUom;
+			usedCartIndexes.add(unclaimedBySkuAndUom);
+		}
+	}
+
+	// Pass 2c: positional bare-SKU fallback when UOMs are absent or compatible.
 	for (let i = 0; i < docItems.length; i++) {
 		if (matchedIndexes[i] !== -1 || usedCartIndexes.has(i)) {
 			continue;
@@ -197,14 +257,15 @@ function resolveCartItemMatches(
 			docItem &&
 			typeof docItem === "object" &&
 			sameIndex &&
-			sameIndex.item_code === docItem.item_code
+			sameIndex.item_code === docItem.item_code &&
+			areRowUomsCompatible(docItem, sameIndex)
 		) {
 			matchedIndexes[i] = i;
 			usedCartIndexes.add(i);
 		}
 	}
 
-	// Pass 2b: unclaimed SKU fallback, then any SKU match if server split one cart row into multiple rows.
+	// Pass 2d: unclaimed UOM-compatible SKU fallback, then any UOM-compatible SKU match for split rows.
 	for (let i = 0; i < docItems.length; i++) {
 		if (matchedIndexes[i] !== -1) {
 			continue;
@@ -217,7 +278,8 @@ function resolveCartItemMatches(
 			(cartItem, idx) =>
 				!usedCartIndexes.has(idx) &&
 				cartItem &&
-				cartItem.item_code === docItem.item_code,
+				cartItem.item_code === docItem.item_code &&
+				areRowUomsCompatible(docItem, cartItem),
 		);
 		if (unclaimedBySku !== -1) {
 			matchedIndexes[i] = unclaimedBySku;
@@ -225,7 +287,10 @@ function resolveCartItemMatches(
 			continue;
 		}
 		const anyBySku = liveCartItems.findIndex(
-			(cartItem) => cartItem && cartItem.item_code === docItem.item_code,
+			(cartItem) =>
+				cartItem &&
+				cartItem.item_code === docItem.item_code &&
+				areRowUomsCompatible(docItem, cartItem),
 		);
 		if (anyBySku !== -1) {
 			matchedIndexes[i] = anyBySku;
@@ -235,13 +300,69 @@ function resolveCartItemMatches(
 	return matchedIndexes;
 }
 
+function applyAuthoritativeDocHeaderFx(
+	row: Record<string, any>,
+	doc?: Record<string, any> | null,
+): Record<string, any> {
+	// Mirror ERPNext taxes_and_totals.py:344: parent invoice header currency & FX
+	// are authoritative for every child item, overriding any stale child-row or
+	// cart-row currency / conversion_rate (including stale positive values like 1).
+	if (!doc || typeof doc !== "object") {
+		return row;
+	}
+	const originalRowCurrency = String(row.currency || "").trim();
+	const docCurrency = String(doc.currency || "").trim();
+	if (docCurrency) {
+		if (
+			originalRowCurrency &&
+			originalRowCurrency !== docCurrency &&
+			isBlankValue(row.buying_rate_currency) &&
+			isBlankValue(row._source_buying_currency) &&
+			(Number(row.trade_price) > 0 ||
+				Number(row.buying_price) > 0 ||
+				Number(row.buying_rate) > 0)
+		) {
+			row._source_buying_currency = originalRowCurrency;
+		}
+		row.currency = doc.currency;
+		if (
+			originalRowCurrency &&
+			originalRowCurrency !== docCurrency &&
+			isBlankValue(doc.conversion_rate)
+		) {
+			row.conversion_rate = undefined;
+		}
+	}
+	if (!isBlankValue(doc.price_list_currency)) {
+		row.price_list_currency = doc.price_list_currency;
+	}
+	if (!isBlankValue(doc.company_currency)) {
+		row.company_currency = doc.company_currency;
+	}
+	if (isPositiveFinite(doc.conversion_rate)) {
+		row.conversion_rate = doc.conversion_rate;
+	} else if (!isBlankValue(doc.conversion_rate)) {
+		row.conversion_rate = doc.conversion_rate;
+	}
+	if (isPositiveFinite(doc.plc_conversion_rate)) {
+		row.plc_conversion_rate = doc.plc_conversion_rate;
+	} else if (!isBlankValue(doc.plc_conversion_rate)) {
+		row.plc_conversion_rate = doc.plc_conversion_rate;
+	}
+	return row;
+}
+
 function mergeDocItemsWithCartCostFallback(
 	docItems: Array<Record<string, any>>,
 	liveCartItems: Array<Record<string, any>>,
 	doc?: Record<string, any> | null,
 ): Array<Record<string, any>> {
 	if (!docItems.length) {
-		return liveCartItems;
+		return liveCartItems.map((cartItem) =>
+			cartItem && typeof cartItem === "object"
+				? applyAuthoritativeDocHeaderFx({ ...cartItem }, doc)
+				: cartItem,
+		);
 	}
 	const matchedIndexes = resolveCartItemMatches(docItems, liveCartItems);
 	return docItems.map((docItem, index) => {
@@ -250,52 +371,10 @@ function mergeDocItemsWithCartCostFallback(
 		}
 		const matchedIndex = matchedIndexes[index] ?? -1;
 		const matched = matchedIndex !== -1 ? liveCartItems[matchedIndex] : null;
-		const merged: Record<string, any> = { ...docItem };
-
-		// Mirror ERPNext taxes_and_totals.py:344: parent invoice header currency & FX
-		// are authoritative for every child item, overriding any stale child-row or
-		// cart-row currency / conversion_rate (including stale positive values like 1).
-		if (doc && typeof doc === "object") {
-			const originalRowCurrency = String(merged.currency || "").trim();
-			const docCurrency = String(doc.currency || "").trim();
-			if (docCurrency) {
-				if (
-					originalRowCurrency &&
-					originalRowCurrency !== docCurrency &&
-					isBlankValue(merged.buying_rate_currency) &&
-					isBlankValue(merged._source_buying_currency) &&
-					(Number(merged.trade_price) > 0 ||
-						Number(merged.buying_price) > 0 ||
-						Number(merged.buying_rate) > 0)
-				) {
-					merged._source_buying_currency = originalRowCurrency;
-				}
-				merged.currency = doc.currency;
-				if (
-					originalRowCurrency &&
-					originalRowCurrency !== docCurrency &&
-					isBlankValue(doc.conversion_rate)
-				) {
-					merged.conversion_rate = undefined;
-				}
-			}
-			if (!isBlankValue(doc.price_list_currency)) {
-				merged.price_list_currency = doc.price_list_currency;
-			}
-			if (!isBlankValue(doc.company_currency)) {
-				merged.company_currency = doc.company_currency;
-			}
-			if (isPositiveFinite(doc.conversion_rate)) {
-				merged.conversion_rate = doc.conversion_rate;
-			} else if (!isBlankValue(doc.conversion_rate)) {
-				merged.conversion_rate = doc.conversion_rate;
-			}
-			if (isPositiveFinite(doc.plc_conversion_rate)) {
-				merged.plc_conversion_rate = doc.plc_conversion_rate;
-			} else if (!isBlankValue(doc.plc_conversion_rate)) {
-				merged.plc_conversion_rate = doc.plc_conversion_rate;
-			}
-		}
+		const merged: Record<string, any> = applyAuthoritativeDocHeaderFx(
+			{ ...docItem },
+			doc,
+		);
 
 		if (matched && typeof matched === "object") {
 			if (
@@ -839,9 +918,15 @@ export function usePaymentSubmission(options: PaymentSubmissionOptions) {
 		const isCashOrNonTradeDiscount = Boolean(
 			doc?.is_cash_or_non_trade_discount,
 		);
+		const docItems = Array.isArray(doc?.items) ? doc.items : [];
+		const effectiveItems = mergeDocItemsWithCartCostFallback(
+			docItems,
+			liveCartItems,
+			doc,
+		);
 		const invoiceDiscountPercentage = resolveInvoiceDiscountPercentage(
 			doc,
-			doc?.items || [],
+			effectiveItems,
 		);
 		const lossOptions = {
 			minimumMarginPercentage: saleFloorPolicy.minimumMarginPercentage,
@@ -851,12 +936,6 @@ export function usePaymentSubmission(options: PaymentSubmissionOptions) {
 			taxes: Array.isArray(doc?.taxes) ? doc.taxes : [],
 			currencyPrecision: prec,
 		};
-		const docItems = Array.isArray(doc?.items) ? doc.items : [];
-		const effectiveItems = mergeDocItemsWithCartCostFallback(
-			docItems,
-			liveCartItems,
-			doc,
-		);
 		const lossRiskItems = saleFloorPolicy.enabled
 			? findLossRiskItems(effectiveItems, lossOptions)
 			: [];

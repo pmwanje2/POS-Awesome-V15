@@ -152,7 +152,12 @@ def delete_invoice(invoice):
 
 
 @frappe.whitelist()
-def fetch_exchange_rate_pair(from_currency, to_currency, transaction_date=None):
+def fetch_exchange_rate_pair(
+    from_currency,
+    to_currency,
+    transaction_date=None,
+    purpose="for_selling",
+):
     """Return exchange rate payload expected by POS multi-currency UI."""
 
     if not from_currency or not to_currency:
@@ -170,6 +175,7 @@ def fetch_exchange_rate_pair(from_currency, to_currency, transaction_date=None):
         from_currency,
         to_currency,
         transaction_date=transaction_date,
+        purpose=purpose,
         silent=True,
     )
     return {

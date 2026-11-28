@@ -488,6 +488,20 @@ class ItemLookupData:
     serial_map: Dict[str, List[Dict[str, Any]]]
     bom_map: Dict[str, Dict[str, Any]]
     valuation_map: Dict[str, float] = field(default_factory=dict)
+    buying_price_not_uom_dependent: Optional[bool] = None
+
+
+def _is_price_list_not_uom_dependent(price_list_name: Optional[str]) -> bool:
+    """Return whether ``Price List.price_not_uom_dependent`` is enabled."""
+
+    if not price_list_name:
+        return False
+    val = frappe.db.get_value("Price List", price_list_name, "price_not_uom_dependent")
+    if val is None:
+        get_cached_value = getattr(frappe, "get_cached_value", None)
+        if callable(get_cached_value):
+            val = get_cached_value("Price List", price_list_name, "price_not_uom_dependent")
+    return val in (1, True, "1")
 
 
 def _select_price(
@@ -583,12 +597,24 @@ def merge_item_row(
 
     row_currency = price_currency or price_list_currency
     buying_currency = buying_price_row.get("currency") if buying_price_row else None
+    buying_price_list_name = buying_price_row.get("price_list") if buying_price_row else None
+    if lookup_data.buying_price_not_uom_dependent is not None:
+        price_not_uom_dependent = bool(lookup_data.buying_price_not_uom_dependent)
+    elif buying_price_row and buying_price_row.get("price_not_uom_dependent") is not None:
+        price_not_uom_dependent = buying_price_row.get("price_not_uom_dependent") in (1, True, "1")
+    else:
+        price_not_uom_dependent = _is_price_list_not_uom_dependent(buying_price_list_name)
     raw_buying_rate = (
         flt(buying_price_row.get("price_list_rate"))
         if buying_price_row and buying_price_row.get("price_list_rate") is not None
         else None
     )
-    if raw_buying_rate is not None and not buying_exact_uom and item.get("uom"):
+    if (
+        raw_buying_rate is not None
+        and not buying_exact_uom
+        and item.get("uom")
+        and not price_not_uom_dependent
+    ):
         uom_factor = next(
             (
                 flt(entry.get("conversion_factor"))
@@ -606,12 +632,20 @@ def merge_item_row(
     if raw_buying_rate is None:
         normalized_buying_rate = None
         buying_rate_currency = None
-    elif not buying_currency or not row_currency or buying_currency == row_currency:
-        normalized_buying_rate = raw_buying_rate
-        buying_rate_currency = row_currency or buying_currency
     elif flt(buying_exchange_rate) > 0 and flt(exchange_rate) > 0:
-        normalized_buying_rate = raw_buying_rate * flt(buying_exchange_rate) / flt(exchange_rate)
-        buying_rate_currency = row_currency
+        normalized_buying_rate = (
+            raw_buying_rate * flt(buying_exchange_rate) / flt(exchange_rate)
+        )
+        buying_rate_currency = row_currency or buying_currency
+    elif not buying_currency or not row_currency or buying_currency == row_currency:
+        normalized_buying_rate = (
+            raw_buying_rate if flt(buying_exchange_rate) > 0 else None
+        )
+        buying_rate_currency = (
+            (row_currency or buying_currency)
+            if normalized_buying_rate is not None
+            else None
+        )
     else:
         normalized_buying_rate = None
         buying_rate_currency = None
@@ -671,11 +705,21 @@ def merge_item_row(
             if flt(buying_exchange_rate) > 0
             else None
         )
+        entry_not_uom_dependent = (
+            price_not_uom_dependent
+            if pr.get("price_list") == buying_price_list_name
+            else (
+                bool(lookup_data.buying_price_not_uom_dependent)
+                if lookup_data.buying_price_not_uom_dependent is not None
+                else _is_price_list_not_uom_dependent(pr.get("price_list"))
+            )
+        )
         buying_prices_by_uom[uom_name] = {
             "price_list_rate": raw_rate,
             "base_price_list_rate": normalized_rate,
             "currency": pr.get("currency"),
             "price_list": pr.get("price_list"),
+            "price_not_uom_dependent": 1 if entry_not_uom_dependent else 0,
         }
     row["_buying_prices_by_uom"] = buying_prices_by_uom
 
@@ -790,6 +834,7 @@ class ItemDetailAggregator:
                 )
 
         buying_price_list = self._resolve_buying_price_list()
+        buying_price_not_uom_dependent = _is_price_list_not_uom_dependent(buying_price_list)
         buying_price_currency = self._determine_price_list_currency(buying_price_list)
         company = self.pos_profile.get("company")
         company_currency = (
@@ -923,6 +968,7 @@ class ItemDetailAggregator:
             serial_map=serial_map,
             bom_map=bom_map,
             valuation_map=valuation_map,
+            buying_price_not_uom_dependent=buying_price_not_uom_dependent,
         )
 
     def build_details(self, items_data: Sequence[Dict[str, object]]) -> List[Dict[str, object]]:

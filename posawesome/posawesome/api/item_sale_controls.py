@@ -348,35 +348,25 @@ def _resolve_floor_rates(
     if rate <= 0 or not source_currency or not invoice_currency:
         return rate, rate, 1.0
 
-    if source_currency == invoice_currency:
-        if not company_currency or invoice_currency == company_currency:
-            return rate, rate, 1.0
-        invoice_to_company = flt(invoice_conversion_rate)
-        if invoice_to_company <= 0:
-            from erpnext.setup.utils import get_exchange_rate
-
-            invoice_to_company = flt(
-                get_exchange_rate(invoice_currency, company_currency, posting_date, "for_selling")
-            )
-        if invoice_to_company <= 0:
-            frappe.throw(
-                _(
-                    "Cannot validate the buying floor because the exchange rate between {0} and {1} is missing."
-                ).format(invoice_currency, company_currency)
-            )
-        return rate, rate * invoice_to_company, invoice_to_company
-
     if not company_currency:
         company_currency = (
             frappe.db.get_value("Company", company, "default_currency") if company else None
         )
     if not company_currency:
+        if source_currency == invoice_currency:
+            return rate, rate, 1.0
         frappe.throw(
             _("Cannot validate the buying floor because the company currency is missing.")
         )
 
+    if source_currency == company_currency and invoice_currency == company_currency:
+        return rate, rate, 1.0
+
     from erpnext.setup.utils import get_exchange_rate
 
+    # Never shortcut source_currency == invoice_currency with the selling invoice rate
+    # when the shared currency is foreign: buying costs convert via for_buying while
+    # selling revenue converts via invoice_conversion_rate / for_selling.
     source_to_company = (
         1.0
         if source_currency == company_currency
@@ -453,6 +443,18 @@ def _resolve_buying_floors_with_uom_context(items, pos_profile=None, invoice_doc
     price_list_currency = (
         frappe.db.get_value("Price List", price_list, "currency") if price_list else None
     )
+    raw_not_uom_dependent = (
+        frappe.db.get_value("Price List", price_list, "price_not_uom_dependent")
+        if price_list
+        else None
+    )
+    if raw_not_uom_dependent is None and price_list:
+        get_cached_value = getattr(frappe, "get_cached_value", None)
+        if callable(get_cached_value):
+            raw_not_uom_dependent = get_cached_value(
+                "Price List", price_list, "price_not_uom_dependent"
+            )
+    price_not_uom_dependent = raw_not_uom_dependent in (1, True, "1")
     stock_uoms, conversion_factors, item_info = _get_item_uom_context(item_rows)
     bin_valuations, default_warehouse = _get_bin_valuation_map(
         item_rows, pos_profile=pos_profile, invoice_doc=invoice_doc
@@ -519,7 +521,13 @@ def _resolve_buying_floors_with_uom_context(items, pos_profile=None, invoice_doc
         selected_price = exact or base
         if selected_price:
             floor = flt(selected_price.get("price_list_rate"))
-            floor *= factor / master_factor if exact else factor
+            # ERPNext get_item_details.py:1579-1592 skips conversion_factor scaling on
+            # stock-UOM fallback when Price List.price_not_uom_dependent is enabled.
+            floor *= (
+                factor / master_factor
+                if (exact or price_not_uom_dependent)
+                else factor
+            )
             source_currency = (
                 selected_price.get("currency") or price_list_currency or invoice_currency
             )
@@ -1315,26 +1323,26 @@ def _server_applied_free_row_indexes(
                     qty_cf, amt_cf = factors
                     _q_code, _q_uom, _q_stock_uom, q_qty, q_stock_qty, q_row = entry
                     row_amt = flt(q_row.get("price_list_rate") or q_row.get("rate")) * q_qty
-                    cumulative_totals = (
-                        _cumulative_totals_for_row(entry) if is_cumulative else None
-                    )
-                    if cumulative_totals is not None:
+                    if is_cumulative:
+                        # Fail closed when cumulative history cannot be loaded (including
+                        # ImportError): never disable min_qty/min_amt checks.
+                        cumulative_totals = _cumulative_totals_for_row(entry)
+                        if cumulative_totals is None:
+                            continue
                         cum_qty, cum_amt = cumulative_totals
                         row_threshold_qty = (q_stock_qty + cum_qty) / qty_cf
                         row_threshold_amt = row_amt + cum_amt
-                        enforce_min = True
                     else:
                         row_threshold_qty = q_stock_qty / qty_cf
                         row_threshold_amt = row_amt
-                        enforce_min = not is_cumulative
                     # ERPNext pricing_rule/utils.py:433-445 always enforces min_qty/min_amt
                     # even when 0 (rejecting negative cumulative totals after returns);
                     # max_qty/max_amt treat 0 as unbounded.
-                    if enforce_min and row_threshold_qty < min_qty - 1e-9:
+                    if row_threshold_qty < min_qty - 1e-9:
                         continue
                     if max_qty > 0 and row_threshold_qty > max_qty + 1e-9:
                         continue
-                    if enforce_min and row_threshold_amt < (min_amt * amt_cf) - 1e-9:
+                    if row_threshold_amt < (min_amt * amt_cf) - 1e-9:
                         continue
                     if max_amt > 0 and row_threshold_amt > (max_amt * amt_cf) + 1e-9:
                         continue
@@ -1413,13 +1421,15 @@ def _invoice_actual_tax_total(invoice_doc):
     return total_actual_tax
 
 
-def _has_populated_net_field(row, fieldname, gross_rate):
+def _has_populated_net_field(row, fieldname, gross_rate, allow_zero=True):
     """Return whether ``fieldname`` on ``row`` carries a meaningful net rate (including 0.0)."""
 
     if row.get(fieldname) in (None, ""):
         return False
     if abs(flt(row.get(fieldname))) > 0 or gross_rate <= 0:
         return True
+    if not allow_zero:
+        return False
     if isinstance(row, dict):
         return True
     return (
@@ -1571,8 +1581,16 @@ def collect_below_buying_price_errors(
                 el_prec = _resolve_currency_precision(el_row, invoice_doc, "net_rate")
             row_ulp = (10.0 ** (-el_prec)) if el_prec is not None else 1e-9
             invoice_ulp = max(invoice_ulp, row_ulp)
+            # ERPNext taxes_and_totals.py:438-462 rounds inclusive-tax net_amount to
+            # currency precision (e.g. flt(0.01 / 1.18, 2) == 0.01), which may exceed
+            # unrounded pre_amount while staying <= gross line amount.
+            el_max_pre_amount = (
+                min(el_gross * el_qty, max(el_pre_amount, flt(el_pre_amount, el_prec)))
+                if el_prec is not None
+                else el_pre_amount
+            )
             if (
-                el_native_amount > el_pre_amount + 1e-9
+                el_native_amount > el_max_pre_amount + 1e-9
                 or el_native_amount > el_computed_amount + row_ulp + 1e-9
             ):
                 all_rows_reconciled = False
@@ -1696,9 +1714,14 @@ def collect_below_buying_price_errors(
                     selling_rate = row_net_rate
 
         base_selling_rate = selling_rate * invoice_to_company
+        # Never let zero base_net_* derived from an unreconciled all-zero draft override
+        # a positive selling_rate (while still honoring reconciled/explicit zero selling_rate).
+        allow_zero_base_net = selling_rate <= 0
         if (
             not honored_native_net_rate
-            and _has_populated_net_field(row, "base_net_amount", gross_rate)
+            and _has_populated_net_field(
+                row, "base_net_amount", gross_rate, allow_zero=allow_zero_base_net
+            )
             and row_qty > 0
         ):
             row_base_from_amount = abs(flt(row.get("base_net_amount"))) / row_qty
@@ -1711,7 +1734,9 @@ def collect_below_buying_price_errors(
             elif row_base_from_amount < base_selling_rate:
                 base_selling_rate = row_base_from_amount
                 selling_rate = row_base_from_amount / invoice_to_company
-        if _has_populated_net_field(row, "base_net_rate", gross_rate):
+        if _has_populated_net_field(
+            row, "base_net_rate", gross_rate, allow_zero=allow_zero_base_net
+        ):
             row_base_net_rate = abs(flt(row.get("base_net_rate")))
             if base_precision is not None:
                 if flt(row_base_net_rate, base_precision) < flt(
