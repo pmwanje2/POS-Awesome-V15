@@ -22,6 +22,7 @@ import {
 	findLossRiskItems,
 	getItemCostFloor,
 	isPricingRuleFreeLine,
+	resolveInvoiceDiscountPercentage,
 	resolveSaleFloorPolicy,
 } from "../../../utils/lossPrevention";
 
@@ -529,36 +530,22 @@ export function usePaymentSubmission(options: PaymentSubmissionOptions) {
 				? storeItemsSource.value
 				: [];
 		const saleFloorPolicy = resolveSaleFloorPolicy(profile);
-		const invoiceGrossAmount = (doc?.items || []).reduce(
-			(total: number, item: any) => {
-				if (
-					item?.is_return ||
-					item?.posa_is_replace ||
-					Number(item?.qty || 0) <= 0
-				) {
-					return total;
-				}
-				return (
-					total +
-					Math.abs(Number(item?.rate || 0) * Number(item?.qty || 0))
-				);
-			},
-			0,
+		const applyDiscountOn = String(
+			doc?.apply_discount_on || "Grand Total",
+		).trim();
+		const isCashOrNonTradeDiscount = Boolean(
+			doc?.is_cash_or_non_trade_discount,
 		);
-		const explicitInvoiceDiscount = Math.max(
-			Number(doc?.additional_discount_percentage || 0),
-			0,
+		const invoiceDiscountPercentage = resolveInvoiceDiscountPercentage(
+			doc,
+			doc?.items || [],
 		);
-		const fixedInvoiceDiscountPercentage =
-			explicitInvoiceDiscount <= 0 && invoiceGrossAmount > 0
-				? (Math.max(Number(doc?.discount_amount || 0), 0) /
-						invoiceGrossAmount) *
-					100
-				: 0;
 		const lossOptions = {
 			minimumMarginPercentage: saleFloorPolicy.minimumMarginPercentage,
-			invoiceDiscountPercentage:
-				explicitInvoiceDiscount || fixedInvoiceDiscountPercentage,
+			invoiceDiscountPercentage,
+			applyDiscountOn,
+			isCashOrNonTradeDiscount,
+			taxes: Array.isArray(doc?.taxes) ? doc.taxes : [],
 		};
 		const docLossRiskItems = saleFloorPolicy.enabled
 			? findLossRiskItems(doc?.items || [], lossOptions)

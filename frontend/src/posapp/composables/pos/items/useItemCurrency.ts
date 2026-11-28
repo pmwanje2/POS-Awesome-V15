@@ -40,13 +40,47 @@ const parsePositiveFinite = (value: unknown): number | null => {
 	return numeric !== null && numeric > 0 ? numeric : null;
 };
 
+const resolveStrictPlcToCompanyRate = (
+	item: CurrencyItem,
+	context: CurrencyContext,
+	companyCurrency: string,
+	priceListCurrency: string,
+	selectedCurrency: string,
+): number | null => {
+	if (!priceListCurrency || !companyCurrency || priceListCurrency === companyCurrency) {
+		return 1;
+	}
+	const explicitItemPlc = parsePositiveFinite(item.plc_conversion_rate);
+	if (explicitItemPlc !== null) {
+		return explicitItemPlc;
+	}
+	const explicitContextPlc = parsePositiveFinite(context.plc_conversion_rate);
+	if (explicitContextPlc !== null) {
+		return explicitContextPlc;
+	}
+	const explicitContextConversion = parsePositiveFinite(context.conversion_rate);
+	if (selectedCurrency && priceListCurrency === selectedCurrency) {
+		return explicitContextConversion;
+	}
+	const explicitDisplayRate = parsePositiveFinite(context.exchange_rate);
+	if (selectedCurrency && selectedCurrency === companyCurrency) {
+		return explicitDisplayRate;
+	}
+	if (explicitDisplayRate !== null && explicitContextConversion !== null) {
+		return explicitDisplayRate * explicitContextConversion;
+	}
+	return null;
+};
+
 const resolveCompanyBuyingPrice = (
 	item: CurrencyItem,
 	companyCurrency: string,
 	previousCurrency: string,
 	previousConversionRate: number | null,
 	priceListCurrency: string,
-	plcToCompanyRate: number,
+	strictPlcToCompanyRate: number | null,
+	selectedCurrency: string,
+	nextConversionRate: number,
 ): number | null => {
 	const storedCompanyBuying =
 		parsePositiveFinite(item._company_buying_price) ??
@@ -56,6 +90,7 @@ const resolveCompanyBuyingPrice = (
 	}
 
 	const scalarBuying =
+		parsePositiveFinite(item._source_buying_price) ??
 		parsePositiveFinite(item.trade_price) ??
 		parsePositiveFinite(item.buying_rate) ??
 		parsePositiveFinite(item.buying_price);
@@ -63,14 +98,27 @@ const resolveCompanyBuyingPrice = (
 		return null;
 	}
 
+	const sourceBuyingCurrency = String(item._source_buying_currency || "").trim();
 	const buyingRateCurrency = String(item.buying_rate_currency || "").trim();
 	const buyingPriceCurrency = String(item.buying_price_currency || "").trim();
 	const scalarCurrency =
-		buyingRateCurrency || buyingPriceCurrency || previousCurrency;
+		sourceBuyingCurrency ||
+		buyingRateCurrency ||
+		buyingPriceCurrency ||
+		previousCurrency;
 
 	if (!scalarCurrency || scalarCurrency === companyCurrency) {
 		return scalarBuying;
 	}
+
+	// Preserve the original foreign buying scalar until a finite positive FX rate resolves it.
+	if (item._source_buying_price === undefined) {
+		item._source_buying_price = scalarBuying;
+	}
+	if (!item._source_buying_currency) {
+		item._source_buying_currency = scalarCurrency;
+	}
+
 	const buyingExchangeRate = parsePositiveFinite(item.buying_exchange_rate);
 	if (
 		buyingPriceCurrency &&
@@ -90,9 +138,17 @@ const resolveCompanyBuyingPrice = (
 	if (
 		priceListCurrency &&
 		scalarCurrency === priceListCurrency &&
-		plcToCompanyRate > 0
+		strictPlcToCompanyRate !== null &&
+		strictPlcToCompanyRate > 0
 	) {
-		return scalarBuying * plcToCompanyRate;
+		return scalarBuying * strictPlcToCompanyRate;
+	}
+	if (
+		selectedCurrency &&
+		scalarCurrency === selectedCurrency &&
+		nextConversionRate > 0
+	) {
+		return scalarBuying * nextConversionRate;
 	}
 	return null;
 };
@@ -154,6 +210,28 @@ export function useItemCurrency() {
 		const priceListCurrency = getPriceListCurrency(context) || base;
 		const selectedCurrency = getSelectedCurrency(context) || base;
 
+		const strictPlcToCompanyRate = resolveStrictPlcToCompanyRate(
+			item,
+			context,
+			base,
+			priceListCurrency,
+			selectedCurrency,
+		);
+		let nextConversionRate: number;
+		if (selectedCurrency === base) {
+			nextConversionRate = 1;
+		} else if (context.conversion_rate !== undefined) {
+			nextConversionRate = parsePositiveFinite(context.conversion_rate) ?? 0;
+		} else {
+			const displayRate = parsePositiveFinite(context.exchange_rate);
+			nextConversionRate =
+				displayRate !== null &&
+				strictPlcToCompanyRate !== null &&
+				strictPlcToCompanyRate > 0
+					? strictPlcToCompanyRate / displayRate
+					: 0;
+		}
+
 		// Preserve company-currency buying cost before switching item.currency/conversion_rate.
 		const companyBuyingPrice = resolveCompanyBuyingPrice(
 			item,
@@ -161,7 +239,9 @@ export function useItemCurrency() {
 			previousCurrency,
 			previousConversionRate,
 			priceListCurrency,
-			plc_to_cc_rate,
+			strictPlcToCompanyRate,
+			selectedCurrency,
+			nextConversionRate,
 		);
 		if (companyBuyingPrice !== null) {
 			item._company_buying_price = companyBuyingPrice;
@@ -183,19 +263,6 @@ export function useItemCurrency() {
 		item.currency = selectedCurrency;
 		item.company_currency = base;
 		item.price_list_rate = item.rate;
-
-		let nextConversionRate: number;
-		if (selectedCurrency === base) {
-			nextConversionRate = 1;
-		} else if (context.conversion_rate !== undefined) {
-			nextConversionRate = parsePositiveFinite(context.conversion_rate) ?? 0;
-		} else {
-			const displayRate = parsePositiveFinite(context.exchange_rate);
-			nextConversionRate =
-				displayRate !== null && plc_to_cc_rate > 0
-					? plc_to_cc_rate / displayRate
-					: 0;
-		}
 		item.conversion_rate = nextConversionRate;
 
 		if (companyBuyingPrice !== null) {

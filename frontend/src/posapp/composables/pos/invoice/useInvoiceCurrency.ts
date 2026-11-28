@@ -277,11 +277,44 @@ export function useInvoiceCurrency() {
 		return numeric !== null && numeric > 0 ? numeric : null;
 	};
 
+	const resolveStrictPlcToCompanyRate = (
+		item: any,
+		companyCurrency: string,
+		priceListCurrency: string,
+		selectedCurrency: string,
+		rawConversionRate: number | null,
+		rawExchangeRate: number | null,
+	): number | null => {
+		if (
+			!priceListCurrency ||
+			!companyCurrency ||
+			priceListCurrency === companyCurrency
+		) {
+			return 1;
+		}
+		const explicitItemPlc = parsePositiveFinite(item?.plc_conversion_rate);
+		if (explicitItemPlc !== null) {
+			return explicitItemPlc;
+		}
+		if (selectedCurrency && priceListCurrency === selectedCurrency) {
+			return rawConversionRate;
+		}
+		if (selectedCurrency && selectedCurrency === companyCurrency) {
+			return rawExchangeRate;
+		}
+		if (rawExchangeRate !== null && rawConversionRate !== null) {
+			return rawExchangeRate * rawConversionRate;
+		}
+		return null;
+	};
+
 	const preserveItemCompanyBuyingPrice = (
 		item: any,
 		companyCurrency: string,
 		priceListCurrency: string,
-		plcToCompanyRate: number,
+		strictPlcToCompanyRate: number | null,
+		selectedCurrency: string,
+		itemConversionRate: number,
 	): number | null => {
 		const storedCompanyBuying =
 			parsePositiveFinite(item?._company_buying_price) ??
@@ -290,6 +323,7 @@ export function useInvoiceCurrency() {
 			return storedCompanyBuying;
 		}
 		const scalarBuying =
+			parsePositiveFinite(item?._source_buying_price) ??
 			parsePositiveFinite(item?.trade_price) ??
 			parsePositiveFinite(item?.buying_rate) ??
 			parsePositiveFinite(item?.buying_price);
@@ -300,6 +334,9 @@ export function useInvoiceCurrency() {
 		const previousConversionRate = parsePositiveFinite(
 			item?.conversion_rate,
 		);
+		const sourceBuyingCurrency = String(
+			item?._source_buying_currency || "",
+		).trim();
 		const buyingRateCurrency = String(
 			item?.buying_rate_currency || "",
 		).trim();
@@ -307,11 +344,21 @@ export function useInvoiceCurrency() {
 			item?.buying_price_currency || "",
 		).trim();
 		const scalarCurrency =
-			buyingRateCurrency || buyingPriceCurrency || previousCurrency;
+			sourceBuyingCurrency ||
+			buyingRateCurrency ||
+			buyingPriceCurrency ||
+			previousCurrency;
 
 		if (!scalarCurrency || scalarCurrency === companyCurrency) {
 			return scalarBuying;
 		}
+		if (item._source_buying_price === undefined) {
+			item._source_buying_price = scalarBuying;
+		}
+		if (!item._source_buying_currency) {
+			item._source_buying_currency = scalarCurrency;
+		}
+
 		const buyingExchangeRate = parsePositiveFinite(
 			item?.buying_exchange_rate,
 		);
@@ -332,9 +379,17 @@ export function useInvoiceCurrency() {
 		if (
 			priceListCurrency &&
 			scalarCurrency === priceListCurrency &&
-			plcToCompanyRate > 0
+			strictPlcToCompanyRate !== null &&
+			strictPlcToCompanyRate > 0
 		) {
-			return scalarBuying * plcToCompanyRate;
+			return scalarBuying * strictPlcToCompanyRate;
+		}
+		if (
+			selectedCurrency &&
+			scalarCurrency === selectedCurrency &&
+			itemConversionRate > 0
+		) {
+			return scalarBuying * itemConversionRate;
 		}
 		return null;
 	};
@@ -351,6 +406,7 @@ export function useInvoiceCurrency() {
 			"";
 		const selectedCurrency = selected_currency.value || companyCurrency;
 		const rawConversionRate = parsePositiveFinite(conversion_rate.value);
+		const rawExchangeRate = parsePositiveFinite(exchange_rate.value);
 		const itemConversionRate =
 			selectedCurrency === companyCurrency
 				? 1
@@ -369,15 +425,24 @@ export function useInvoiceCurrency() {
 			exchange_rate: exchange_rate.value || 1,
 			conversion_rate: conversionRate,
 		};
-		const plcToCompanyRate = getPlcConversionRate(currencyContext);
 
 		items.forEach((item: any) => {
 			item._skip_calc = true;
+			const strictPlcToCompanyRate = resolveStrictPlcToCompanyRate(
+				item,
+				companyCurrency,
+				resolvedPriceListCurrency,
+				selectedCurrency,
+				rawConversionRate,
+				rawExchangeRate,
+			);
 			const companyBuyingPrice = preserveItemCompanyBuyingPrice(
 				item,
 				companyCurrency,
 				resolvedPriceListCurrency,
-				plcToCompanyRate,
+				strictPlcToCompanyRate,
+				selectedCurrency,
+				itemConversionRate,
 			);
 			if (companyBuyingPrice !== null) {
 				item._company_buying_price = companyBuyingPrice;

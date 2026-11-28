@@ -209,6 +209,7 @@ def resolve_erpnext_currency_rates(
             company_currency,
             cache=cache,
             transaction_date=exchange_rate_date,
+            purpose="for_selling",
         )
 
     plc_conversion_rate = 1.0
@@ -218,6 +219,7 @@ def resolve_erpnext_currency_rates(
             company_currency,
             cache=cache,
             transaction_date=exchange_rate_date,
+            purpose="for_selling",
         )
 
     return {

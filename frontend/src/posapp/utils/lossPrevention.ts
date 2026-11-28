@@ -25,6 +25,9 @@ export type SaleFloorPolicy = {
 export type LossPreventionOptions = {
 	minimumMarginPercentage?: number;
 	invoiceDiscountPercentage?: number;
+	applyDiscountOn?: string;
+	isCashOrNonTradeDiscount?: boolean | number;
+	taxes?: Array<Record<string, unknown>>;
 };
 
 const COST_CANDIDATES: Array<{
@@ -118,7 +121,7 @@ function resolveInvoiceToCompanyRate(
 	}
 
 	const rawCurrencyRate = toFiniteNumber(item.conversion_rate);
-	if (rawCurrencyRate !== null && rawCurrencyRate > EPSILON) {
+	if (rawCurrencyRate !== null && rawCurrencyRate > 0) {
 		return rawCurrencyRate;
 	}
 
@@ -138,6 +141,277 @@ function resolveInvoiceToCompanyRate(
 	return 1;
 }
 
+function parseItemTaxRateMap(
+	item: Record<string, unknown> | null | undefined,
+): Record<string, number> {
+	const raw = item?.item_tax_rate;
+	if (!raw) {
+		return {};
+	}
+	if (typeof raw === "object" && !Array.isArray(raw)) {
+		const out: Record<string, number> = {};
+		for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+			const parsed = toFiniteNumber(v);
+			if (parsed !== null) {
+				out[k] = parsed;
+			}
+		}
+		return out;
+	}
+	if (typeof raw === "string") {
+		try {
+			const parsed = JSON.parse(raw);
+			if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+				return parseItemTaxRateMap({ item_tax_rate: parsed });
+			}
+		} catch {
+			return {};
+		}
+	}
+	return {};
+}
+
+export function computeRowTaxParams(
+	item: Record<string, unknown> | null | undefined,
+	taxes: Array<Record<string, unknown>> | null | undefined,
+): { inclA: number; inclB: number; allA: number; allB: number } {
+	if (!Array.isArray(taxes) || !taxes.length) {
+		return { inclA: 0, inclB: 0, allA: 0, allB: 0 };
+	}
+	const itemTaxMap = parseItemTaxRateMap(item);
+	const inclTerms: Array<[number, number]> = [];
+	const allTerms: Array<[number, number]> = [];
+	let inclA = 0;
+	let inclB = 0;
+	let allA = 0;
+	let allB = 0;
+
+	const computeTerm = (
+		chargeType: string,
+		taxRate: number,
+		rowIdRaw: unknown,
+		terms: Array<[number, number]>,
+	): [number, number] => {
+		if (chargeType === "On Net Total") {
+			return [taxRate / 100, 0];
+		}
+		if (chargeType === "On Item Quantity") {
+			return [0, taxRate];
+		}
+		if (chargeType === "On Previous Row Amount") {
+			const refIdx = Math.trunc(Number(rowIdRaw || 0)) - 1;
+			if (refIdx >= 0 && refIdx < terms.length) {
+				const [prevA, prevB] = terms[refIdx]!;
+				return [(taxRate / 100) * prevA, (taxRate / 100) * prevB];
+			}
+			return [0, 0];
+		}
+		if (chargeType === "On Previous Row Total") {
+			const refIdx = Math.trunc(Number(rowIdRaw || 0)) - 1;
+			if (refIdx >= 0 && refIdx < terms.length) {
+				let sumA = 0;
+				let sumB = 0;
+				for (let idx = 0; idx <= refIdx; idx++) {
+					sumA += terms[idx]![0];
+					sumB += terms[idx]![1];
+				}
+				return [(taxRate / 100) * (1 + sumA), (taxRate / 100) * sumB];
+			}
+			return [taxRate / 100, 0];
+		}
+		return [0, 0];
+	};
+
+	for (const tax of taxes) {
+		if (!tax || typeof tax !== "object") {
+			inclTerms.push([0, 0]);
+			allTerms.push([0, 0]);
+			continue;
+		}
+		const chargeType = String(tax.charge_type || "").trim();
+		const accountHead = String(tax.account_head || "");
+		const taxRate =
+			accountHead && Object.prototype.hasOwnProperty.call(itemTaxMap, accountHead)
+				? itemTaxMap[accountHead]!
+				: toFiniteNumber(tax.rate) || 0;
+		const isInclusive =
+			tax.included_in_print_rate === true ||
+			tax.included_in_print_rate === 1 ||
+			tax.included_in_print_rate === "1";
+
+		const [curAllA, curAllB] = computeTerm(
+			chargeType,
+			taxRate,
+			tax.row_id,
+			allTerms,
+		);
+		allTerms.push([curAllA, curAllB]);
+		allA += curAllA;
+		allB += curAllB;
+
+		const [curInclA, curInclB] = isInclusive
+			? computeTerm(chargeType, taxRate, tax.row_id, inclTerms)
+			: [0, 0];
+		inclTerms.push([curInclA, curInclB]);
+		inclA += curInclA;
+		inclB += curInclB;
+	}
+
+	return {
+		inclA: Math.max(inclA, 0),
+		inclB: Math.max(inclB, 0),
+		allA: Math.max(allA, 0),
+		allB: Math.max(allB, 0),
+	};
+}
+
+export function computeInvoiceActualTaxTotal(
+	taxes: Array<Record<string, unknown>> | null | undefined,
+): number {
+	if (!Array.isArray(taxes) || !taxes.length) {
+		return 0;
+	}
+	let totalActualTax = 0;
+	const actualTaxes = new Map<number, [number, number]>();
+
+	const record = (rowIdx: number, tax: Record<string, unknown>, rawAmount: number) => {
+		let amount = rawAmount;
+		if (String(tax.add_deduct_tax || "").trim() === "Deduct") {
+			amount *= -1;
+		}
+		if (String(tax.category || "").trim() !== "Valuation") {
+			totalActualTax += amount;
+		}
+		actualTaxes.set(rowIdx, [amount, totalActualTax]);
+	};
+
+	for (let pos = 0; pos < taxes.length; pos++) {
+		const tax = taxes[pos];
+		if (!tax || typeof tax !== "object") {
+			continue;
+		}
+		const rowIdx = Math.trunc(Number(tax.idx || 0)) || pos + 1;
+		const chargeType = String(tax.charge_type || "").trim();
+		if (chargeType === "Actual") {
+			record(rowIdx, tax, toFiniteNumber(tax.tax_amount) || 0);
+			continue;
+		}
+		if (
+			chargeType !== "On Previous Row Amount" &&
+			chargeType !== "On Previous Row Total"
+		) {
+			continue;
+		}
+		const refIdx = Math.trunc(Number(tax.row_id || 0));
+		const baseEntry = actualTaxes.get(refIdx);
+		if (!baseEntry) {
+			continue;
+		}
+		const baseAmount =
+			chargeType === "On Previous Row Amount"
+				? baseEntry[0]
+				: baseEntry[1];
+		record(rowIdx, tax, (baseAmount * (toFiniteNumber(tax.rate) || 0)) / 100);
+	}
+	return totalActualTax;
+}
+
+export function resolveInvoiceDiscountPercentage(
+	doc: Record<string, unknown> | null | undefined,
+	items?: Array<Record<string, unknown>> | null,
+): number {
+	if (!doc) {
+		return 0;
+	}
+	const applyDiscountOn = String(
+		doc.apply_discount_on || "Grand Total",
+	).trim();
+	const isCashDiscount =
+		Boolean(doc.is_cash_or_non_trade_discount) &&
+		applyDiscountOn === "Grand Total";
+	if (isCashDiscount) {
+		return 0;
+	}
+
+	const explicitPct = Math.max(
+		toFiniteNumber(doc.additional_discount_percentage) || 0,
+		0,
+	);
+	const discountAmount = Math.max(toFiniteNumber(doc.discount_amount) || 0, 0);
+	if (explicitPct <= 0 && discountAmount <= 0) {
+		return 0;
+	}
+
+	const itemList = Array.isArray(items)
+		? items
+		: Array.isArray(doc.items)
+			? (doc.items as Array<Record<string, unknown>>)
+			: [];
+	const taxes = Array.isArray(doc.taxes)
+		? (doc.taxes as Array<Record<string, unknown>>)
+		: [];
+
+	let eligibleNetTotal = 0;
+	let eligibleScalableGrandTotal = 0;
+	let eligibleFixedQtyTaxTotal = 0;
+
+	for (const item of itemList) {
+		if (
+			!item ||
+			item.is_return ||
+			item.posa_is_replace ||
+			isPricingRuleFreeLine(item)
+		) {
+			continue;
+		}
+		const qty = toFiniteNumber(item.qty) || 0;
+		if (qty <= 0) {
+			continue;
+		}
+		const grossRate = getEffectiveSellingRate(item);
+		const { inclA, inclB, allA, allB } = computeRowTaxParams(item, taxes);
+		const preDiscountNet = Math.max((grossRate - inclB) / (1 + inclA), 0);
+		eligibleNetTotal += preDiscountNet * qty;
+		eligibleScalableGrandTotal += preDiscountNet * (1 + allA) * qty;
+		eligibleFixedQtyTaxTotal += allB * qty;
+	}
+
+	if (applyDiscountOn === "Net Total") {
+		if (explicitPct > 0) {
+			return explicitPct;
+		}
+		return eligibleNetTotal > 0 ? (discountAmount / eligibleNetTotal) * 100 : 0;
+	}
+
+	const actualTaxTotal = computeInvoiceActualTaxTotal(taxes);
+	if (
+		Math.abs(eligibleScalableGrandTotal - eligibleNetTotal) <= EPSILON &&
+		actualTaxTotal === 0
+	) {
+		const docGrandTotal = toFiniteNumber(doc.grand_total) || 0;
+		const docTaxesTotal = toFiniteNumber(doc.total_taxes_and_charges) || 0;
+		if (docGrandTotal > 0 && discountAmount > 0) {
+			const preDiscountGrandTotal = docGrandTotal + discountAmount;
+			if (preDiscountGrandTotal > eligibleScalableGrandTotal + EPSILON) {
+				eligibleScalableGrandTotal = preDiscountGrandTotal;
+			}
+		} else if (docTaxesTotal > 0) {
+			eligibleScalableGrandTotal += docTaxesTotal;
+		}
+	}
+
+	const eligibleGrandTotal =
+		eligibleScalableGrandTotal + eligibleFixedQtyTaxTotal + actualTaxTotal;
+	if (eligibleScalableGrandTotal <= 0) {
+		return 0;
+	}
+	if (explicitPct > 0) {
+		const effectiveDiscount = (explicitPct / 100) * eligibleGrandTotal;
+		return Math.min((effectiveDiscount / eligibleScalableGrandTotal) * 100, 100);
+	}
+	return Math.min((discountAmount / eligibleScalableGrandTotal) * 100, 100);
+}
+
 export function getItemCostFloor(
 	item: Record<string, unknown> | null | undefined,
 ): LossCostFloor | null {
@@ -146,10 +420,11 @@ export function getItemCostFloor(
 	}
 	const rawUomFactor = toFiniteNumber(item.conversion_factor);
 	const uomConversionFactor =
-		rawUomFactor !== null && rawUomFactor > EPSILON ? rawUomFactor : 1;
+		rawUomFactor !== null && rawUomFactor > 0 ? rawUomFactor : 1;
 
 	const resolvedCandidates: LossCostFloor[] = [];
 	let hasNormalizedBuyingPrice = false;
+	let hasUnresolvedCrossCurrencyCost = false;
 	let selectedTableCurrency = "";
 
 	const pricesByUom = item._buying_prices_by_uom;
@@ -166,7 +441,7 @@ export function getItemCostFloor(
 		const selected = exact || fallback;
 		selectedTableCurrency = String(selected?.currency || "").trim();
 		const baseRate = toFiniteNumber(selected?.base_price_list_rate);
-		if (baseRate !== null && baseRate > EPSILON) {
+		if (baseRate !== null && baseRate > 0) {
 			const conversionFactor = exact ? 1 : uomConversionFactor;
 			selectedTableRate = baseRate * conversionFactor;
 			hasNormalizedBuyingPrice = true;
@@ -177,35 +452,41 @@ export function getItemCostFloor(
 		item,
 		selectedTableCurrency,
 	);
-	if (selectedTableRate !== null && invoiceToCompanyRate !== null) {
-		resolvedCandidates.push({
-			field: "_buying_prices_by_uom",
-			label: "Trade Price",
-			rate: selectedTableRate,
-			baseCurrency: true,
-		});
+	if (selectedTableRate !== null) {
+		if (invoiceToCompanyRate !== null) {
+			resolvedCandidates.push({
+				field: "_buying_prices_by_uom",
+				label: "Trade Price",
+				rate: selectedTableRate,
+				baseCurrency: true,
+			});
+		} else {
+			hasUnresolvedCrossCurrencyCost = true;
+		}
 	}
 
 	if (!hasNormalizedBuyingPrice) {
 		const storedCompanyBuying = toFiniteNumber(item._company_buying_price);
 		const baseBuyingRate = toFiniteNumber(item.base_buying_rate);
 		const companyBuyingPrice =
-			storedCompanyBuying !== null && storedCompanyBuying > EPSILON
+			storedCompanyBuying !== null && storedCompanyBuying > 0
 				? storedCompanyBuying
-				: baseBuyingRate !== null && baseBuyingRate > EPSILON
+				: baseBuyingRate !== null && baseBuyingRate > 0
 					? baseBuyingRate
 					: null;
 		if (companyBuyingPrice !== null) {
 			if (invoiceToCompanyRate !== null) {
 				resolvedCandidates.push({
 					field:
-						storedCompanyBuying !== null && storedCompanyBuying > EPSILON
+						storedCompanyBuying !== null && storedCompanyBuying > 0
 							? "_company_buying_price"
 							: "base_buying_rate",
 					label: "Trade Price",
 					rate: companyBuyingPrice,
 					baseCurrency: true,
 				});
+			} else {
+				hasUnresolvedCrossCurrencyCost = true;
 			}
 			hasNormalizedBuyingPrice = true;
 		}
@@ -221,10 +502,11 @@ export function getItemCostFloor(
 
 	for (const candidate of COST_CANDIDATES) {
 		const rawRate = toFiniteNumber(item[candidate.field]);
-		if (rawRate === null || rawRate <= EPSILON) {
+		if (rawRate === null || rawRate <= 0) {
 			continue;
 		}
 		if (candidate.baseCurrency && invoiceToCompanyRate === null) {
+			hasUnresolvedCrossCurrencyCost = true;
 			continue;
 		}
 		if (candidate.buyingListField) {
@@ -239,6 +521,7 @@ export function getItemCostFloor(
 			);
 			if (currencyMismatch) {
 				if (invoiceToCompanyRate === null) {
+					hasUnresolvedCrossCurrencyCost = true;
 					continue;
 				}
 				if (
@@ -255,7 +538,7 @@ export function getItemCostFloor(
 					buyingPriceCurrency &&
 					scalarCurrency === buyingPriceCurrency &&
 					rawBuyingExchangeRate !== null &&
-					rawBuyingExchangeRate > EPSILON
+					rawBuyingExchangeRate > 0
 				) {
 					resolvedCandidates.push({
 						field: candidate.field,
@@ -278,7 +561,7 @@ export function getItemCostFloor(
 		});
 	}
 
-	if (!resolvedCandidates.length) {
+	if (hasUnresolvedCrossCurrencyCost || !resolvedCandidates.length) {
 		return null;
 	}
 
@@ -370,13 +653,41 @@ export function getItemLossRisk(
 	if (!cost) {
 		return null;
 	}
-	const sellingRate = getEffectiveSellingRate(item);
-	const invoiceDiscountPercentage = Math.min(
-		Math.max(toFiniteNumber(options.invoiceDiscountPercentage) || 0, 0),
-		100,
+	const grossSellingRate = getEffectiveSellingRate(item);
+	const { inclA, inclB } = computeRowTaxParams(item, options.taxes);
+	const preDiscountNetRate = Math.max(
+		(grossSellingRate - inclB) / (1 + inclA),
+		0,
 	);
-	const effectiveSellingRate =
-		sellingRate * (1 - invoiceDiscountPercentage / 100);
+	const applyDiscountOn = String(
+		options.applyDiscountOn || "Grand Total",
+	).trim();
+	const isCashDiscount =
+		Boolean(options.isCashOrNonTradeDiscount) &&
+		applyDiscountOn === "Grand Total";
+	const invoiceDiscountPercentage = isCashDiscount
+		? 0
+		: Math.min(
+				Math.max(toFiniteNumber(options.invoiceDiscountPercentage) || 0, 0),
+				100,
+			);
+	const rawNetRate = toFiniteNumber(item.net_rate);
+	const hasPopulatedNetRate =
+		rawNetRate !== null &&
+		rawNetRate >= 0 &&
+		(rawNetRate > 0 || grossSellingRate <= 0);
+	let effectiveSellingRate: number;
+	if (
+		hasPopulatedNetRate &&
+		(rawNetRate! < preDiscountNetRate - EPSILON ||
+			isCashDiscount ||
+			invoiceDiscountPercentage <= 0)
+	) {
+		effectiveSellingRate = Math.min(rawNetRate!, preDiscountNetRate);
+	} else {
+		effectiveSellingRate =
+			preDiscountNetRate * (1 - invoiceDiscountPercentage / 100);
+	}
 	const minimumMarginPercentage = Math.max(
 		toFiniteNumber(options.minimumMarginPercentage) || 0,
 		0,
@@ -397,9 +708,12 @@ export function getItemLossRisk(
 	if (comparisonSellingRate + EPSILON >= minimumCostRate) {
 		return null;
 	}
-	const displayCostRate = cost.baseCurrency
+	const rawDisplayCostRate = cost.baseCurrency
 		? minimumCostRate / currencyConversionRate
 		: minimumCostRate;
+	const displayCostRate = Number.isFinite(rawDisplayCostRate)
+		? Number(rawDisplayCostRate.toPrecision(12))
+		: rawDisplayCostRate;
 	return {
 		belowCost: true,
 		itemCode: String(item.item_code || ""),

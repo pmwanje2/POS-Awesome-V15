@@ -268,19 +268,42 @@ def _apply_item_name_overrides(invoice_doc, overrides=None):
             item.name_overridden = 0
 
 
-def _merge_duplicate_taxes(invoice_doc, recalculate=True):
-    """Remove duplicate tax rows with same account and rate.
+def _tax_row_field(tax, fieldname, default=None):
+    if hasattr(tax, "get"):
+        return tax.get(fieldname, default)
+    return getattr(tax, fieldname, default)
 
-    If duplicates are found, keep the first occurrence and recalculate totals
-    when ``recalculate`` is enabled.
+
+def _merge_duplicate_taxes(invoice_doc, recalculate=True):
+    """Remove identical duplicate tax rows while preserving distinct chained rows.
+
+    Preserves distinct ``row_id``, ``included_in_print_rate``, ``Actual`` tax
+    amounts, ``cost_center``, ``add_deduct_tax``, and ``category`` entries so
+    chained taxes referencing different rows are never collapsed.
     """
     seen = set()
     unique = []
     for tax in invoice_doc.get("taxes", []):
-        account_head = tax.get("account_head") if isinstance(tax, dict) else tax.account_head
-        tax_rate = tax.get("rate") if isinstance(tax, dict) else tax.rate
-        charge_type = tax.get("charge_type") if isinstance(tax, dict) else tax.charge_type
-        key = (account_head, flt(tax_rate), cstr(charge_type))
+        account_head = cstr(_tax_row_field(tax, "account_head")).strip()
+        tax_rate = flt(_tax_row_field(tax, "rate"))
+        charge_type = cstr(_tax_row_field(tax, "charge_type")).strip()
+        row_id = cstr(_tax_row_field(tax, "row_id")).strip()
+        included_in_print_rate = cint(_tax_row_field(tax, "included_in_print_rate"))
+        actual_amount = flt(_tax_row_field(tax, "tax_amount")) if charge_type == "Actual" else 0.0
+        cost_center = cstr(_tax_row_field(tax, "cost_center")).strip()
+        add_deduct_tax = cstr(_tax_row_field(tax, "add_deduct_tax") or "Add").strip()
+        category = cstr(_tax_row_field(tax, "category") or "Total").strip()
+        key = (
+            account_head,
+            tax_rate,
+            charge_type,
+            row_id,
+            included_in_print_rate,
+            actual_amount,
+            cost_center,
+            add_deduct_tax,
+            category,
+        )
         if key in seen:
             continue
         seen.add(key)
