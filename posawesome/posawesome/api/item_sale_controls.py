@@ -1163,48 +1163,170 @@ def _server_applied_free_row_indexes(
             recurse_for = flt(rule.get("recurse_for"))
             if recurse_for <= 0:
                 continue
-            # ERPNext pricing_rule/utils.py:312-332, 423-441 + get_item_details.py:1784-1789:
+            # ERPNext pricing_rule/utils.py:312-332, 423-453, 546-615 + get_item_details.py:1784-1789:
             # - Only `mixed_conditions=1` aggregates current-invoice paid lines; when
-            #   `mixed_conditions=0` (including `is_cumulative=1`), each paid line is
-            #   checked independently against `min_qty`/`max_qty`.
+            #   `mixed_conditions=0`, each paid line is checked independently against
+            #   `min_qty`/`max_qty` and `min_amt`/`max_amt`.
+            # - When `is_cumulative=1` (and `mixed_conditions=0`), ERPNext adds historical
+            #   submitted `(cumulative_qty, cumulative_amount)` — which may be negative
+            #   after returns — to each line's `stock_qty` and `amount` before checking
+            #   thresholds.
             # - Only `apply_on == "Item Code"` child rows carry `item_code`, so Brand and
             #   Item Group rules convert with factor 1.0 in ERPNext.
             min_qty = flt(rule.get("min_qty"))
             max_qty = flt(rule.get("max_qty"))
+            min_amt = flt(rule.get("min_amt"))
+            max_amt = flt(rule.get("max_amt"))
             is_mixed = bool(cint(rule.get("mixed_conditions")))
             is_cumulative = bool(cint(rule.get("is_cumulative")))
             apply_on = cstr(rule.get("apply_on")).strip()
 
-            def _row_threshold_qty(entry):
-                q_code, q_uom, q_stock_uom, _q_qty, q_stock_qty, q_row = entry
+            class _RuleAttrDict(dict):
+                def __getattr__(self, key):
+                    return self.get(key)
+
+            def _row_threshold_factors(entry):
+                q_code, q_uom, q_stock_uom, _q_qty, _q_stock_qty, q_row = entry
                 if apply_on != "Item Code":
-                    return q_stock_qty
+                    return 1.0, 1.0
                 child_uom = _matched_rule_uom(rule, q_code, q_uom, q_row)
                 if not child_uom or child_uom == q_stock_uom:
-                    return q_stock_qty
+                    return 1.0, 1.0
                 child_cf = _authoritative_uom_factor(q_code, child_uom, q_stock_uom)
-                return (q_stock_qty / child_cf) if child_cf > 0 else None
+                if child_cf <= 0:
+                    return None
+                amt_cf = 1.0 if child_uom == q_uom else child_cf
+                return child_cf, amt_cf
+
+            def _cumulative_totals_for_row(entry):
+                q_code, q_uom, _q_stock_uom, q_qty, q_stock_qty, q_row = entry
+                try:
+                    from erpnext.accounts.doctype.pricing_rule.utils import (
+                        get_cumulative_qty_and_amount_for_row,
+                    )
+                except Exception:
+                    return None
+
+                pr_doc = None
+                get_cached_doc = getattr(frappe, "get_cached_doc", None)
+                if callable(get_cached_doc) and rule_name:
+                    try:
+                        pr_doc = get_cached_doc("Pricing Rule", rule_name)
+                    except Exception:
+                        pr_doc = None
+                if pr_doc is None:
+                    pr_doc = _RuleAttrDict(rule)
+
+                meta = item_info_map.get(q_code) or {}
+                doc_doctype = (
+                    cstr(
+                        invoice_doc.get("doctype")
+                        or getattr(invoice_doc, "doctype", None)
+                    ).strip()
+                    if has_doc
+                    else ""
+                )
+                doctype = (
+                    doc_doctype
+                    or cstr(q_row.get("parenttype") or "Sales Invoice").strip()
+                )
+                row_args = _RuleAttrDict(
+                    {
+                        "item_code": q_code,
+                        "item_group": cstr(
+                            meta.get("item_group") or q_row.get("item_group")
+                        ).strip(),
+                        "brand": cstr(
+                            meta.get("brand") or q_row.get("brand")
+                        ).strip(),
+                        "parenttype": doctype,
+                        "doctype": doctype,
+                        "company": company,
+                        "name": (
+                            invoice_doc.get("name")
+                            or getattr(invoice_doc, "name", None)
+                            if has_doc
+                            else None
+                        ),
+                        "modified": (
+                            invoice_doc.get("modified")
+                            or getattr(invoice_doc, "modified", None)
+                            if has_doc
+                            else None
+                        ),
+                        "uom": q_uom,
+                        "qty": q_qty,
+                        "stock_qty": q_stock_qty,
+                        "price_list_rate": flt(
+                            q_row.get("price_list_rate") or q_row.get("rate")
+                        ),
+                    }
+                )
+                try:
+                    result = get_cumulative_qty_and_amount_for_row(
+                        pr_doc,
+                        row_args,
+                        invoice_doc if has_doc else None,
+                    )
+                except Exception:
+                    return None
+                if not isinstance(result, (tuple, list)) or len(result) < 2:
+                    return None
+                return flt(result[0]), flt(result[1])
 
             if is_mixed:
-                threshold_values = [_row_threshold_qty(entry) for entry in qualifying_rows]
-                valid_thresholds = [val for val in threshold_values if val is not None]
-                if not valid_thresholds:
+                total_threshold_qty = 0.0
+                total_threshold_amt = 0.0
+                valid_count = 0
+                for entry in qualifying_rows:
+                    factors = _row_threshold_factors(entry)
+                    if factors is None:
+                        continue
+                    qty_cf, amt_cf = factors
+                    _q_code, _q_uom, _q_stock_uom, q_qty, q_stock_qty, q_row = entry
+                    total_threshold_qty += q_stock_qty / qty_cf
+                    row_amt = flt(q_row.get("price_list_rate") or q_row.get("rate")) * q_qty
+                    total_threshold_amt += row_amt / amt_cf
+                    valid_count += 1
+                if not valid_count:
                     continue
-                total_threshold_qty = sum(valid_thresholds)
                 if min_qty > 0 and total_threshold_qty < min_qty - 1e-9:
                     continue
                 if max_qty > 0 and total_threshold_qty > max_qty + 1e-9:
+                    continue
+                if min_amt > 0 and total_threshold_amt < min_amt - 1e-9:
+                    continue
+                if max_amt > 0 and total_threshold_amt > max_amt + 1e-9:
                     continue
                 eligible_rows = qualifying_rows
             else:
                 eligible_rows = []
                 for entry in qualifying_rows:
-                    row_threshold = _row_threshold_qty(entry)
-                    if row_threshold is None:
+                    factors = _row_threshold_factors(entry)
+                    if factors is None:
                         continue
-                    if min_qty > 0 and not is_cumulative and row_threshold < min_qty - 1e-9:
+                    qty_cf, amt_cf = factors
+                    _q_code, _q_uom, _q_stock_uom, q_qty, q_stock_qty, q_row = entry
+                    row_amt = flt(q_row.get("price_list_rate") or q_row.get("rate")) * q_qty
+                    cumulative_totals = (
+                        _cumulative_totals_for_row(entry) if is_cumulative else None
+                    )
+                    if cumulative_totals is not None:
+                        cum_qty, cum_amt = cumulative_totals
+                        row_threshold_qty = (q_stock_qty + cum_qty) / qty_cf
+                        row_threshold_amt = row_amt + cum_amt
+                        enforce_min = True
+                    else:
+                        row_threshold_qty = q_stock_qty / qty_cf
+                        row_threshold_amt = row_amt
+                        enforce_min = not is_cumulative
+                    if min_qty > 0 and enforce_min and row_threshold_qty < min_qty - 1e-9:
                         continue
-                    if max_qty > 0 and row_threshold > max_qty + 1e-9:
+                    if max_qty > 0 and row_threshold_qty > max_qty + 1e-9:
+                        continue
+                    if min_amt > 0 and enforce_min and row_threshold_amt < (min_amt * amt_cf) - 1e-9:
+                        continue
+                    if max_amt > 0 and row_threshold_amt > (max_amt * amt_cf) + 1e-9:
                         continue
                     eligible_rows.append(entry)
                 if not eligible_rows:

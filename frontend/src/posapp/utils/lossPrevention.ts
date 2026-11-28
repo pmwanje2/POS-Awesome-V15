@@ -449,7 +449,11 @@ export function getItemCostFloor(
 	).trim();
 	const buyingPriceCurrency = String(item.buying_price_currency || "").trim();
 	const buyingRateCurrency = String(item.buying_rate_currency || "").trim();
+	const sourceBuyingCurrency = String(
+		item._source_buying_currency || "",
+	).trim();
 	const companyCurrency = String(item.company_currency || "").trim();
+	const effectiveInvoiceCurrency = invoiceCurrency || companyCurrency;
 	const rawBuyingExchangeRate = toFiniteNumber(item.buying_exchange_rate);
 
 	const pricesByUom = item._buying_prices_by_uom;
@@ -576,11 +580,12 @@ export function getItemCostFloor(
 			if (hasNormalizedBuyingPrice) {
 				continue;
 			}
-			const scalarCurrency = buyingRateCurrency || buyingPriceCurrency;
+			const scalarCurrency =
+				buyingRateCurrency || sourceBuyingCurrency || buyingPriceCurrency;
 			const currencyMismatch = Boolean(
 				scalarCurrency &&
-					invoiceCurrency &&
-					scalarCurrency !== invoiceCurrency,
+					effectiveInvoiceCurrency &&
+					scalarCurrency !== effectiveInvoiceCurrency,
 			);
 			if (currencyMismatch) {
 				if (invoiceToCompanyRate === null) {
@@ -624,6 +629,64 @@ export function getItemCostFloor(
 			rate: scaledRate,
 			baseCurrency: candidate.baseCurrency,
 		});
+	}
+
+	if (!hasNormalizedBuyingPrice) {
+		const rawSourceBuyingPrice = toFiniteNumber(item._source_buying_price);
+		if (
+			rawSourceBuyingPrice !== null &&
+			rawSourceBuyingPrice > 0 &&
+			(!buyingRateCurrency || buyingRateCurrency === sourceBuyingCurrency)
+		) {
+			const sourceCurrency = sourceBuyingCurrency || buyingPriceCurrency;
+			const sourceMismatch = Boolean(
+				sourceCurrency &&
+					effectiveInvoiceCurrency &&
+					sourceCurrency !== effectiveInvoiceCurrency,
+			);
+			if (sourceMismatch) {
+				if (invoiceToCompanyRate === null) {
+					hasUnresolvedCrossCurrencyCost = true;
+				} else if (
+					companyCurrency &&
+					sourceCurrency === companyCurrency
+				) {
+					resolvedCandidates.push({
+						field: "_source_buying_price",
+						label: "Trade Price",
+						rate: rawSourceBuyingPrice,
+						baseCurrency: true,
+					});
+				} else if (
+					buyingPriceCurrency &&
+					sourceCurrency === buyingPriceCurrency &&
+					rawBuyingExchangeRate !== null &&
+					rawBuyingExchangeRate > 0
+				) {
+					resolvedCandidates.push({
+						field: "_source_buying_price",
+						label: "Trade Price",
+						rate: rawSourceBuyingPrice * rawBuyingExchangeRate,
+						baseCurrency: true,
+					});
+				} else {
+					hasUnresolvedCrossCurrencyCost = true;
+				}
+			} else if (
+				!resolvedCandidates.some((candidate) =>
+					["trade_price", "buying_price", "buying_rate"].includes(
+						candidate.field,
+					),
+				)
+			) {
+				resolvedCandidates.push({
+					field: "_source_buying_price",
+					label: "Trade Price",
+					rate: rawSourceBuyingPrice,
+					baseCurrency: false,
+				});
+			}
+		}
 	}
 
 	if (hasUnresolvedCrossCurrencyCost || !resolvedCandidates.length) {
@@ -702,12 +765,13 @@ function resolveNativeNetAmount(
 	item: Record<string, unknown>,
 	grossSellingRate: number,
 	qty: number,
+	allowZero = false,
 ): number | null {
 	const rawNetAmount = toFiniteNumber(item.net_amount);
 	if (
 		rawNetAmount !== null &&
 		rawNetAmount >= 0 &&
-		(rawNetAmount > 0 || grossSellingRate <= 0)
+		(rawNetAmount > 0 || grossSellingRate <= 0 || allowZero)
 	) {
 		return Math.abs(rawNetAmount);
 	}
@@ -715,7 +779,7 @@ function resolveNativeNetAmount(
 	if (
 		rawNetRate !== null &&
 		rawNetRate >= 0 &&
-		(rawNetRate > 0 || grossSellingRate <= 0)
+		(rawNetRate > 0 || grossSellingRate <= 0 || allowZero)
 	) {
 		return Math.abs(rawNetRate) * qty;
 	}
@@ -727,12 +791,13 @@ function resolveNativeUnitNetRate(
 	grossSellingRate: number,
 	qty: number | null,
 	precision = 2,
+	allowZero = false,
 ): number | null {
 	const rawNetAmount = toFiniteNumber(item.net_amount);
 	const netFromAmount =
 		rawNetAmount !== null &&
 		rawNetAmount >= 0 &&
-		(rawNetAmount > 0 || grossSellingRate <= 0) &&
+		(rawNetAmount > 0 || grossSellingRate <= 0 || allowZero) &&
 		qty !== null &&
 		qty > 0
 			? Math.abs(rawNetAmount) / qty
@@ -744,6 +809,7 @@ function resolveNativeUnitNetRate(
 		rawNetRate >= 0 &&
 		(rawNetRate > 0 ||
 			grossSellingRate <= 0 ||
+			allowZero ||
 			(netFromAmount !== null &&
 				Math.abs(Math.abs(rawNetRate) - netFromAmount) <= halfUlp + 1e-9));
 	if (hasValidNetRate) {
@@ -786,6 +852,7 @@ function areNativeNetAmountsReconciled(
 	let nativeSum = 0;
 	let expectedSum = 0;
 	let preDiscountSum = 0;
+	let hasZeroAboveHalfUlp = false;
 
 	for (const item of items) {
 		if (
@@ -802,15 +869,22 @@ function areNativeNetAmountsReconciled(
 		}
 		eligibleCount += 1;
 		const grossRate = getEffectiveSellingRate(item);
-		const nativeAmount = resolveNativeNetAmount(item, grossRate, qty);
-		if (nativeAmount === null) {
-			return false;
-		}
 		const { inclA, inclB } = computeRowTaxParams(item, options.taxes);
 		const preDiscountNet = Math.max((grossRate - inclB) / (1 + inclA), 0);
 		const preAmount = preDiscountNet * qty;
 		const computedAmount =
 			preDiscountNet * (1 - invoiceDiscountPercentage / 100) * qty;
+		const nativeAmount = resolveNativeNetAmount(item, grossRate, qty, true);
+		if (nativeAmount === null) {
+			return false;
+		}
+		if (
+			nativeAmount === 0 &&
+			grossRate > 0 &&
+			computedAmount > 0.5 * ulp + 1e-9
+		) {
+			hasZeroAboveHalfUlp = true;
+		}
 		if (
 			nativeAmount > preAmount + 1e-9 ||
 			nativeAmount > computedAmount + ulp + 1e-9
@@ -828,6 +902,13 @@ function areNativeNetAmountsReconciled(
 	const hasUnappliedDiscount =
 		expectedSum < preDiscountSum - 0.5 * ulp - 1e-9 &&
 		nativeSum >= preDiscountSum - 1e-9;
+	if (hasZeroAboveHalfUlp) {
+		return (
+			!hasUnappliedDiscount &&
+			expectedSum < preDiscountSum - 1e-9 &&
+			Math.abs(nativeSum - expectedSum) <= 0.5 * ulp + 1e-9
+		);
+	}
 	return !hasUnappliedDiscount && Math.abs(nativeSum - expectedSum) <= ulp + 1e-9;
 }
 
@@ -872,11 +953,18 @@ export function getItemLossRisk(
 	const rawPrecision = toFiniteNumber(options.currencyPrecision);
 	const precision =
 		rawPrecision !== null && rawPrecision >= 0 ? Math.trunc(rawPrecision) : 2;
+	const computedNetRate =
+		preDiscountNetRate * (1 - invoiceDiscountPercentage / 100);
+	const halfUlp = 0.5 * 10 ** -precision;
+	const allowZeroNativeNet =
+		Boolean(options.reconciledNativeNet) ||
+		computedNetRate <= halfUlp + 1e-9;
 	const nativeUnitNetRate = resolveNativeUnitNetRate(
 		item,
 		grossSellingRate,
 		qty,
 		precision,
+		allowZeroNativeNet,
 	);
 	let effectiveSellingRate: number;
 	if (options.reconciledNativeNet && nativeUnitNetRate !== null) {

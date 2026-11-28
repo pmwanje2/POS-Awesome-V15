@@ -123,51 +123,116 @@ function isBlankValue(value: unknown): boolean {
 	return value === undefined || value === null || value === "";
 }
 
-function findMatchingCartItemIndex(
-	docItem: Record<string, any>,
-	index: number,
+function isPositiveFinite(value: unknown): boolean {
+	if (isBlankValue(value)) {
+		return false;
+	}
+	const numeric = Number(value);
+	return Number.isFinite(numeric) && numeric > 0;
+}
+
+const BUYING_LIST_SCALAR_FIELDS = new Set<string>([
+	"trade_price",
+	"buying_price",
+	"buying_rate",
+]);
+
+function resolveCartItemMatches(
+	docItems: Array<Record<string, any>>,
 	liveCartItems: Array<Record<string, any>>,
-	usedIndexes: Set<number>,
-): number {
-	if (docItem.posa_row_id) {
+): number[] {
+	const matchedIndexes = new Array<number>(docItems.length).fill(-1);
+	if (!liveCartItems.length) {
+		return matchedIndexes;
+	}
+	const usedCartIndexes = new Set<number>();
+
+	// Pass 1a: reserve all exact posa_row_id matches first so earlier anonymous rows cannot steal them.
+	for (let i = 0; i < docItems.length; i++) {
+		const docItem = docItems[i];
+		if (!docItem || typeof docItem !== "object" || !docItem.posa_row_id) {
+			continue;
+		}
 		const byRowId = liveCartItems.findIndex(
-			(cartItem) => cartItem && cartItem.posa_row_id === docItem.posa_row_id,
+			(cartItem, idx) =>
+				!usedCartIndexes.has(idx) &&
+				cartItem &&
+				cartItem.posa_row_id === docItem.posa_row_id,
 		);
 		if (byRowId !== -1) {
-			return byRowId;
+			matchedIndexes[i] = byRowId;
+			usedCartIndexes.add(byRowId);
 		}
 	}
-	if (docItem.name) {
+
+	// Pass 1b: reserve remaining exact child row name matches.
+	for (let i = 0; i < docItems.length; i++) {
+		if (matchedIndexes[i] !== -1) {
+			continue;
+		}
+		const docItem = docItems[i];
+		if (!docItem || typeof docItem !== "object" || !docItem.name) {
+			continue;
+		}
 		const byName = liveCartItems.findIndex(
-			(cartItem) => cartItem && cartItem.name === docItem.name,
+			(cartItem, idx) =>
+				!usedCartIndexes.has(idx) &&
+				cartItem &&
+				cartItem.name === docItem.name,
 		);
 		if (byName !== -1) {
-			return byName;
+			matchedIndexes[i] = byName;
+			usedCartIndexes.add(byName);
 		}
 	}
-	const sameIndex = liveCartItems[index];
-	if (
-		!usedIndexes.has(index) &&
-		sameIndex &&
-		sameIndex.item_code === docItem.item_code
-	) {
-		return index;
+
+	// Pass 2a: positional fallback for unmatched rows whose same-index cart slot is still unclaimed.
+	for (let i = 0; i < docItems.length; i++) {
+		if (matchedIndexes[i] !== -1 || usedCartIndexes.has(i)) {
+			continue;
+		}
+		const docItem = docItems[i];
+		const sameIndex = liveCartItems[i];
+		if (
+			docItem &&
+			typeof docItem === "object" &&
+			sameIndex &&
+			sameIndex.item_code === docItem.item_code
+		) {
+			matchedIndexes[i] = i;
+			usedCartIndexes.add(i);
+		}
 	}
-	if (docItem.item_code) {
+
+	// Pass 2b: unclaimed SKU fallback, then any SKU match if server split one cart row into multiple rows.
+	for (let i = 0; i < docItems.length; i++) {
+		if (matchedIndexes[i] !== -1) {
+			continue;
+		}
+		const docItem = docItems[i];
+		if (!docItem || typeof docItem !== "object" || !docItem.item_code) {
+			continue;
+		}
 		const unclaimedBySku = liveCartItems.findIndex(
 			(cartItem, idx) =>
-				!usedIndexes.has(idx) &&
+				!usedCartIndexes.has(idx) &&
 				cartItem &&
 				cartItem.item_code === docItem.item_code,
 		);
 		if (unclaimedBySku !== -1) {
-			return unclaimedBySku;
+			matchedIndexes[i] = unclaimedBySku;
+			usedCartIndexes.add(unclaimedBySku);
+			continue;
 		}
-		return liveCartItems.findIndex(
+		const anyBySku = liveCartItems.findIndex(
 			(cartItem) => cartItem && cartItem.item_code === docItem.item_code,
 		);
+		if (anyBySku !== -1) {
+			matchedIndexes[i] = anyBySku;
+		}
 	}
-	return -1;
+
+	return matchedIndexes;
 }
 
 function mergeDocItemsWithCartCostFallback(
@@ -178,24 +243,60 @@ function mergeDocItemsWithCartCostFallback(
 	if (!docItems.length) {
 		return liveCartItems;
 	}
-	const usedCartIndexes = new Set<number>();
+	const matchedIndexes = resolveCartItemMatches(docItems, liveCartItems);
 	return docItems.map((docItem, index) => {
 		if (!docItem || typeof docItem !== "object") {
 			return docItem;
 		}
-		const matchedIndex = liveCartItems.length
-			? findMatchingCartItemIndex(
-					docItem,
-					index,
-					liveCartItems,
-					usedCartIndexes,
-				)
-			: -1;
+		const matchedIndex = matchedIndexes[index] ?? -1;
 		const matched = matchedIndex !== -1 ? liveCartItems[matchedIndex] : null;
-		if (matchedIndex !== -1) {
-			usedCartIndexes.add(matchedIndex);
-		}
 		const merged: Record<string, any> = { ...docItem };
+
+		// Apply authoritative invoice-level currency & FX metadata before cart fallback
+		// so stale or pending-zero cart FX never overrides a valid invoice conversion_rate.
+		if (doc && typeof doc === "object") {
+			for (const docField of [
+				"currency",
+				"price_list_currency",
+				"company_currency",
+			] as const) {
+				if (isBlankValue(merged[docField]) && !isBlankValue(doc[docField])) {
+					merged[docField] = doc[docField];
+				}
+			}
+			const docCurrency = String(doc.currency || "").trim();
+			const mergedCurrency = String(merged.currency || "").trim();
+			if (
+				isPositiveFinite(doc.conversion_rate) &&
+				(isBlankValue(merged.conversion_rate) ||
+					!isPositiveFinite(merged.conversion_rate)) &&
+				(!docCurrency || !mergedCurrency || docCurrency === mergedCurrency)
+			) {
+				merged.conversion_rate = doc.conversion_rate;
+			} else if (
+				isBlankValue(merged.conversion_rate) &&
+				!isBlankValue(doc.conversion_rate)
+			) {
+				merged.conversion_rate = doc.conversion_rate;
+			}
+			const docPlcCurrency = String(doc.price_list_currency || "").trim();
+			const mergedPlcCurrency = String(merged.price_list_currency || "").trim();
+			if (
+				isPositiveFinite(doc.plc_conversion_rate) &&
+				(isBlankValue(merged.plc_conversion_rate) ||
+					!isPositiveFinite(merged.plc_conversion_rate)) &&
+				(!docPlcCurrency ||
+					!mergedPlcCurrency ||
+					docPlcCurrency === mergedPlcCurrency)
+			) {
+				merged.plc_conversion_rate = doc.plc_conversion_rate;
+			} else if (
+				isBlankValue(merged.plc_conversion_rate) &&
+				!isBlankValue(doc.plc_conversion_rate)
+			) {
+				merged.plc_conversion_rate = doc.plc_conversion_rate;
+			}
+		}
 
 		if (matched && typeof matched === "object") {
 			if (
@@ -211,31 +312,72 @@ function mergeDocItemsWithCartCostFallback(
 					? { ...matched._buying_prices_by_uom, ...existingMap }
 					: { ...matched._buying_prices_by_uom };
 			}
+			let copiedBuyingListScalar = false;
 			for (const field of SCALAR_COST_FALLBACK_FIELDS) {
 				const currentVal = merged[field];
 				const currentMissing =
 					isBlankValue(currentVal) || !(Number(currentVal) > 0);
 				if (currentMissing && Number(matched[field]) > 0) {
 					merged[field] = matched[field];
+					if (BUYING_LIST_SCALAR_FIELDS.has(field)) {
+						copiedBuyingListScalar = true;
+					}
 				}
 			}
 			for (const field of METADATA_FALLBACK_FIELDS) {
+				if (field === "conversion_rate") {
+					const cartCurrency = String(matched.currency || "").trim();
+					const rowCurrency = String(merged.currency || "").trim();
+					const currencyMatches =
+						!cartCurrency || !rowCurrency || cartCurrency === rowCurrency;
+					if (
+						currencyMatches &&
+						isBlankValue(merged.conversion_rate) &&
+						!isBlankValue(matched.conversion_rate)
+					) {
+						merged.conversion_rate = matched.conversion_rate;
+					}
+					continue;
+				}
+				if (field === "plc_conversion_rate") {
+					const cartPlc = String(matched.price_list_currency || "").trim();
+					const rowPlc = String(merged.price_list_currency || "").trim();
+					const plcMatches = !cartPlc || !rowPlc || cartPlc === rowPlc;
+					if (
+						plcMatches &&
+						isBlankValue(merged.plc_conversion_rate) &&
+						!isBlankValue(matched.plc_conversion_rate)
+					) {
+						merged.plc_conversion_rate = matched.plc_conversion_rate;
+					}
+					continue;
+				}
 				if (isBlankValue(merged[field]) && !isBlankValue(matched[field])) {
 					merged[field] = matched[field];
 				}
 			}
-		}
-
-		if (doc && typeof doc === "object") {
-			for (const docField of [
-				"currency",
-				"price_list_currency",
-				"company_currency",
-				"conversion_rate",
-				"plc_conversion_rate",
-			] as const) {
-				if (isBlankValue(merged[docField]) && !isBlankValue(doc[docField])) {
-					merged[docField] = doc[docField];
+			if (
+				copiedBuyingListScalar &&
+				isBlankValue(merged.buying_rate_currency) &&
+				isBlankValue(merged._source_buying_currency)
+			) {
+				const matchedScalarCurrency = String(
+					matched.buying_rate_currency ||
+						matched._source_buying_currency ||
+						matched.buying_price_currency ||
+						matched.currency ||
+						matched.price_list_currency ||
+						"",
+				).trim();
+				const mergedInvoiceCurrency = String(
+					merged.currency || merged.price_list_currency || "",
+				).trim();
+				if (
+					matchedScalarCurrency &&
+					mergedInvoiceCurrency &&
+					matchedScalarCurrency !== mergedInvoiceCurrency
+				) {
+					merged._source_buying_currency = matchedScalarCurrency;
 				}
 			}
 		}
