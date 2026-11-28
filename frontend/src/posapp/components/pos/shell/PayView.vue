@@ -171,7 +171,7 @@
 						:invoice-total-currency="invoiceTotalCurrency"
 						:payment-total-currency="paymentTotalCurrency"
 						:mpesa-total-currency="mpesaTotalCurrency"
-						:company-currency="companyCurrency"
+						:company-currency="companyCurrencyLocal"
 						:exchange-rate-loading="exchangeRateLoading"
 						:exchange-rate-error="exchangeRateError"
 						:requires-exchange-rate="requiresExchangeRate"
@@ -740,32 +740,70 @@ export default {
 			}
 		};
 
+		const exchangeRateRequestState = { seq: 0, key: "" };
+
 		const fetchExchangeRate = async () => {
-			if (exchangeRateLoading.value || !requiresExchangeRate.value) {
-				exchangeRate.value = requiresExchangeRate.value ? null : 1;
+			const requestState =
+				typeof exchangeRateRequestState !== "undefined"
+					? exchangeRateRequestState
+					: (exchangeRateLoading._requestState ||= { seq: 0, key: "" });
+			if (!requiresExchangeRate.value) {
+				requestState.seq += 1;
+				requestState.key = "";
+				exchangeRateLoading.value = false;
+				exchangeRateError.value = null;
+				exchangeRate.value = 1;
 				return;
 			}
-			if (!invoiceTotalCurrency.value || !companyCurrencyLocal.value) {
+			const fromCurrency = invoiceTotalCurrency.value;
+			const toCurrency = companyCurrencyLocal.value;
+			const effectiveDate = postingDate.value || getTodayDate();
+			const purpose = exchangeRatePurpose.value;
+			if (!fromCurrency || !toCurrency) {
+				requestState.seq += 1;
+				requestState.key = "";
+				exchangeRateLoading.value = false;
 				return;
 			}
+			const requestKey = `${fromCurrency}|${toCurrency}|${purpose}|${effectiveDate}`;
+			if (exchangeRateLoading.value && requestState.key === requestKey) {
+				return;
+			}
+			const requestSeq = ++requestState.seq;
+			requestState.key = requestKey;
 			exchangeRateLoading.value = true;
 			exchangeRateError.value = null;
 			try {
 				const result = await resolveExchangeRate({
 					profileName: pos_profile.value?.name,
 					company: company.value,
-					fromCurrency: invoiceTotalCurrency.value,
-					toCurrency: companyCurrencyLocal.value,
-					effectiveDate: postingDate.value || getTodayDate(),
-					purpose: exchangeRatePurpose.value,
+					fromCurrency,
+					toCurrency,
+					effectiveDate,
+					purpose,
 				});
+				if (
+					requestSeq !== requestState.seq ||
+					fromCurrency !== invoiceTotalCurrency.value ||
+					toCurrency !== companyCurrencyLocal.value ||
+					purpose !== exchangeRatePurpose.value ||
+					effectiveDate !== (postingDate.value || getTodayDate())
+				) {
+					return;
+				}
 				if (!result.found || !result.rate) throw new Error(__("Exchange rate unavailable"));
 				exchangeRate.value = result.rate;
 			} catch (e) {
+				if (requestSeq !== requestState.seq) {
+					return;
+				}
 				exchangeRateError.value = e.message;
 				exchangeRate.value = null;
 			} finally {
-				exchangeRateLoading.value = false;
+				if (requestSeq === requestState.seq) {
+					requestState.key = "";
+					exchangeRateLoading.value = false;
+				}
 			}
 		};
 
@@ -1345,6 +1383,7 @@ export default {
 			autoAllocatePaymentAmount,
 			exchangeRate,
 			companyCurrency,
+			companyCurrencyLocal,
 			referenceNo,
 			referenceDate,
 			exchangeRateLoading,

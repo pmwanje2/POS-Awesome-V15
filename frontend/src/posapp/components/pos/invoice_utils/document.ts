@@ -144,6 +144,24 @@ function clearStalePartyFieldsForCustomerChange(
  * - context.formatDateForBackend (method)
  */
 
+function buildCurrencyContext(
+	context: any,
+	companyCurrency: string | null | undefined,
+) {
+	return {
+		company_currency: companyCurrency || context.company_currency || null,
+		company: context.company || context.company_doc,
+		pos_profile: context.pos_profile,
+		invoice_doc: context.invoice_doc,
+		currency: context.currency,
+		selected_currency: context.selected_currency,
+		price_list_currency: context.price_list_currency,
+		exchange_rate: context.exchange_rate,
+		conversion_rate: context.conversion_rate,
+		plc_conversion_rate: context.plc_conversion_rate,
+	};
+}
+
 export function get_invoice_doc(context: any) {
 	let doc: any = {};
 	const sourceDoc = context.invoice_doc || {};
@@ -474,13 +492,12 @@ export function get_invoice_doc(context: any) {
 	const companyCurrency =
 		context.company_currency ||
 		(context.company && context.company.default_currency) ||
+		(context.company_doc && context.company_doc.default_currency) ||
 		context.pos_profile?.company_currency ||
 		context.invoice_doc?.company_currency ||
 		context.pos_profile?.currency ||
 		null;
-	const currencyContext = companyCurrency
-		? { ...context, company_currency: companyCurrency }
-		: context;
+	const currencyContext = buildCurrencyContext(context, companyCurrency);
 	if (context.selected_currency !== companyCurrency) {
 		doc.base_total = toCompanyCurrency(currencyContext, total);
 		doc.base_net_total = toCompanyCurrency(currencyContext, total);
@@ -609,13 +626,12 @@ export function get_invoice_items(context: any) {
 		const companyCurrency =
 			context.company_currency ||
 			(context.company && context.company.default_currency) ||
+			(context.company_doc && context.company_doc.default_currency) ||
 			context.pos_profile?.company_currency ||
 			context.invoice_doc?.company_currency ||
 			item?.company_currency ||
 			context.pos_profile?.currency;
-		const itemCurrencyContext = companyCurrency
-			? { ...context, company_currency: companyCurrency }
-			: context;
+		const itemCurrencyContext = buildCurrencyContext(context, companyCurrency);
 		if (context.selected_currency !== companyCurrency) {
 			// item.rate is in SC and base_rate should be in CC.
 			new_item.rate = flt(item.rate); // Keep rate in USD

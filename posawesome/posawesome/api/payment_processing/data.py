@@ -207,8 +207,9 @@ def get_outstanding_invoices(
             # Examples:
             # - Party YER (company), Invoice USD: 60,003 YER ÷ 531 (YER/USD) = 113 USD
             # - Party USD (invoice), Invoice USD: 100 USD → 100 USD (no conversion)
-            party_account_currency = invoice.get("party_account_currency") or currency
+            party_account_currency = invoice.get("party_account_currency") or row_currency or currency
             company_currency = frappe.get_cached_value("Company", company, "default_currency")
+            conversion_unavailable = False
             if party_account_currency == row_currency:
                 outstanding_in_invoice_currency = outstanding_amount
             elif party_account_currency == company_currency:
@@ -220,20 +221,25 @@ def get_outstanding_invoices(
             else:
                 # Third currency: convert from party account currency to invoice currency
                 precision = frappe.get_precision("Sales Invoice", "outstanding_amount") or 2
-                party_to_inv = get_exchange_rate(
-                    party_account_currency,
-                    row_currency,
-                    invoice.get("posting_date"),
-                    "for_buying" if party_type == "Supplier" else "for_selling",
+                party_to_inv = flt(
+                    get_exchange_rate(
+                        party_account_currency,
+                        row_currency,
+                        invoice.get("posting_date"),
+                        "for_buying" if party_type == "Supplier" else "for_selling",
+                    )
                 )
-                if party_to_inv:
+                if party_to_inv > 0:
                     outstanding_in_invoice_currency = flt(outstanding_amount * party_to_inv, precision)
                 else:
-                    outstanding_in_invoice_currency = flt(outstanding_amount / conversion_rate, precision) if conversion_rate > 0 else outstanding_amount
+                    # Never divide by an unrelated invoice->company conversion_rate when the
+                    # required party->invoice quote is unavailable.
+                    outstanding_in_invoice_currency = None
+                    conversion_unavailable = True
             invoice_total = flt(
                 invoice.get("rounded_total")
                 or invoice.get("grand_total")
-                or outstanding_in_invoice_currency
+                or (outstanding_in_invoice_currency if outstanding_in_invoice_currency is not None else 0)
             )
 
             normalized_rows.append(
@@ -243,10 +249,13 @@ def get_outstanding_invoices(
                         "voucher_type": "Purchase Invoice" if party_type == "Supplier" else "Sales Invoice",
                         "outstanding_amount": outstanding_amount,
                         "outstanding_amount_in_invoice_currency": outstanding_in_invoice_currency,
+                        "outstanding_conversion_unavailable": conversion_unavailable,
                         "invoice_amount": invoice_total,
                         "due_date": invoice.get("due_date") or invoice.get("posting_date"),
                         "posting_date": invoice.get("posting_date"),
                         "currency": row_currency,
+                        "company_currency": company_currency,
+                        "party_account_currency": party_account_currency,
                         "pos_profile": invoice.get("pos_profile") if party_type == "Customer" else None,
                         "customer": customer,
                         "customer_name": (

@@ -170,6 +170,10 @@ def _create_gift_card_journal_entry(company, posting_date, remark, accounts):
 
     ensure_child_doctype(je_doc, "accounts", "Journal Entry Account")
     je_doc.flags.ignore_permissions = True
+    if je_doc.multi_currency:
+        # Preserve POS-validated selling rates (including exact 1.00 parity) so ERPNext
+        # JournalEntry.set_exchange_rate() does not replace them via an unqualified lookup.
+        je_doc.flags.ignore_exchange_rate = True
     frappe.flags.ignore_account_permission = True
     je_doc.user_remark = remark
     je_doc.set_missing_values()
