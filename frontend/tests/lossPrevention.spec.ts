@@ -1127,4 +1127,159 @@ describe("loss prevention", () => {
 		expect(risks[0]?.itemCode).toBe("ZERO-NET-RATE");
 		expect(risks[0]?.sellingRate).toBe(0);
 	});
+
+	it("returns null floor when _source_buying_currency preserves an unresolved foreign cost after switching currency", () => {
+		const { applyCurrencyConversionToItem } = useItemCurrency();
+
+		// Foreign -> foreign (EUR -> USD) without EUR FX: _source_buying_currency="EUR" must fail closed.
+		const eurToUsdItem: Record<string, any> = {
+			item_code: "EUR-TO-USD-NO-FX",
+			item_name: "EUR Unresolved Foreign Switch",
+			qty: 1,
+			rate: 12,
+			price_list_rate: 12,
+			currency: "EUR",
+			company_currency: "UGX",
+			trade_price: 10,
+		};
+		applyCurrencyConversionToItem(eurToUsdItem, {
+			pos_profile: { currency: "UGX" },
+			price_list_currency: "USD",
+			selected_currency: "USD",
+			exchange_rate: 1,
+			conversion_rate: 3700,
+			currency_precision: 2,
+			flt: (value: unknown) => Number(value),
+		});
+		expect(eurToUsdItem.currency).toBe("USD");
+		expect(eurToUsdItem._source_buying_currency).toBe("EUR");
+		expect(getItemCostFloor(eurToUsdItem)).toBeNull();
+
+		// Foreign -> company (EUR -> UGX) without EUR FX: must also fail closed rather than reading 10 as UGX 10.
+		const eurToCompanyItem: Record<string, any> = {
+			item_code: "EUR-TO-UGX-NO-FX",
+			item_name: "EUR Unresolved Company Switch",
+			qty: 1,
+			rate: 50000,
+			price_list_rate: 50000,
+			currency: "EUR",
+			company_currency: "UGX",
+			trade_price: 10,
+		};
+		applyCurrencyConversionToItem(eurToCompanyItem, {
+			pos_profile: { currency: "UGX" },
+			price_list_currency: "UGX",
+			selected_currency: "UGX",
+			exchange_rate: 1,
+			conversion_rate: 1,
+			currency_precision: 2,
+			flt: (value: unknown) => Number(value),
+		});
+		expect(eurToCompanyItem.currency).toBe("UGX");
+		expect(eurToCompanyItem._source_buying_currency).toBe("EUR");
+		expect(getItemCostFloor(eurToCompanyItem)).toBeNull();
+
+		// Preserved _source_buying_price/_source_buying_currency alone (without trade_price) must also fail closed.
+		expect(
+			getItemCostFloor({
+				item_code: "EUR-SOURCE-ONLY",
+				qty: 1,
+				rate: 12,
+				currency: "USD",
+				company_currency: "UGX",
+				conversion_rate: 3700,
+				_source_buying_price: 10,
+				_source_buying_currency: "EUR",
+				valuation_rate: 5000,
+			}),
+		).toBeNull();
+	});
+
+	it("honors legitimate zero net_amount and net_rate on multi-line USD Net Total discount while ignoring uncalculated draft zeros", () => {
+		const items = [
+			{
+				item_code: "SMALL-ZERO-LINE",
+				item_name: "Small Rounded Zero Line",
+				qty: 1,
+				rate: 0.01,
+				net_amount: 0,
+				net_rate: 0,
+				base_net_rate: 0,
+				currency: "USD",
+				company_currency: "UGX",
+				conversion_rate: 3700,
+				valuation_rate: 10,
+			},
+			{
+				item_code: "SMALL-NONZERO-LINE",
+				item_name: "Small Positive Line",
+				qty: 1,
+				rate: 0.04,
+				net_amount: 0.02,
+				net_rate: 0.02,
+				base_net_rate: 74,
+				currency: "USD",
+				company_currency: "UGX",
+				conversion_rate: 3700,
+				valuation_rate: 10,
+			},
+		];
+		const doc = {
+			apply_discount_on: "Net Total",
+			discount_amount: 0.03,
+			items,
+		};
+		const invoiceDiscountPercentage = resolveInvoiceDiscountPercentage(
+			doc,
+			items,
+		);
+		const risks = findLossRiskItems(items, {
+			invoiceDiscountPercentage,
+			applyDiscountOn: "Net Total",
+			currencyPrecision: 2,
+		});
+		expect(risks).toHaveLength(1);
+		expect(risks[0]?.itemCode).toBe("SMALL-ZERO-LINE");
+		expect(risks[0]?.sellingRate).toBe(0);
+
+		// Uncalculated draft rows with net_amount=0, net_rate=0 and no discount must NOT trigger false below-cost blocks.
+		const uncalculatedTinyDraft = [
+			{
+				item_code: "UNCALC-TINY",
+				qty: 1,
+				rate: 0.01,
+				net_amount: 0,
+				net_rate: 0,
+				currency: "USD",
+				company_currency: "UGX",
+				conversion_rate: 3700,
+				valuation_rate: 10,
+			},
+		];
+		expect(
+			findLossRiskItems(uncalculatedTinyDraft, {
+				invoiceDiscountPercentage: 0,
+				applyDiscountOn: "Net Total",
+				currencyPrecision: 2,
+			}),
+		).toEqual([]);
+
+		const uncalculatedLargeDraft = [
+			{
+				item_code: "UNCALC-LARGE",
+				qty: 1,
+				rate: 100,
+				net_amount: 0,
+				net_rate: 0,
+				trade_price: 50,
+			},
+		];
+		expect(
+			findLossRiskItems(uncalculatedLargeDraft, {
+				invoiceDiscountPercentage: 0,
+				applyDiscountOn: "Net Total",
+				currencyPrecision: 2,
+			}),
+		).toEqual([]);
+	});
 });

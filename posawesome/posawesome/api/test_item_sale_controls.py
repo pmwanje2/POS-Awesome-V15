@@ -3946,6 +3946,156 @@ class TestItemSaleControls(unittest.TestCase):
                 1,
             )
 
+    def test_cumulative_recursive_pricing_rule_includes_historical_returns_in_thresholds(self):
+        def _pricing_rule_utils_modules(historical_qty, historical_amt=0.0):
+            erpnext_pkg = types.ModuleType("erpnext")
+            erpnext_accounts = types.ModuleType("erpnext.accounts")
+            erpnext_doctype = types.ModuleType("erpnext.accounts.doctype")
+            erpnext_pr = types.ModuleType("erpnext.accounts.doctype.pricing_rule")
+            erpnext_pr_utils = types.ModuleType("erpnext.accounts.doctype.pricing_rule.utils")
+            erpnext_pr_utils.get_cumulative_qty_and_amount_for_row = (
+                lambda _pr_doc, _args, _doc=None: (historical_qty, historical_amt)
+            )
+            return {
+                "erpnext": erpnext_pkg,
+                "erpnext.accounts": erpnext_accounts,
+                "erpnext.accounts.doctype": erpnext_doctype,
+                "erpnext.accounts.doctype.pricing_rule": erpnext_pr,
+                "erpnext.accounts.doctype.pricing_rule.utils": erpnext_pr_utils,
+            }
+
+        with self.subTest("negative historical returns (-2) plus current qty 5 gives cumulative 3 <= max_qty 4 and awards 5 free units"):
+            self._install_promotional_rule(
+                apply_on="Item Code",
+                mixed_conditions=0,
+                is_cumulative=1,
+                is_recursive=1,
+                min_qty=1,
+                max_qty=4,
+                recurse_for=1,
+                free_qty=1,
+                round_free_qty=1,
+            )
+            line = self._promo_trigger_row()
+            line["qty"] = 5
+            free_five = self._promo_free_row(rate=0)
+            free_five["qty"] = 5
+            free_six = self._promo_free_row(rate=0)
+            free_six["qty"] = 6
+
+            with patch.dict(sys.modules, _pricing_rule_utils_modules(-2.0, -200.0)):
+                self.assertEqual(
+                    self.controls.collect_below_buying_price_errors(
+                        [line, free_five],
+                        invoice_doc={**self.PROMO_INVOICE, "doctype": "POS Invoice"},
+                    ),
+                    [],
+                )
+                self.assertEqual(
+                    len(
+                        self.controls.collect_below_buying_price_errors(
+                            [line, free_six],
+                            invoice_doc={**self.PROMO_INVOICE, "doctype": "POS Invoice"},
+                        )
+                    ),
+                    1,
+                )
+
+        with self.subTest("positive historical purchases (+2) plus current qty 3 exceeds max_qty 4 and rejects free row"):
+            self._install_promotional_rule(
+                apply_on="Item Code",
+                mixed_conditions=0,
+                is_cumulative=1,
+                is_recursive=1,
+                min_qty=1,
+                max_qty=4,
+                recurse_for=1,
+                free_qty=1,
+                round_free_qty=1,
+            )
+            line = self._promo_trigger_row()
+            line["qty"] = 3
+            free_three = self._promo_free_row(rate=0)
+            free_three["qty"] = 3
+
+            with patch.dict(sys.modules, _pricing_rule_utils_modules(2.0, 200.0)):
+                self.assertEqual(
+                    len(
+                        self.controls.collect_below_buying_price_errors(
+                            [line, free_three],
+                            invoice_doc={**self.PROMO_INVOICE, "doctype": "POS Invoice"},
+                        )
+                    ),
+                    1,
+                )
+
+        with self.subTest("negative historical returns (-2) plus current qty 2 falls below min_qty 1 and rejects free row"):
+            self._install_promotional_rule(
+                apply_on="Item Code",
+                mixed_conditions=0,
+                is_cumulative=1,
+                is_recursive=1,
+                min_qty=1,
+                max_qty=4,
+                recurse_for=1,
+                free_qty=1,
+                round_free_qty=1,
+            )
+            line = self._promo_trigger_row()
+            line["qty"] = 2
+            free_two = self._promo_free_row(rate=0)
+            free_two["qty"] = 2
+
+            with patch.dict(sys.modules, _pricing_rule_utils_modules(-2.0, -200.0)):
+                self.assertEqual(
+                    len(
+                        self.controls.collect_below_buying_price_errors(
+                            [line, free_two],
+                            invoice_doc={**self.PROMO_INVOICE, "doctype": "POS Invoice"},
+                        )
+                    ),
+                    1,
+                )
+
+        with self.subTest("cumulative min_amt/max_amt includes negative historical return amount (-200 + 500 = 300 in [100, 400])"):
+            self._install_promotional_rule(
+                apply_on="Item Code",
+                mixed_conditions=0,
+                is_cumulative=1,
+                is_recursive=1,
+                min_qty=0,
+                max_qty=0,
+                min_amt=100,
+                max_amt=400,
+                recurse_for=1,
+                free_qty=1,
+                round_free_qty=1,
+            )
+            line = self._promo_trigger_row(rate=100)
+            line["qty"] = 5
+            free_five = self._promo_free_row(rate=0)
+            free_five["qty"] = 5
+
+            with patch.dict(sys.modules, _pricing_rule_utils_modules(-2.0, -200.0)):
+                self.assertEqual(
+                    self.controls.collect_below_buying_price_errors(
+                        [line, free_five],
+                        invoice_doc={**self.PROMO_INVOICE, "doctype": "POS Invoice"},
+                    ),
+                    [],
+                )
+
+            with patch.dict(sys.modules, _pricing_rule_utils_modules(0.0, 0.0)):
+                self.assertEqual(
+                    len(
+                        self.controls.collect_below_buying_price_errors(
+                            [line, free_five],
+                            invoice_doc={**self.PROMO_INVOICE, "doctype": "POS Invoice"},
+                        )
+                    ),
+                    1,
+                )
+
 
 if __name__ == "__main__":
     unittest.main()
