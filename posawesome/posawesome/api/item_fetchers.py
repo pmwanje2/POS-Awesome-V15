@@ -637,15 +637,6 @@ def merge_item_row(
             raw_buying_rate * flt(buying_exchange_rate) / flt(exchange_rate)
         )
         buying_rate_currency = row_currency or buying_currency
-    elif not buying_currency or not row_currency or buying_currency == row_currency:
-        normalized_buying_rate = (
-            raw_buying_rate if flt(buying_exchange_rate) > 0 else None
-        )
-        buying_rate_currency = (
-            (row_currency or buying_currency)
-            if normalized_buying_rate is not None
-            else None
-        )
     else:
         normalized_buying_rate = None
         buying_rate_currency = None
@@ -779,29 +770,31 @@ class ItemDetailAggregator:
             or ("Standard Buying" if frappe.db.exists("Price List", "Standard Buying") else None)
         )
 
-    def _compute_exchange_rate(self) -> float:
+    def _compute_exchange_rate(self) -> Optional[float]:
         """Compute the price list to company currency exchange rate."""
 
         company = self.pos_profile.get("company")
-        allow_multi_currency = self.pos_profile.get("posa_allow_multi_currency") or 0
         company_currency = frappe.db.get_value("Company", company, "default_currency") if company else None
         price_list_currency = self.price_list_currency or self.pos_profile.get("currency")
 
+        # Always resolve foreign-to-company selling FX regardless of posa_allow_multi_currency
+        # so fixed foreign-currency POS Profiles never divide company costs by 1.
         if (
             company_currency
             and price_list_currency
             and price_list_currency != company_currency
-            and allow_multi_currency
         ):
             try:
-                return get_exchange_rate(
+                rate = get_exchange_rate(
                     price_list_currency, company_currency, self.today, "for_selling"
                 )
+                return rate if flt(rate) > 0 else None
             except Exception:
                 frappe.log_error(
                     f"Missing exchange rate from {price_list_currency} to {company_currency}",
                     "POS Awesome",
                 )
+                return None
         return 1
 
     def _prepare_lookup(self, item_codes: Iterable[str]) -> ItemLookupData:

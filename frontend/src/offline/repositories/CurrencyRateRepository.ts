@@ -8,6 +8,8 @@ export type OfflineCurrencyRateRecord = {
 	to_currency: string;
 	exchange_rate: number;
 	date: string;
+	for_buying?: number | boolean | null;
+	for_selling?: number | boolean | null;
 	modified?: string | null;
 	[key: string]: any;
 };
@@ -18,7 +20,99 @@ type CurrencyRateLookup = {
 	fromCurrency: string;
 	toCurrency: string;
 	date: string;
+	purpose?: "for_buying" | "for_selling" | string | null;
 };
+
+function isFlagEnabled(value: unknown): boolean {
+	return value === 1 || value === true || value === "1";
+}
+
+function hasExplicitPurposeFlags(row: Record<string, any>): boolean {
+	return (
+		(row?.for_buying !== undefined && row?.for_buying !== null) ||
+		(row?.for_selling !== undefined && row?.for_selling !== null)
+	);
+}
+
+/**
+ * Select the authoritative Currency Exchange row matching ERPNext setup/utils.py:66-98:
+ * - Date on or before `targetDate`
+ * - Purpose filter (`for_buying` / `for_selling`), staying backwards-compatible with legacy
+ *   cached rows that omit both purpose flags
+ * - Order: `date desc`, purpose-specific before dual-purpose (`for_selling asc` for buying,
+ *   `for_buying asc` for selling), `name desc`, falling back to `modified desc` only if tied.
+ */
+export function selectCurrencyRateRecord<T extends Record<string, any>>(
+	rows: T[],
+	targetDate?: string | null,
+	purpose?: string | null,
+): T | null {
+	const cutoff = String(targetDate || "").slice(0, 10);
+	const normalizedPurpose =
+		purpose === "for_buying" || purpose === "for_selling" ? purpose : null;
+	const eligible = (rows || []).filter((row) => {
+		if (!row) {
+			return false;
+		}
+		const rowDate = String(row.date || "").slice(0, 10);
+		if (cutoff && rowDate && rowDate > cutoff) {
+			return false;
+		}
+		if (normalizedPurpose && hasExplicitPurposeFlags(row)) {
+			return isFlagEnabled(row[normalizedPurpose]);
+		}
+		return true;
+	});
+
+	eligible.sort((left, right) => {
+		const dateOrder = String(right?.date || "")
+			.slice(0, 10)
+			.localeCompare(String(left?.date || "").slice(0, 10));
+		if (dateOrder) {
+			return dateOrder;
+		}
+		if (normalizedPurpose === "for_buying") {
+			const leftSelling = hasExplicitPurposeFlags(left)
+				? isFlagEnabled(left.for_selling)
+					? 1
+					: 0
+				: 1;
+			const rightSelling = hasExplicitPurposeFlags(right)
+				? isFlagEnabled(right.for_selling)
+					? 1
+					: 0
+				: 1;
+			if (leftSelling !== rightSelling) {
+				return leftSelling - rightSelling;
+			}
+		} else if (normalizedPurpose === "for_selling") {
+			const leftBuying = hasExplicitPurposeFlags(left)
+				? isFlagEnabled(left.for_buying)
+					? 1
+					: 0
+				: 1;
+			const rightBuying = hasExplicitPurposeFlags(right)
+				? isFlagEnabled(right.for_buying)
+					? 1
+					: 0
+				: 1;
+			if (leftBuying !== rightBuying) {
+				return leftBuying - rightBuying;
+			}
+		}
+		const nameOrder = String(right?.name || "").localeCompare(
+			String(left?.name || ""),
+		);
+		if (nameOrder) {
+			return nameOrder;
+		}
+		return String(right?.modified || "").localeCompare(
+			String(left?.modified || ""),
+		);
+	});
+
+	return eligible[0] || null;
+}
 
 class CurrencyRateRepository {
 	async clear() {
@@ -75,20 +169,7 @@ class CurrencyRateRepository {
 		lookup: CurrencyRateLookup,
 	): Promise<OfflineCurrencyRateRecord | null> {
 		const rows = await this.findForPair(lookup);
-		const eligible = rows
-			.filter((row) => !lookup.date || row.date <= lookup.date)
-			.sort((left, right) => {
-				const dateOrder = String(right.date || "").localeCompare(
-					String(left.date || ""),
-				);
-				if (dateOrder) {
-					return dateOrder;
-				}
-				return String(right.modified || "").localeCompare(
-					String(left.modified || ""),
-				);
-			});
-		return eligible[0] || null;
+		return selectCurrencyRateRecord(rows, lookup.date, lookup.purpose);
 	}
 }
 

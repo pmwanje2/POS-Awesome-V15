@@ -135,6 +135,7 @@ const resolveUncached = async (
 				fromCurrency: args.fromCurrency,
 				toCurrency: args.toCurrency,
 				date: args.effectiveDate,
+				...(args.purpose ? { purpose: args.purpose } : {}),
 			});
 			const cachedRate = positiveFinite(cachedRecord?.exchange_rate);
 			if (cachedRate) {

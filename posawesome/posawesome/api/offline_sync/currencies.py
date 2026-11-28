@@ -165,6 +165,8 @@ def _get_exchange_rows(resolved_pairs):
                 "to_currency",
                 "exchange_rate",
                 "date",
+                "for_buying",
+                "for_selling",
                 "modified",
             ],
             order_by="date asc, modified asc, name asc",
@@ -258,6 +260,7 @@ def sync_currency_scope(
         exchange_rate, rate_date = get_latest_rate(
             from_currency,
             to_currency,
+            purpose="for_selling",
             silent=True,
         )
         changes.append(

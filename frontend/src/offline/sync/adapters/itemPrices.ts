@@ -80,10 +80,20 @@ export async function syncItemPricesResource(
 			scopeApplied = true;
 		}
 		if (response?.scope?.buying_price_list) {
-			await setProfileBuyingPriceList(
-				args.posProfile,
-				String(response.scope.buying_price_list),
-			);
+			const buyingNotUomDependent =
+				response.scope.buying_price_not_uom_dependent;
+			if (buyingNotUomDependent !== undefined) {
+				await setProfileBuyingPriceList(
+					args.posProfile,
+					String(response.scope.buying_price_list),
+					buyingNotUomDependent,
+				);
+			} else {
+				await setProfileBuyingPriceList(
+					args.posProfile,
+					String(response.scope.buying_price_list),
+				);
+			}
 		}
 
 		if (response?.full_resync_required) {

@@ -102,12 +102,71 @@ export function toFiniteNumber(value: unknown): number | null {
 	return Number.isFinite(parsed) ? parsed : null;
 }
 
+/**
+ * Mirror Frappe `frappe/utils/data.py:1242-1338` and `number_format.js:208-265`.
+ * Defaults to Frappe's `"Banker's Rounding (legacy)"` (half-to-even at precision 0,
+ * decimal-stabilized half-up at precision > 0) and honors `frappe.boot.sysdefaults.rounding_method`
+ * when configured to `"Banker's Rounding"` or `"Commercial Rounding"`.
+ */
 function roundToPrecision(value: number, precision: number): number {
 	if (!Number.isFinite(value)) {
 		return value;
 	}
-	const factor = 10 ** precision;
-	return Math.round((value + Math.sign(value) * 1e-12) * factor) / factor;
+	if (value === 0) {
+		return 0;
+	}
+	const d = Math.max(0, Math.trunc(precision));
+	const isNegative = value < 0;
+	const absValue = Math.abs(value);
+	const multiplier = 10 ** d;
+	const roundingMethod =
+		(globalThis as any)?.frappe?.boot?.sysdefaults?.rounding_method ||
+		"Banker's Rounding (legacy)";
+
+	if (roundingMethod === "Banker's Rounding") {
+		const scaled = Number((d ? absValue * multiplier : absValue).toFixed(12));
+		if (scaled === 0) {
+			return 0;
+		}
+		const floorNum = Math.floor(scaled);
+		const decimalPart = scaled - floorNum;
+		const epsilon = 2 ** (Math.log2(Math.abs(scaled)) - 52);
+		const isTie =
+			epsilon < 0.5
+				? Math.abs(decimalPart - 0.5) < epsilon
+				: decimalPart === 0.5;
+		const roundedInt = isTie
+			? floorNum % 2 === 0
+				? floorNum
+				: floorNum + 1
+			: Math.round(scaled);
+		const result = d ? roundedInt / multiplier : roundedInt;
+		return isNegative ? -result : result;
+	}
+
+	if (roundingMethod === "Commercial Rounding") {
+		const scaled = d ? absValue * multiplier : absValue;
+		let epsilon = 2 ** (Math.log2(Math.abs(scaled)) - 52);
+		if (epsilon >= 0.25) {
+			epsilon = 0;
+		}
+		const roundedInt = Math.round(scaled + epsilon);
+		const result = d ? roundedInt / multiplier : roundedInt;
+		return isNegative ? -result : result;
+	}
+
+	// Default: Frappe "Banker's Rounding (legacy)"
+	const scaled = Number((d ? absValue * multiplier : absValue).toFixed(8));
+	const floorNum = Math.floor(scaled);
+	const decimalPart = scaled - floorNum;
+	const roundedInt =
+		d === 0 && decimalPart === 0.5
+			? floorNum % 2 === 0
+				? floorNum
+				: floorNum + 1
+			: Math.round(scaled);
+	const result = d ? roundedInt / multiplier : roundedInt;
+	return isNegative ? -result : result;
 }
 
 function resolveInvoiceToCompanyRate(
@@ -510,6 +569,13 @@ export function getItemCostFloor(
 				buyingPriceCurrency &&
 				selectedTableCurrency === buyingPriceCurrency &&
 				rawBuyingExchangeRate !== null &&
+				rawBuyingExchangeRate <= 0
+			) {
+				hasUnresolvedCrossCurrencyCost = true;
+			} else if (
+				buyingPriceCurrency &&
+				selectedTableCurrency === buyingPriceCurrency &&
+				rawBuyingExchangeRate !== null &&
 				rawBuyingExchangeRate > 0
 			) {
 				selectedTableRate =
@@ -590,11 +656,34 @@ export function getItemCostFloor(
 			}
 			const scalarCurrency =
 				buyingRateCurrency || sourceBuyingCurrency || buyingPriceCurrency;
+			const isForeignBuyingScalar = Boolean(
+				scalarCurrency &&
+					companyCurrency &&
+					scalarCurrency !== companyCurrency &&
+					buyingPriceCurrency &&
+					scalarCurrency === buyingPriceCurrency,
+			);
 			const currencyMismatch = Boolean(
 				scalarCurrency &&
 					effectiveInvoiceCurrency &&
 					scalarCurrency !== effectiveInvoiceCurrency,
 			);
+			// Mirror ERPNext setup/utils.py:77 & backend _resolve_floor_rates: even when
+			// sourceCurrency === invoiceCurrency !== companyCurrency, a raw buying scalar with
+			// buying_exchange_rate converts via for_buying FX (and fails closed if <= 0).
+			if (isForeignBuyingScalar && rawBuyingExchangeRate !== null) {
+				if (rawBuyingExchangeRate <= 0 || invoiceToCompanyRate === null) {
+					hasUnresolvedCrossCurrencyCost = true;
+				} else {
+					resolvedCandidates.push({
+						field: candidate.field,
+						label: candidate.label,
+						rate: rawRate * rawBuyingExchangeRate,
+						baseCurrency: true,
+					});
+				}
+				continue;
+			}
 			if (currencyMismatch) {
 				if (invoiceToCompanyRate === null) {
 					hasUnresolvedCrossCurrencyCost = true;
@@ -647,12 +736,30 @@ export function getItemCostFloor(
 			(!buyingRateCurrency || buyingRateCurrency === sourceBuyingCurrency)
 		) {
 			const sourceCurrency = sourceBuyingCurrency || buyingPriceCurrency;
+			const isForeignSource = Boolean(
+				sourceCurrency &&
+					companyCurrency &&
+					sourceCurrency !== companyCurrency &&
+					buyingPriceCurrency &&
+					sourceCurrency === buyingPriceCurrency,
+			);
 			const sourceMismatch = Boolean(
 				sourceCurrency &&
 					effectiveInvoiceCurrency &&
 					sourceCurrency !== effectiveInvoiceCurrency,
 			);
-			if (sourceMismatch) {
+			if (isForeignSource && rawBuyingExchangeRate !== null) {
+				if (rawBuyingExchangeRate <= 0 || invoiceToCompanyRate === null) {
+					hasUnresolvedCrossCurrencyCost = true;
+				} else {
+					resolvedCandidates.push({
+						field: "_source_buying_price",
+						label: "Trade Price",
+						rate: rawSourceBuyingPrice * rawBuyingExchangeRate,
+						baseCurrency: true,
+					});
+				}
+			} else if (sourceMismatch) {
 				if (invoiceToCompanyRate === null) {
 					hasUnresolvedCrossCurrencyCost = true;
 				} else if (
@@ -861,6 +968,10 @@ function areNativeNetAmountsReconciled(
 	let expectedSum = 0;
 	let preDiscountSum = 0;
 	let hasZeroAboveHalfUlp = false;
+	const taxGroupTotals = new Map<
+		string,
+		{ nativeSum: number; preSum: number }
+	>();
 
 	for (const item of items) {
 		if (!item || item.is_return || item.posa_is_replace) {
@@ -873,6 +984,7 @@ function areNativeNetAmountsReconciled(
 		eligibleCount += 1;
 		const grossRate = getEffectiveSellingRate(item);
 		const { inclA, inclB } = computeRowTaxParams(item, options.taxes);
+		const hasInclusiveTax = inclA > 0 || inclB > 0;
 		const preDiscountNet = Math.max((grossRate - inclB) / (1 + inclA), 0);
 		const preAmount = preDiscountNet * qty;
 		const computedAmount =
@@ -892,13 +1004,12 @@ function areNativeNetAmountsReconciled(
 		) {
 			hasZeroAboveHalfUlp = true;
 		}
-		// ERPNext taxes_and_totals.py:438-462 rounds inclusive-tax net_amount to
-		// currency precision (e.g. flt(0.01 / 1.18, 2) == 0.01), which may exceed
-		// unrounded preAmount while staying <= gross line amount.
-		const maxPreAmount = Math.min(
-			grossRate * qty,
-			Math.max(preAmount, roundToPrecision(preAmount, precision)),
-		);
+		// ERPNext taxes_and_totals.py:438-462 carries inclusive-tax rounding across rows
+		// within the same tax group, permitting up to +1 ULP on an individual inclusive row
+		// (strictly capped at gross line amount) while keeping the tax-group total within 0.5 ULP.
+		const maxPreAmount = hasInclusiveTax
+			? Math.min(grossRate * qty, preAmount + ulp)
+			: preAmount;
 		if (
 			nativeAmount > maxPreAmount + 1e-9 ||
 			nativeAmount > computedAmount + ulp + 1e-9
@@ -908,6 +1019,18 @@ function areNativeNetAmountsReconciled(
 		nativeSum += nativeAmount;
 		expectedSum += computedAmount;
 		preDiscountSum += preAmount;
+		const itemTaxKey = Object.entries(parseItemTaxRateMap(item))
+			.sort(([left], [right]) => left.localeCompare(right))
+			.map(([k, v]) => `${k}=${v}`)
+			.join("|");
+		const groupKey = `${Math.round(inclA * 1e9)}:${Math.round(inclB * 1e9)}:${itemTaxKey}`;
+		const existingGroup = taxGroupTotals.get(groupKey) || {
+			nativeSum: 0,
+			preSum: 0,
+		};
+		existingGroup.nativeSum += nativeAmount;
+		existingGroup.preSum += preAmount;
+		taxGroupTotals.set(groupKey, existingGroup);
 	}
 
 	if (eligibleCount === 0) {
@@ -916,19 +1039,27 @@ function areNativeNetAmountsReconciled(
 	const hasUnappliedDiscount =
 		expectedSum < preDiscountSum - 0.5 * ulp - 1e-9 &&
 		nativeSum >= preDiscountSum - 1e-9;
+	if (hasUnappliedDiscount) {
+		return false;
+	}
 	if (hasZeroAboveHalfUlp) {
 		return (
-			!hasUnappliedDiscount &&
 			expectedSum < preDiscountSum - 1e-9 &&
 			Math.abs(nativeSum - expectedSum) <= 0.5 * ulp + 1e-9
 		);
 	}
-	// ERPNext taxes_and_totals.py:1105-1116 applies a running rounding adjustment so
-	// sum(item.net_amount) stays within 0.5 ULP of the unrounded discounted net total.
-	return (
-		!hasUnappliedDiscount &&
-		Math.abs(nativeSum - expectedSum) <= 0.5 * ulp + 1e-9
-	);
+	// When undiscounted, ERPNext carries rounding strictly within each tax group
+	// (taxes_and_totals.py:446-455). When discounted, taxes_and_totals.py:1105-1116
+	// carries rounding across the whole invoice so sum(item.net_amount) stays within 0.5 ULP.
+	if (Math.abs(expectedSum - preDiscountSum) <= 1e-9) {
+		for (const group of taxGroupTotals.values()) {
+			if (Math.abs(group.nativeSum - group.preSum) > 0.5 * ulp + 1e-9) {
+				return false;
+			}
+		}
+		return true;
+	}
+	return Math.abs(nativeSum - expectedSum) <= 0.5 * ulp + 1e-9;
 }
 
 export function getItemLossRisk(

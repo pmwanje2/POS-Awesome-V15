@@ -81,6 +81,33 @@ def _deleted_item_prices(watermark):
     ]
 
 
+def _price_list_not_uom_dependent_map(price_lists):
+    """Map each synced Price List name to its ``price_not_uom_dependent`` flag."""
+
+    if not price_lists:
+        return {}
+    rows = (
+        frappe.get_all(
+            "Price List",
+            filters={"name": ("in", list(price_lists))},
+            fields=["name", "price_not_uom_dependent"],
+        )
+        or []
+    )
+    flag_map = {
+        row.get("name"): row.get("price_not_uom_dependent") in (1, True, "1")
+        for row in rows
+        if row.get("name")
+    }
+    db = getattr(frappe, "db", None)
+    if db and callable(getattr(db, "get_value", None)):
+        for price_list in price_lists:
+            if price_list not in flag_map:
+                val = db.get_value("Price List", price_list, "price_not_uom_dependent")
+                flag_map[price_list] = val in (1, True, "1")
+    return flag_map
+
+
 @frappe.whitelist()
 def sync_item_prices(
     pos_profile=None,
@@ -102,9 +129,11 @@ def sync_item_prices(
         response["scope"] = {
             "price_lists": [],
             "buying_price_list": buying_price_list,
+            "buying_price_not_uom_dependent": 0,
         }
         return response
 
+    not_uom_dependent_map = _price_list_not_uom_dependent_map(price_lists)
     resolved_offset = _coerce_offset(offset)
     resolved_limit = _coerce_limit(limit, 500)
     filters = {"price_list": ("in", price_lists)}
@@ -130,7 +159,12 @@ def sync_item_prices(
         {
             "key": f"item_price::{row.get('name')}",
             "modified": row.get("modified"),
-            "data": dict(row),
+            "data": {
+                **dict(row),
+                "price_not_uom_dependent": (
+                    1 if not_uom_dependent_map.get(row.get("price_list")) else 0
+                ),
+            },
         }
         for row in page_rows
         if row.get("name")
@@ -154,5 +188,8 @@ def sync_item_prices(
     response["scope"] = {
         "price_lists": price_lists,
         "buying_price_list": buying_price_list,
+        "buying_price_not_uom_dependent": (
+            1 if not_uom_dependent_map.get(buying_price_list) else 0
+        ),
     }
     return response

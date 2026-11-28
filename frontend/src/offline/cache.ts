@@ -62,6 +62,7 @@ import { memory, persist, db, checkDbHealth } from "./db";
 import { emitBootstrapSnapshotUpdated } from "../posapp/utils/bootstrapRuntimeEvents";
 import { finishStartupPhase, startStartupPhase } from "../utils/startupTrace";
 import { itemPriceRepository } from "./repositories";
+import { selectCurrencyRateRecord } from "./repositories/CurrencyRateRepository";
 
 const normalizeScope = (scope: unknown): string => String(scope || "");
 const hasScope = (scope: unknown): boolean => normalizeScope(scope).length > 0;
@@ -1263,6 +1264,10 @@ export function saveItemDetailsCache(profileName, priceList, items) {
 	}
 }
 
+function isTruthyFlag(value: unknown): boolean {
+	return value === 1 || value === true || value === "1";
+}
+
 async function attachOfflineBuyingFloors(profileName: string, items: any[]) {
 	if (!profileName || !items.length) return items;
 	const profile = await db.table("pos_profiles").get(profileName);
@@ -1290,15 +1295,23 @@ async function attachOfflineBuyingFloors(profileName: string, items: any[]) {
 		.toArray();
 	if (!priceRows.length) return items;
 
-	const companyCurrency = String(
-		profile?.company_currency || profile?.currency || "",
-	);
+	const profileCompanyCurrency = String(profile?.company_currency || "").trim();
+	const profileFallbackCurrency = String(profile?.currency || "").trim();
+	const profileNotUomDependent =
+		profile?.buying_price_not_uom_dependent !== undefined &&
+		profile?.buying_price_not_uom_dependent !== null
+			? isTruthyFlag(profile.buying_price_not_uom_dependent)
+			: null;
 	const currencyRates = new Map<string, number>();
-	const toCompanyRate = async (currency: string) => {
+	const toCompanyRate = async (
+		currency: string,
+		companyCurrency: string,
+	) => {
 		if (!currency || !companyCurrency || currency === companyCurrency)
 			return 1;
-		if (currencyRates.has(currency))
-			return currencyRates.get(currency) || 0;
+		const cacheKey = `${currency}::${companyCurrency}`;
+		if (currencyRates.has(cacheKey))
+			return currencyRates.get(cacheKey) || 0;
 		const rows = await db
 			.table("currency_rate_records")
 			.where("[profile_name+company+from_currency+to_currency]")
@@ -1309,18 +1322,12 @@ async function attachOfflineBuyingFloors(profileName: string, items: any[]) {
 				companyCurrency,
 			])
 			.toArray();
-		const selected = rows
-			.filter(
-				(row) => !row?.date || String(row.date).slice(0, 10) <= today,
-			)
-			.sort((left, right) =>
-				String(right?.date || right?.modified || "").localeCompare(
-					String(left?.date || left?.modified || ""),
-				),
-			)[0];
+		// Mirror ERPNext setup/utils.py:66-98: buying floors must resolve via for_buying FX
+		// (never overwritten by newer selling-only rates) and tie-break by name desc.
+		const selected = selectCurrencyRateRecord(rows, today, "for_buying");
 		const rate = Number(selected?.exchange_rate || 0);
-		currencyRates.set(currency, Number.isFinite(rate) ? rate : 0);
-		return currencyRates.get(currency) || 0;
+		currencyRates.set(cacheKey, Number.isFinite(rate) ? rate : 0);
+		return currencyRates.get(cacheKey) || 0;
 	};
 
 	const rowsByItem = new Map<string, any[]>();
@@ -1338,6 +1345,23 @@ async function attachOfflineBuyingFloors(profileName: string, items: any[]) {
 				String(left?.valid_from || left?.modified || ""),
 			),
 		);
+		const companyCurrency =
+			profileCompanyCurrency ||
+			String(item?.company_currency || "").trim() ||
+			profileFallbackCurrency;
+		const existingBuyingMap =
+			item?._buying_prices_by_uom &&
+			typeof item._buying_prices_by_uom === "object"
+				? item._buying_prices_by_uom
+				: null;
+		const existingAnyNotUomDependent = existingBuyingMap
+			? Object.values(existingBuyingMap).some(
+					(entry: any) =>
+						(!entry?.price_list ||
+							entry.price_list === buyingPriceList) &&
+						isTruthyFlag(entry?.price_not_uom_dependent),
+				)
+			: false;
 		const pricesByUom: Record<string, any> = {};
 		for (const row of buyingRows) {
 			const uom = String(row?.uom || "");
@@ -1345,14 +1369,35 @@ async function attachOfflineBuyingFloors(profileName: string, items: any[]) {
 			const rate = Number(row?.price_list_rate || 0);
 			const exchangeRate = await toCompanyRate(
 				String(row?.currency || ""),
+				companyCurrency,
 			);
 			if (!Number.isFinite(rate) || rate <= 0 || exchangeRate <= 0)
 				continue;
+			let priceNotUomDependent = false;
+			if (
+				row?.price_not_uom_dependent !== undefined &&
+				row?.price_not_uom_dependent !== null
+			) {
+				priceNotUomDependent = isTruthyFlag(row.price_not_uom_dependent);
+			} else if (profileNotUomDependent !== null) {
+				priceNotUomDependent = profileNotUomDependent;
+			} else if (
+				existingBuyingMap?.[uom]?.price_not_uom_dependent !==
+					undefined &&
+				existingBuyingMap?.[uom]?.price_not_uom_dependent !== null
+			) {
+				priceNotUomDependent = isTruthyFlag(
+					existingBuyingMap[uom].price_not_uom_dependent,
+				);
+			} else {
+				priceNotUomDependent = existingAnyNotUomDependent;
+			}
 			pricesByUom[uom] = {
 				price_list_rate: rate,
 				base_price_list_rate: rate * exchangeRate,
 				currency: row?.currency || companyCurrency,
 				price_list: buyingPriceList,
+				price_not_uom_dependent: priceNotUomDependent ? 1 : 0,
 			};
 		}
 		if (Object.keys(pricesByUom).length) {
@@ -1366,6 +1411,7 @@ async function attachOfflineBuyingFloors(profileName: string, items: any[]) {
 export async function setProfileBuyingPriceList(
 	profile: any,
 	buyingPriceList: string | null | undefined,
+	priceNotUomDependent?: number | boolean | null,
 ) {
 	if (!profile?.name || !buyingPriceList) return;
 	await checkDbHealth();
@@ -1375,6 +1421,9 @@ export async function setProfileBuyingPriceList(
 	await db.table("pos_profiles").put({
 		...current,
 		buying_price_list: buyingPriceList,
+		...(priceNotUomDependent !== undefined && priceNotUomDependent !== null
+			? { buying_price_not_uom_dependent: isTruthyFlag(priceNotUomDependent) ? 1 : 0 }
+			: {}),
 	});
 }
 

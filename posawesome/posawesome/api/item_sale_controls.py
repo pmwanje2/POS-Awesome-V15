@@ -1562,6 +1562,7 @@ def collect_below_buying_price_errors(
         expected_sum = 0.0
         pre_discount_sum = 0.0
         invoice_ulp = 1e-9
+        tax_group_totals = {}
         all_rows_reconciled = True
         for idx in eligible_indexes:
             el_row = item_rows[idx]
@@ -1576,17 +1577,21 @@ def collect_below_buying_price_errors(
                     break
             el_pre_amount = pre_discount_nets.get(idx, 0.0) * el_qty
             el_computed_amount = computed_net_rates.get(idx, 0.0) * el_qty
+            el_incl_a, el_incl_b, _el_all_a, _el_all_b = row_tax_params.get(
+                idx, (0.0, 0.0, 0.0, 0.0)
+            )
+            has_inclusive_tax = el_incl_a > 0 or el_incl_b > 0
             el_prec = _resolve_currency_precision(el_row, invoice_doc, "net_amount")
             if el_prec is None:
                 el_prec = _resolve_currency_precision(el_row, invoice_doc, "net_rate")
             row_ulp = (10.0 ** (-el_prec)) if el_prec is not None else 1e-9
             invoice_ulp = max(invoice_ulp, row_ulp)
-            # ERPNext taxes_and_totals.py:438-462 rounds inclusive-tax net_amount to
-            # currency precision (e.g. flt(0.01 / 1.18, 2) == 0.01), which may exceed
-            # unrounded pre_amount while staying <= gross line amount.
+            # ERPNext taxes_and_totals.py:438-462 carries inclusive-tax rounding across rows
+            # within the same tax group, permitting up to +1 ULP on an individual inclusive row
+            # (strictly capped at gross line amount) while keeping the tax-group total within 0.5 ULP.
             el_max_pre_amount = (
-                min(el_gross * el_qty, max(el_pre_amount, flt(el_pre_amount, el_prec)))
-                if el_prec is not None
+                min(el_gross * el_qty, el_pre_amount + row_ulp)
+                if has_inclusive_tax and el_prec is not None
                 else el_pre_amount
             )
             if (
@@ -1598,18 +1603,33 @@ def collect_below_buying_price_errors(
             native_sum += el_native_amount
             expected_sum += el_computed_amount
             pre_discount_sum += el_pre_amount
+            item_tax_key = tuple(
+                sorted((str(k), str(v)) for k, v in _parse_item_tax_rate(el_row).items())
+            )
+            group_key = (round(el_incl_a, 9), round(el_incl_b, 9), item_tax_key)
+            group_entry = tax_group_totals.setdefault(
+                group_key, {"native": 0.0, "pre": 0.0, "ulp": 1e-9}
+            )
+            group_entry["native"] += el_native_amount
+            group_entry["pre"] += el_pre_amount
+            group_entry["ulp"] = max(group_entry["ulp"], row_ulp)
         has_unapplied_discount = (
             expected_sum < pre_discount_sum - 0.5 * invoice_ulp - 1e-9
             and native_sum >= pre_discount_sum - 1e-9
         )
-        # ERPNext taxes_and_totals.py:1105-1116 applies a running rounding adjustment so
-        # sum(item.net_amount) stays within 0.5 ULP of the unrounded discounted net total.
-        if (
-            all_rows_reconciled
-            and not has_unapplied_discount
-            and abs(native_sum - expected_sum) <= 0.5 * invoice_ulp + 1e-9
-        ):
-            reconciled_native_nets = True
+        # When undiscounted, ERPNext carries rounding strictly within each tax group
+        # (taxes_and_totals.py:446-455). When discounted, taxes_and_totals.py:1105-1116
+        # carries rounding across the whole invoice so sum(item.net_amount) stays within 0.5 ULP.
+        if all_rows_reconciled and not has_unapplied_discount:
+            if abs(expected_sum - pre_discount_sum) <= 1e-9:
+                reconciled_native_nets = all(
+                    abs(group["native"] - group["pre"]) <= 0.5 * group["ulp"] + 1e-9
+                    for group in tax_group_totals.values()
+                )
+            else:
+                reconciled_native_nets = (
+                    abs(native_sum - expected_sum) <= 0.5 * invoice_ulp + 1e-9
+                )
 
     for index, row in enumerate(item_rows):
         item_code = row.get("item_code") if hasattr(row, "get") else None
