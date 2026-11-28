@@ -2232,6 +2232,615 @@ class TestItemSaleControls(unittest.TestCase):
             )
             self.assertEqual(errors, [])
 
+    def test_chained_inclusive_quantity_tax_zero_net_revenue_is_rejected(self):
+        self._install_bin_valuation(valuation_rate=0.50, company_currency="USD")
+
+        with self.subTest("On Item Quantity 10 + 10% On Previous Row Amount at gross 11 yields 0 net"):
+            errors = self.controls.collect_below_buying_price_errors(
+                [
+                    PrecisionDoc(
+                        item_code="LOW",
+                        item_name="Excise Chained Tax Item",
+                        qty=1,
+                        rate=11.0,
+                        amount=11.0,
+                        uom="Nos",
+                        warehouse="Shop Floor - JBS",
+                        precision_value=2,
+                    )
+                ],
+                invoice_doc=PrecisionDoc(
+                    company="Test Co",
+                    currency="USD",
+                    conversion_rate=1,
+                    taxes=[
+                        {
+                            "charge_type": "On Item Quantity",
+                            "account_head": "Excise - CO",
+                            "rate": 10.0,
+                            "included_in_print_rate": 1,
+                        },
+                        {
+                            "charge_type": "On Previous Row Amount",
+                            "account_head": "VAT on Excise - CO",
+                            "row_id": "1",
+                            "rate": 10.0,
+                            "included_in_print_rate": 1,
+                        },
+                    ],
+                    precision_value=2,
+                ),
+            )
+            self.assertEqual(len(errors), 1)
+            self.assertEqual(errors[0]["reason"], "below_buying_price")
+            self.assertAlmostEqual(errors[0]["selling_rate"], 0.0, places=2)
+            self.assertAlmostEqual(errors[0]["base_selling_rate"], 0.0, places=2)
+
+        with self.subTest("On Item Quantity 10 + 10% On Previous Row Total at gross 11 yields 0 net"):
+            errors = self.controls.collect_below_buying_price_errors(
+                [
+                    PrecisionDoc(
+                        item_code="LOW",
+                        item_name="Excise Total Tax Item",
+                        qty=1,
+                        rate=11.0,
+                        amount=11.0,
+                        uom="Nos",
+                        warehouse="Shop Floor - JBS",
+                        precision_value=2,
+                    )
+                ],
+                invoice_doc=PrecisionDoc(
+                    company="Test Co",
+                    currency="USD",
+                    conversion_rate=1,
+                    taxes=[
+                        {
+                            "charge_type": "On Item Quantity",
+                            "account_head": "Excise - CO",
+                            "rate": 10.0,
+                            "included_in_print_rate": 1,
+                        },
+                        {
+                            "charge_type": "On Previous Row Total",
+                            "account_head": "VAT on Total - CO",
+                            "row_id": "1",
+                            "rate": 10.0,
+                            "included_in_print_rate": 1,
+                        },
+                    ],
+                    precision_value=2,
+                ),
+            )
+            self.assertEqual(len(errors), 1)
+            self.assertEqual(errors[0]["reason"], "below_buying_price")
+            self.assertAlmostEqual(errors[0]["selling_rate"], 0.0, places=2)
+
+        with self.subTest("freshly calculated zero base_net_rate is never discarded when gross > 0"):
+            errors = self.controls.collect_below_buying_price_errors(
+                [
+                    PrecisionDoc(
+                        item_code="LOW",
+                        item_name="Zero Base Net Rate Item",
+                        qty=1,
+                        rate=11.0,
+                        amount=11.0,
+                        net_rate=0.0,
+                        base_net_rate=0.0,
+                        uom="Nos",
+                        warehouse="Shop Floor - JBS",
+                        precision_value=2,
+                    )
+                ],
+                invoice_doc=PrecisionDoc(
+                    company="Test Co",
+                    currency="USD",
+                    conversion_rate=1,
+                    precision_value=2,
+                ),
+            )
+            self.assertEqual(len(errors), 1)
+            self.assertEqual(errors[0]["reason"], "below_buying_price")
+            self.assertAlmostEqual(errors[0]["selling_rate"], 0.0, places=2)
+            self.assertAlmostEqual(errors[0]["base_selling_rate"], 0.0, places=2)
+
+        with self.subTest("chained On Item Quantity + On Previous Row Total clears floor at gross 22"):
+            self._install_bin_valuation(valuation_rate=10.0, company_currency="USD")
+            errors = self.controls.collect_below_buying_price_errors(
+                [
+                    PrecisionDoc(
+                        item_code="LOW",
+                        item_name="Excise Total OK",
+                        qty=1,
+                        rate=22.0,
+                        amount=22.0,
+                        net_rate=10.0,
+                        base_net_rate=10.0,
+                        uom="Nos",
+                        warehouse="Shop Floor - JBS",
+                        precision_value=2,
+                    )
+                ],
+                invoice_doc=PrecisionDoc(
+                    company="Test Co",
+                    currency="USD",
+                    conversion_rate=1,
+                    taxes=[
+                        {
+                            "charge_type": "On Item Quantity",
+                            "account_head": "Excise - CO",
+                            "rate": 10.0,
+                            "included_in_print_rate": 1,
+                        },
+                        {
+                            "charge_type": "On Previous Row Total",
+                            "account_head": "VAT on Total - CO",
+                            "row_id": "1",
+                            "rate": 10.0,
+                            "included_in_print_rate": 1,
+                        },
+                    ],
+                    precision_value=2,
+                ),
+            )
+            self.assertEqual(errors, [])
+
+    def test_fixed_grand_total_discount_distributes_across_exclusive_and_inclusive_tax(self):
+        exclusive_tax = [
+            {
+                "charge_type": "On Net Total",
+                "account_head": "VAT 10% - CO",
+                "rate": 10.0,
+                "included_in_print_rate": 0,
+            }
+        ]
+        inclusive_tax = [
+            {
+                "charge_type": "On Net Total",
+                "account_head": "VAT 18% - CO",
+                "rate": 18.0,
+                "included_in_print_rate": 1,
+            }
+        ]
+
+        with self.subTest("exclusive tax with ERPNext distributed net_rate 90 passes 89.50 floor"):
+            self._install_bin_valuation(valuation_rate=89.50, company_currency="USD")
+            errors = self.controls.collect_below_buying_price_errors(
+                [
+                    PrecisionDoc(
+                        item_code="LOW",
+                        item_name="Exclusive Tax Discount",
+                        qty=1,
+                        rate=100.0,
+                        amount=100.0,
+                        net_rate=90.0,
+                        base_net_rate=90.0,
+                        uom="Nos",
+                        warehouse="Shop Floor - JBS",
+                        precision_value=2,
+                    )
+                ],
+                invoice_doc=PrecisionDoc(
+                    company="Test Co",
+                    currency="USD",
+                    conversion_rate=1,
+                    apply_discount_on="Grand Total",
+                    discount_amount=11.0,
+                    taxes=exclusive_tax,
+                    precision_value=2,
+                ),
+            )
+            self.assertEqual(errors, [])
+
+        with self.subTest("exclusive tax fallback math distributes 11 over 110 grand total to 90 net"):
+            self._install_bin_valuation(valuation_rate=89.50, company_currency="USD")
+            errors = self.controls.collect_below_buying_price_errors(
+                [
+                    PrecisionDoc(
+                        item_code="LOW",
+                        item_name="Exclusive Tax Fallback",
+                        qty=1,
+                        rate=100.0,
+                        amount=100.0,
+                        uom="Nos",
+                        warehouse="Shop Floor - JBS",
+                        precision_value=2,
+                    )
+                ],
+                invoice_doc=PrecisionDoc(
+                    company="Test Co",
+                    currency="USD",
+                    conversion_rate=1,
+                    apply_discount_on="Grand Total",
+                    discount_amount=11.0,
+                    taxes=exclusive_tax,
+                    precision_value=2,
+                ),
+            )
+            self.assertEqual(errors, [])
+
+        with self.subTest("exclusive tax with 90 net fails 90.50 floor"):
+            self._install_bin_valuation(valuation_rate=90.50, company_currency="USD")
+            errors = self.controls.collect_below_buying_price_errors(
+                [
+                    PrecisionDoc(
+                        item_code="LOW",
+                        item_name="Exclusive Tax Below Floor",
+                        qty=1,
+                        rate=100.0,
+                        amount=100.0,
+                        net_rate=90.0,
+                        base_net_rate=90.0,
+                        uom="Nos",
+                        warehouse="Shop Floor - JBS",
+                        precision_value=2,
+                    )
+                ],
+                invoice_doc=PrecisionDoc(
+                    company="Test Co",
+                    currency="USD",
+                    conversion_rate=1,
+                    apply_discount_on="Grand Total",
+                    discount_amount=11.0,
+                    taxes=exclusive_tax,
+                    precision_value=2,
+                ),
+            )
+            self.assertEqual(len(errors), 1)
+            self.assertAlmostEqual(errors[0]["selling_rate"], 90.0, places=2)
+
+        with self.subTest("inclusive tax fixed Grand Total discount distributes proportionally"):
+            self._install_bin_valuation(valuation_rate=89.50, company_currency="USD")
+            ok_errors = self.controls.collect_below_buying_price_errors(
+                [
+                    PrecisionDoc(
+                        item_code="LOW",
+                        item_name="Inclusive Tax Discount OK",
+                        qty=1,
+                        rate=118.0,
+                        amount=118.0,
+                        net_rate=90.0,
+                        base_net_rate=90.0,
+                        uom="Nos",
+                        warehouse="Shop Floor - JBS",
+                        precision_value=2,
+                    )
+                ],
+                invoice_doc=PrecisionDoc(
+                    company="Test Co",
+                    currency="USD",
+                    conversion_rate=1,
+                    apply_discount_on="Grand Total",
+                    discount_amount=11.80,
+                    taxes=inclusive_tax,
+                    precision_value=2,
+                ),
+            )
+            self.assertEqual(ok_errors, [])
+
+            self._install_bin_valuation(valuation_rate=90.50, company_currency="USD")
+            blocked_errors = self.controls.collect_below_buying_price_errors(
+                [
+                    PrecisionDoc(
+                        item_code="LOW",
+                        item_name="Inclusive Tax Discount Low",
+                        qty=1,
+                        rate=118.0,
+                        amount=118.0,
+                        uom="Nos",
+                        warehouse="Shop Floor - JBS",
+                        precision_value=2,
+                    )
+                ],
+                invoice_doc=PrecisionDoc(
+                    company="Test Co",
+                    currency="USD",
+                    conversion_rate=1,
+                    apply_discount_on="Grand Total",
+                    discount_amount=11.80,
+                    taxes=inclusive_tax,
+                    precision_value=2,
+                ),
+            )
+            self.assertEqual(len(blocked_errors), 1)
+            self.assertAlmostEqual(blocked_errors[0]["selling_rate"], 90.0, places=2)
+
+    def test_validate_pos_invoice_refreshes_stale_foreign_conversion_rate_and_blocks_below_cost(
+        self,
+    ):
+        self._install_bin_valuation(valuation_rate=100000, company_currency="UGX")
+        erpnext_module = types.ModuleType("erpnext")
+        erpnext_setup = types.ModuleType("erpnext.setup")
+        erpnext_utils = types.ModuleType("erpnext.setup.utils")
+        erpnext_utils.get_exchange_rate = lambda from_curr, to_curr, *_args, **_kwargs: (
+            3700.0 if (from_curr, to_curr) == ("USD", "UGX") else 1.0
+        )
+
+        recalc_calls = []
+
+        class DeskInvoiceDoc(PrecisionDoc):
+            def calculate_taxes_and_totals(self):
+                recalc_calls.append(self["conversion_rate"])
+                for item in self["items"]:
+                    item["net_rate"] = item["rate"]
+                    item["base_net_rate"] = round(item["net_rate"] * self["conversion_rate"], 2)
+
+        item_row = PrecisionDoc(
+            item_code="LOW",
+            item_name="Desk USD Item",
+            qty=1,
+            rate=10.0,
+            amount=10.0,
+            net_rate=10.0,
+            base_net_rate=10000000.0,
+            uom="Nos",
+            warehouse="Shop Floor - JBS",
+            precision_value=2,
+        )
+        invoice = DeskInvoiceDoc(
+            doctype="POS Invoice",
+            is_pos=1,
+            pos_profile="Main POS",
+            company="Test Co",
+            currency="USD",
+            conversion_rate=1000000.0,
+            posting_date="2026-11-28",
+            items=[item_row],
+            precision_value=2,
+        )
+        invoice.doctype = "POS Invoice"
+        invoice.flags = types.SimpleNamespace()
+
+        with patch.dict(
+            sys.modules,
+            {
+                "erpnext": erpnext_module,
+                "erpnext.setup": erpnext_setup,
+                "erpnext.setup.utils": erpnext_utils,
+            },
+        ):
+            with self.assertRaisesRegex(Exception, "below Warehouse Valuation"):
+                self.controls.validate_pos_invoice_item_sale_controls(invoice)
+
+        self.assertEqual(invoice["conversion_rate"], 3700.0)
+        self.assertEqual(recalc_calls, [3700.0])
+        self.assertAlmostEqual(item_row["base_net_rate"], 37000.0, places=2)
+
+    def test_validate_pos_invoice_preserves_return_and_consolidated_exemptions_with_foreign_currency(
+        self,
+    ):
+        self._install_bin_valuation(valuation_rate=100000, company_currency="UGX")
+
+        return_doc = PrecisionDoc(
+            doctype="POS Invoice",
+            is_pos=1,
+            is_return=1,
+            pos_profile="Main POS",
+            company="Test Co",
+            currency="USD",
+            conversion_rate=3500.0,
+            posting_date="2026-11-28",
+            items=[
+                PrecisionDoc(
+                    item_code="LOW",
+                    qty=-1,
+                    rate=10.0,
+                    net_rate=10.0,
+                    base_net_rate=35000.0,
+                    uom="Nos",
+                    warehouse="Shop Floor - JBS",
+                    precision_value=2,
+                )
+            ],
+            precision_value=2,
+        )
+        return_doc.doctype = "POS Invoice"
+        return_doc.flags = types.SimpleNamespace()
+        self.controls.validate_pos_invoice_item_sale_controls(return_doc)
+        self.assertEqual(return_doc["conversion_rate"], 3500.0)
+
+        consolidated_doc = PrecisionDoc(
+            doctype="Sales Invoice",
+            is_pos=1,
+            is_consolidated=1,
+            pos_profile="Main POS",
+            company="Test Co",
+            currency="USD",
+            conversion_rate=3500.0,
+            posting_date="2026-11-28",
+            items=[
+                PrecisionDoc(
+                    item_code="LOW",
+                    qty=1,
+                    rate=10.0,
+                    uom="Nos",
+                    warehouse="Shop Floor - JBS",
+                    precision_value=2,
+                )
+            ],
+            precision_value=2,
+        )
+        consolidated_doc.doctype = "Sales Invoice"
+        consolidated_doc.flags = types.SimpleNamespace(is_consolidated=True)
+        self.controls.validate_pos_invoice_item_sale_controls(consolidated_doc)
+        self.assertEqual(consolidated_doc["conversion_rate"], 3500.0)
+
+    def test_free_item_matches_utm_campaign_and_hierarchical_customer_group_and_territory(self):
+        tree_nodes = {
+            "Customer Group": [
+                {"name": "All Customer Groups", "lft": 1, "rgt": 20},
+                {"name": "Retail", "lft": 2, "rgt": 11},
+                {"name": "Supermarkets", "lft": 3, "rgt": 4},
+                {"name": "Wholesale", "lft": 12, "rgt": 15},
+            ],
+            "Territory": [
+                {"name": "All Territories", "lft": 1, "rgt": 20},
+                {"name": "East Africa", "lft": 2, "rgt": 11},
+                {"name": "Kampala", "lft": 5, "rgt": 6},
+                {"name": "West Africa", "lft": 12, "rgt": 15},
+            ],
+        }
+
+        def install_rule_with_trees(**overrides):
+            self._install_promotional_rule(**overrides)
+            base_get_all = self.frappe.get_all
+
+            def get_all(doctype, *args, **kwargs):
+                if doctype in tree_nodes:
+                    return list(tree_nodes[doctype])
+                return base_get_all(doctype, *args, **kwargs)
+
+            self.frappe.get_all = get_all
+
+        with self.subTest("matching utm_campaign qualifies"):
+            install_rule_with_trees(applicable_for="Campaign", campaign="SUMMER-2026")
+            errors = self.controls.collect_below_buying_price_errors(
+                [self._promo_trigger_row(), self._promo_free_row(rate=0)],
+                invoice_doc={**self.PROMO_INVOICE, "utm_campaign": "SUMMER-2026"},
+            )
+            self.assertEqual(errors, [])
+
+        with self.subTest("non-matching utm_campaign is rejected"):
+            install_rule_with_trees(applicable_for="Campaign", campaign="SUMMER-2026")
+            errors = self.controls.collect_below_buying_price_errors(
+                [self._promo_trigger_row(), self._promo_free_row(rate=0)],
+                invoice_doc={**self.PROMO_INVOICE, "utm_campaign": "WINTER-2026"},
+            )
+            self.assertEqual(len(errors), 1)
+
+        with self.subTest("child Customer Group qualifies under parent rule"):
+            install_rule_with_trees(applicable_for="Customer Group", customer_group="Retail")
+            errors = self.controls.collect_below_buying_price_errors(
+                [self._promo_trigger_row(), self._promo_free_row(rate=0)],
+                invoice_doc={**self.PROMO_INVOICE, "customer_group": "Supermarkets"},
+            )
+            self.assertEqual(errors, [])
+
+        with self.subTest("sibling Customer Group does not qualify"):
+            install_rule_with_trees(applicable_for="Customer Group", customer_group="Retail")
+            errors = self.controls.collect_below_buying_price_errors(
+                [self._promo_trigger_row(), self._promo_free_row(rate=0)],
+                invoice_doc={**self.PROMO_INVOICE, "customer_group": "Wholesale"},
+            )
+            self.assertEqual(len(errors), 1)
+
+        with self.subTest("child Territory qualifies under parent rule"):
+            install_rule_with_trees(applicable_for="Territory", territory="East Africa")
+            errors = self.controls.collect_below_buying_price_errors(
+                [self._promo_trigger_row(), self._promo_free_row(rate=0)],
+                invoice_doc={**self.PROMO_INVOICE, "territory": "Kampala"},
+            )
+            self.assertEqual(errors, [])
+
+        with self.subTest("sibling Territory does not qualify"):
+            install_rule_with_trees(applicable_for="Territory", territory="East Africa")
+            errors = self.controls.collect_below_buying_price_errors(
+                [self._promo_trigger_row(), self._promo_free_row(rate=0)],
+                invoice_doc={**self.PROMO_INVOICE, "territory": "West Africa"},
+            )
+            self.assertEqual(len(errors), 1)
+
+    def test_free_item_enforces_default_free_qty_default_stock_uom_and_recursive_cap(self):
+        with self.subTest("blank free_qty caps non-recursive award at 1"):
+            self._install_promotional_rule(free_qty=None, is_recursive=0)
+            free_row = self._promo_free_row(rate=0)
+            free_row["qty"] = 2
+
+            errors = self.controls.collect_below_buying_price_errors(
+                [self._promo_trigger_row(), free_row],
+                invoice_doc=dict(self.PROMO_INVOICE),
+            )
+            self.assertEqual(len(errors), 1)
+            self.assertEqual(errors[0]["reason"], "below_buying_price")
+
+        with self.subTest("blank free_item_uom requires free item stock_uom"):
+            self._install_promotional_rule(free_item_uom=None, free_qty=1, is_recursive=0)
+            base_get_all = self.frappe.get_all
+
+            def get_all(doctype, *args, **kwargs):
+                if doctype == "UOM Conversion Detail":
+                    return [{"parent": "LOW", "uom": "Box", "conversion_factor": 10}]
+                return base_get_all(doctype, *args, **kwargs)
+
+            self.frappe.get_all = get_all
+            free_row = self._promo_free_row(rate=0)
+            free_row["uom"] = "Box"
+
+            errors = self.controls.collect_below_buying_price_errors(
+                [self._promo_trigger_row(), free_row],
+                invoice_doc=dict(self.PROMO_INVOICE),
+            )
+            self.assertEqual(len(errors), 1)
+            self.assertEqual(errors[0]["buying_rate"], 1000)
+
+        with self.subTest("recursive rule allows exact server-computed multiple of qualifying qty"):
+            self._install_promotional_rule(is_recursive=1, recurse_for=2, free_qty=1)
+            trigger = self._promo_trigger_row()
+            trigger["qty"] = 5
+            free_row = self._promo_free_row(rate=0)
+            free_row["qty"] = 2
+
+            errors = self.controls.collect_below_buying_price_errors(
+                [trigger, free_row],
+                invoice_doc=dict(self.PROMO_INVOICE),
+            )
+            self.assertEqual(errors, [])
+
+        with self.subTest("recursive rule blocks free qty exceeding server-computed multiple"):
+            self._install_promotional_rule(is_recursive=1, recurse_for=2, free_qty=1)
+            trigger = self._promo_trigger_row()
+            trigger["qty"] = 5
+            free_row = self._promo_free_row(rate=0)
+            free_row["qty"] = 3
+
+            errors = self.controls.collect_below_buying_price_errors(
+                [trigger, free_row],
+                invoice_doc=dict(self.PROMO_INVOICE),
+            )
+            self.assertEqual(len(errors), 1)
+            self.assertEqual(errors[0]["reason"], "below_buying_price")
+
+        with self.subTest("recursive rule respects apply_recursion_over threshold"):
+            self._install_promotional_rule(
+                is_recursive=1,
+                recurse_for=2,
+                apply_recursion_over=1,
+                free_qty=1,
+            )
+            trigger = self._promo_trigger_row()
+            trigger["qty"] = 4
+
+            ok_free = self._promo_free_row(rate=0)
+            ok_free["qty"] = 1
+            self.assertEqual(
+                self.controls.collect_below_buying_price_errors(
+                    [trigger, ok_free],
+                    invoice_doc=dict(self.PROMO_INVOICE),
+                ),
+                [],
+            )
+
+            over_free = self._promo_free_row(rate=0)
+            over_free["qty"] = 2
+            errors = self.controls.collect_below_buying_price_errors(
+                [trigger, over_free],
+                invoice_doc=dict(self.PROMO_INVOICE),
+            )
+            self.assertEqual(len(errors), 1)
+
+        with self.subTest("recursive rule with blank free_qty defaults to 1 per multiple"):
+            self._install_promotional_rule(is_recursive=1, recurse_for=2, free_qty=None)
+            trigger = self._promo_trigger_row()
+            trigger["qty"] = 4
+            over_free = self._promo_free_row(rate=0)
+            over_free["qty"] = 3
+
+            errors = self.controls.collect_below_buying_price_errors(
+                [trigger, over_free],
+                invoice_doc=dict(self.PROMO_INVOICE),
+            )
+            self.assertEqual(len(errors), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

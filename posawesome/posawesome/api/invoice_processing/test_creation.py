@@ -3541,6 +3541,192 @@ class TestExistingDraftFloorHardening(unittest.TestCase):
         self.assertEqual(result["status"], 1)
         self.assertEqual(flag_during_save, [False])
 
+    def test_submit_invoice_recalculates_edited_draft_stale_net_rate_before_floor_check(self):
+        def run_repriced_submit(old_rate, new_rate, floor_rate):
+            tax_row = {
+                "charge_type": "On Net Total",
+                "account_head": "VAT 10% - TC",
+                "rate": 10,
+                "included_in_print_rate": 0,
+            }
+            invoice_doc = self._build_fx_draft(
+                name="ACC-SINV-REPRICE-0001",
+                currency="UGX",
+                price_list_currency="UGX",
+                conversion_rate=1.0,
+                plc_conversion_rate=1.0,
+                items=[
+                    FakeDoc(
+                        item_code="REPRICE-ITEM",
+                        item_name="Repriced Item",
+                        qty=1,
+                        rate=old_rate,
+                        amount=old_rate,
+                        net_rate=old_rate,
+                        net_amount=old_rate,
+                        base_rate=old_rate,
+                        base_amount=old_rate,
+                        base_net_rate=old_rate,
+                        base_net_amount=old_rate,
+                        price_list_rate=old_rate,
+                        base_price_list_rate=old_rate,
+                        discount_amount=0,
+                        base_discount_amount=0,
+                    )
+                ],
+                taxes=[dict(tax_row)],
+            )
+            recalc_rates = []
+
+            def recalc():
+                for row in invoice_doc.items:
+                    rate = row["rate"] if isinstance(row, dict) else row.rate
+                    qty = row["qty"] if isinstance(row, dict) else row.qty
+                    net = rate
+                    base_net = net * (invoice_doc.get("conversion_rate") or 1.0)
+                    if isinstance(row, dict):
+                        row["amount"] = rate * qty
+                        row["net_rate"] = net
+                        row["net_amount"] = net * qty
+                        row["base_net_rate"] = base_net
+                        row["base_net_amount"] = base_net * qty
+                    else:
+                        row.amount = rate * qty
+                        row.net_rate = net
+                        row.net_amount = net * qty
+                        row.base_net_rate = base_net
+                        row.base_net_amount = base_net * qty
+                    recalc_rates.append(base_net)
+
+            object.__setattr__(invoice_doc, "calculate_taxes_and_totals", recalc)
+            invoice_doc.submit = lambda: setattr(invoice_doc, "docstatus", 1)
+
+            def floor_check(doc):
+                row = doc.items[0]
+                net = row["base_net_rate"] if isinstance(row, dict) else row.base_net_rate
+                if net < floor_rate:
+                    self.creation.frappe.throw(f"below floor {net} < {floor_rate}")
+
+            self.creation.validate_invoice_item_sale_controls = floor_check
+            self.creation._save_draft_with_latest_timestamp = lambda doc: doc
+            self.creation.frappe.db.exists = lambda doctype, name: name == "ACC-SINV-REPRICE-0001"
+            self.creation.frappe.db.get_value = lambda *args, **kwargs: 0
+            self.creation.frappe.get_cached_value = (
+                lambda doctype, name, fieldname: 0
+                if (doctype, name, fieldname) == ("POS Profile", "Main POS", "posa_tax_inclusive")
+                else ("UGX" if (doctype, fieldname) == ("Company", "default_currency") else None)
+            )
+            self.creation.frappe.get_doc = lambda *args: invoice_doc
+
+            result = self.creation.submit_invoice(
+                json.dumps(
+                    {
+                        "doctype": "Sales Invoice",
+                        "name": "ACC-SINV-REPRICE-0001",
+                        "pos_profile": "Main POS",
+                        "company": "Test Company",
+                        "currency": "UGX",
+                        "customer": "CUST-0001",
+                        "posting_date": "2026-11-28",
+                        "items": [
+                            {
+                                "item_code": "REPRICE-ITEM",
+                                "item_name": "Repriced Item",
+                                "qty": 1,
+                                "rate": new_rate,
+                                "amount": new_rate,
+                                "net_rate": old_rate,
+                                "net_amount": old_rate,
+                                "base_net_rate": old_rate,
+                                "base_net_amount": old_rate,
+                            }
+                        ],
+                        "taxes": [dict(tax_row)],
+                        "payments": [],
+                    }
+                ),
+                json.dumps({}),
+                submit_in_background=0,
+            )
+            return result, recalc_rates
+
+        with self.subTest("repriced above floor 90 -> 120 vs 95 succeeds"):
+            result, recalc_rates = run_repriced_submit(90.0, 120.0, 95.0)
+            self.assertEqual(result["status"], 1)
+            self.assertEqual(recalc_rates, [120.0])
+
+        with self.subTest("repriced below floor 120 -> 90 vs 95 is rejected"):
+            with self.assertRaisesRegex(Exception, "below floor 90.0 < 95.0"):
+                run_repriced_submit(120.0, 90.0, 95.0)
+
+    def test_submit_in_background_job_recalculates_stale_net_rate_before_floor_check(self):
+        tax_row = {
+            "charge_type": "On Net Total",
+            "account_head": "VAT 10% - TC",
+            "rate": 10,
+            "included_in_print_rate": 0,
+        }
+        item_row = FakeDoc(
+            item_code="REPRICE-ITEM",
+            item_name="Repriced Item",
+            qty=1,
+            rate=120.0,
+            amount=120.0,
+            net_rate=90.0,
+            net_amount=90.0,
+            base_rate=120.0,
+            base_amount=120.0,
+            base_net_rate=90.0,
+            base_net_amount=90.0,
+            price_list_rate=120.0,
+            base_price_list_rate=120.0,
+            discount_amount=0,
+            base_discount_amount=0,
+        )
+        invoice_doc = self._build_fx_draft(
+            name="ACC-SINV-BG-REPRICE-0001",
+            currency="UGX",
+            price_list_currency="UGX",
+            conversion_rate=1.0,
+            plc_conversion_rate=1.0,
+            items=[item_row],
+            taxes=[dict(tax_row)],
+        )
+
+        def recalc():
+            item_row.net_rate = item_row.rate
+            item_row.base_net_rate = item_row.rate * (invoice_doc.get("conversion_rate") or 1.0)
+
+        object.__setattr__(invoice_doc, "calculate_taxes_and_totals", recalc)
+        invoice_doc.submit = lambda: setattr(invoice_doc, "docstatus", 1)
+
+        def floor_check(doc):
+            if doc.items[0].base_net_rate < 95.0:
+                self.creation.frappe.throw(f"below floor {doc.items[0].base_net_rate}")
+
+        self.creation.validate_invoice_item_sale_controls = floor_check
+        self.creation._save_draft_with_latest_timestamp = lambda doc: doc
+        self.creation.frappe.get_doc = lambda *args: invoice_doc
+        self.creation.frappe.db.get_value = lambda *args, **kwargs: None
+        self.creation.frappe.get_cached_value = (
+            lambda doctype, name, fieldname: 0
+            if (doctype, name, fieldname) == ("POS Profile", "Main POS", "posa_tax_inclusive")
+            else ("UGX" if (doctype, fieldname) == ("Company", "default_currency") else None)
+        )
+
+        self.creation.submit_in_background_job(
+            {
+                "invoice": "ACC-SINV-BG-REPRICE-0001",
+                "doctype": "Sales Invoice",
+                "data": {},
+                "payments": [],
+                "user": "cashier@example.com",
+            }
+        )
+
+        self.assertEqual(invoice_doc.docstatus, 1)
+        self.assertEqual(item_row.base_net_rate, 120.0)
+
 
 if __name__ == "__main__":
     unittest.main()

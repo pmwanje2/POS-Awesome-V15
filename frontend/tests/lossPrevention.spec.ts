@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
 
+import { useItemCurrency } from "../src/posapp/composables/pos/items/useItemCurrency";
 import {
 	findLossRiskItems,
 	getEffectiveSellingRate,
+	getItemCostFloor,
 	getItemLossRisk,
 	resolveSaleFloorPolicy,
 } from "../src/posapp/utils/lossPrevention";
@@ -408,5 +410,159 @@ describe("loss prevention", () => {
 				buying_rate: 37000,
 			}),
 		).toBeNull();
+	});
+
+	it("preserves below-cost detection across UGX -> USD -> UGX currency switches without _buying_prices_by_uom", () => {
+		const { applyCurrencyConversionToItem } = useItemCurrency();
+		const item: Record<string, unknown> = {
+			item_code: "SWITCH-UGX-USD-UGX",
+			qty: 1,
+			rate: 55500,
+			price_list_rate: 55500,
+			currency: "UGX",
+			company_currency: "UGX",
+			conversion_rate: 1,
+			uom: "Nos",
+			stock_uom: "Nos",
+			conversion_factor: 1,
+			buying_price_currency: "UGX",
+			buying_rate_currency: "UGX",
+			trade_price: 37000,
+			buying_rate: 37000,
+		};
+
+		applyCurrencyConversionToItem(item, {
+			company: { default_currency: "UGX" },
+			pos_profile: { currency: "UGX" },
+			price_list_currency: "UGX",
+			selected_currency: "USD",
+			exchange_rate: 1 / 3700,
+			conversion_rate: 3700,
+			currency_precision: 2,
+		});
+		expect(getItemLossRisk(item)).toBeNull();
+
+		applyCurrencyConversionToItem(item, {
+			company: { default_currency: "UGX" },
+			pos_profile: { currency: "UGX" },
+			price_list_currency: "UGX",
+			selected_currency: "UGX",
+			exchange_rate: 1,
+			conversion_rate: 1,
+			currency_precision: 2,
+		});
+		item.rate = 30000;
+
+		const risk = getItemLossRisk(item);
+		expect(risk?.belowCost).toBe(true);
+		expect(risk?.costRate).toBeCloseTo(37000);
+	});
+
+	it("preserves below-cost detection when a USD-normalized scalar item switches back to UGX without _buying_prices_by_uom", () => {
+		const { applyCurrencyConversionToItem } = useItemCurrency();
+		const item: Record<string, unknown> = {
+			item_code: "SWITCH-USD-TO-UGX",
+			qty: 1,
+			rate: 15,
+			price_list_rate: 15,
+			currency: "USD",
+			company_currency: "UGX",
+			conversion_rate: 3700,
+			plc_conversion_rate: 3700,
+			uom: "Nos",
+			stock_uom: "Nos",
+			conversion_factor: 1,
+			buying_price_currency: "UGX",
+			buying_rate_currency: "USD",
+			trade_price: 10,
+			buying_rate: 10,
+		};
+
+		applyCurrencyConversionToItem(item, {
+			company: { default_currency: "UGX" },
+			pos_profile: { currency: "UGX" },
+			price_list_currency: "USD",
+			selected_currency: "UGX",
+			exchange_rate: 3700,
+			conversion_rate: 1,
+			currency_precision: 2,
+		});
+		item.rate = 30000;
+
+		const risk = getItemLossRisk(item);
+		expect(risk?.belowCost).toBe(true);
+		expect(risk?.costRate).toBeCloseTo(37000);
+	});
+
+	it("does not treat a stale USD-tagged scalar buying price as UGX after switching invoice currency to UGX", () => {
+		const item = {
+			item_code: "STALE-USD-TAG",
+			qty: 1,
+			rate: 30000,
+			currency: "UGX",
+			company_currency: "UGX",
+			conversion_rate: 1,
+			uom: "Nos",
+			stock_uom: "Nos",
+			conversion_factor: 1,
+			buying_price_currency: "UGX",
+			buying_rate_currency: "USD",
+			trade_price: 10,
+			buying_rate: 10,
+		};
+
+		expect(getItemCostFloor(item)).toBeNull();
+	});
+
+	it("does not fall back to 1:1 cross-currency comparison when invoice FX is missing, 0, or NaN (with _buying_prices_by_uom)", () => {
+		for (const conversionRate of [undefined, 0, Number.NaN]) {
+			const item = {
+				item_code: "FX-MISSING-WITH-TABLE",
+				qty: 1,
+				rate: 15,
+				currency: "USD",
+				company_currency: "UGX",
+				conversion_rate: conversionRate,
+				uom: "Nos",
+				stock_uom: "Nos",
+				conversion_factor: 1,
+				buying_price_currency: "UGX",
+				trade_price: 37000,
+				buying_rate: 37000,
+				_buying_prices_by_uom: {
+					Nos: {
+						price_list_rate: 37000,
+						base_price_list_rate: 37000,
+						currency: "UGX",
+					},
+				},
+			};
+
+			expect(getItemCostFloor(item)).toBeNull();
+			expect(getItemLossRisk(item)).toBeNull();
+		}
+	});
+
+	it("does not fall back to 1:1 cross-currency comparison when invoice FX is missing, 0, or NaN (without _buying_prices_by_uom)", () => {
+		for (const conversionRate of [undefined, 0, Number.NaN]) {
+			const item = {
+				item_code: "FX-MISSING-NO-TABLE",
+				qty: 1,
+				rate: 15,
+				currency: "USD",
+				company_currency: "UGX",
+				conversion_rate: conversionRate,
+				uom: "Nos",
+				stock_uom: "Nos",
+				conversion_factor: 1,
+				buying_price_currency: "UGX",
+				trade_price: 37000,
+				buying_rate: 37000,
+				valuation_rate: 37000,
+			};
+
+			expect(getItemCostFloor(item)).toBeNull();
+			expect(getItemLossRisk(item)).toBeNull();
+		}
 	});
 });

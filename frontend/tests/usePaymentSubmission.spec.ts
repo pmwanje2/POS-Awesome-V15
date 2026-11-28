@@ -285,6 +285,63 @@ describe("usePaymentSubmission", () => {
 		expect(requestBelowCostOverride).not.toHaveBeenCalled();
 	});
 
+	it("routes unresolved cross-currency FX through missing-cost policy without 1:1 floor comparison", async () => {
+		const buildInvoice = () =>
+			ref<any>({
+				is_return: 0,
+				currency: "USD",
+				items: [
+					{
+						item_code: "FX-MISSING",
+						item_name: "Missing FX Item",
+						qty: 1,
+						rate: 15,
+						currency: "USD",
+						company_currency: "UGX",
+						conversion_rate: 0,
+						buying_price_currency: "UGX",
+						trade_price: 37000,
+						_buying_prices_by_uom: {
+							Nos: {
+								price_list_rate: 37000,
+								base_price_list_rate: 37000,
+								currency: "UGX",
+							},
+						},
+					},
+				],
+				payments: [{ mode_of_payment: "Cash", amount: 15, type: "Cash" }],
+				rounded_total: 15,
+				grand_total: 15,
+			});
+
+		const blockSubmit = usePaymentSubmission({
+			invoiceDoc: buildInvoice(),
+			posProfile: ref({ posa_missing_cost_action: "Block" }),
+			stockSettings: ref({}),
+			invoiceType: ref("Invoice"),
+			formatFloat: (value) => Number(value || 0),
+			stores: { toastStore: { show: vi.fn() } },
+			diff_payment: ref(0) as any,
+			isCashback: ref(true),
+		});
+		await expect(blockSubmit.validateSubmission(true)).rejects.toThrow(
+			/no valid buying floor is available for Missing FX Item/i,
+		);
+
+		const allowSubmit = usePaymentSubmission({
+			invoiceDoc: buildInvoice(),
+			posProfile: ref({ posa_missing_cost_action: "Allow" }),
+			stockSettings: ref({}),
+			invoiceType: ref("Invoice"),
+			formatFloat: (value) => Number(value || 0),
+			stores: { toastStore: { show: vi.fn() } },
+			diff_payment: ref(0) as any,
+			isCashback: ref(true),
+		});
+		await expect(allowSubmit.validateSubmission(true)).resolves.toBe(true);
+	});
+
 	it("defers print and schedules background wait when invoice submission is queued", async () => {
 		const invoiceService = (
 			await import("../src/posapp/services/invoiceService")

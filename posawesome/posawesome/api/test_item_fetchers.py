@@ -361,6 +361,7 @@ class TestItemFetchers(unittest.TestCase):
 
         self.assertAlmostEqual(row["trade_price"], 10.0)
         self.assertAlmostEqual(row["buying_rate"], 10.0)
+        self.assertAlmostEqual(row["base_buying_rate"], 37000.0)
         self.assertEqual(row["buying_rate_currency"], "USD")
         self.assertEqual(row["buying_price_currency"], "UGX")
         self.assertAlmostEqual(
