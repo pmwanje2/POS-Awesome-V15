@@ -400,4 +400,58 @@ describe("boot-critical offline sync adapters", () => {
 			}),
 		);
 	});
+
+	it("does not record unacknowledged opportunistic incremental rows in syncedCurrencyPairs and returns syncedCurrencyPairs on result", async () => {
+		const result = await syncCurrencyMatrixResource({
+			posProfile: {
+				name: "POS-DELTA",
+				company: "Uganda Co",
+				modified: "2026-04-09T10:00:00",
+			},
+			currencyPairs: [{ from_currency: "USD", to_currency: "UGX" }],
+			syncedCurrencyPairs: ["USD::UGX"],
+			watermark: "2026-04-09T10:00:00",
+			fetcher: vi.fn(async () => ({
+				schema_version: "2026-04-09",
+				next_watermark: "2026-04-09T10:05:00",
+				synced_pairs: [{ from_currency: "USD", to_currency: "UGX" }],
+				changes: [
+					{
+						key: "currency_rate::FX-EUR-UGX-SELL-INC",
+						modified: "2026-04-09T10:05:00",
+						data: {
+							name: "FX-EUR-UGX-SELL-INC",
+							from_currency: "EUR",
+							to_currency: "UGX",
+							exchange_rate: 4300,
+							date: "2026-04-09",
+							for_buying: 0,
+							for_selling: 1,
+						},
+					},
+					{
+						key: "exchange_rate::EUR::UGX",
+						modified: "2026-04-09T10:05:00",
+						data: {
+							from_currency: "EUR",
+							to_currency: "UGX",
+							exchange_rate: 4300,
+							date: "2026-04-09",
+							purpose: "for_selling",
+						},
+					},
+				],
+				deleted: [],
+				has_more: false,
+			})),
+		});
+
+		expect(syncStateMocks.setSyncResourceState).toHaveBeenCalledWith(
+			expect.objectContaining({
+				resourceId: "currency_matrix",
+				syncedCurrencyPairs: ["USD::UGX"],
+			}),
+		);
+		expect((result as any).syncedCurrencyPairs).toEqual(["USD::UGX"]);
+	});
 });

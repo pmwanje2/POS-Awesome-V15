@@ -1230,4 +1230,99 @@ describe("offline buying floor cache reconstruction", () => {
 			}),
 		).toBeNull();
 	});
+
+	it("preserves verified server buying floor when currency_matrix sync state has undefined syncedCurrencyPairs", async () => {
+		const profile = {
+			name: "POS-UNDEF-PAIRS",
+			company: "Test Co",
+			currency: "USD",
+			company_currency: "UGX",
+			selling_price_list: "USD Selling",
+			buying_price_list: "USD Buying",
+		};
+		await setProfileBuyingPriceList(profile, "USD Buying");
+		await db.table("items").put({
+			item_code: "ITEM-UNDEF-PAIRS",
+			item_name: "Undefined Synced Pairs Item",
+			stock_uom: "Nos",
+			valuation_rate: 100,
+		});
+		await db.table("item_price_records").bulkPut([
+			{
+				name: "IP-UNDEF-1",
+				price_list: "USD Buying",
+				item_code: "ITEM-UNDEF-PAIRS",
+				uom: "Nos",
+				currency: "USD",
+				price_list_rate: 10,
+				buying: 1,
+				selling: 0,
+				valid_from: "2025-01-01",
+				modified: "2025-04-01T10:00:00",
+			},
+		]);
+		await db.table("sync_state").put({
+			key: "posa_sync_state::currency_matrix",
+			resourceId: "currency_matrix",
+			status: "fresh",
+			value: {
+				resourceId: "currency_matrix",
+				status: "fresh",
+				lastSyncedAt: "2026-04-09T10:00:00.000Z",
+				watermark: "2026-04-09T10:00:00",
+				scopeSignature: JSON.stringify({
+					profile: "POS-UNDEF-PAIRS",
+					company: "Test Co",
+					warehouse: null,
+				}),
+				schemaVersion: "2026-04-09",
+			},
+		});
+		saveItemDetailsCache("POS-UNDEF-PAIRS", "USD Selling", [
+			{
+				item_code: "ITEM-UNDEF-PAIRS",
+				stock_uom: "Nos",
+				rate: 10.5,
+				price_list_rate: 10.5,
+				company_currency: "UGX",
+				buying_price_list: "USD Buying",
+				buying_price_currency: "USD",
+				buying_exchange_rate: 4050,
+				base_buying_rate: 40500,
+				trade_price: 40500 / 3700,
+				buying_rate: 40500 / 3700,
+				_company_buying_price: 40500,
+				_buying_prices_by_uom: {
+					Nos: {
+						price_list_rate: 10,
+						base_price_list_rate: 40500,
+						currency: "USD",
+						price_list: "USD Buying",
+						price_not_uom_dependent: 0,
+					},
+				},
+			},
+		]);
+
+		const { cached } = await getCachedItemDetails(
+			"POS-UNDEF-PAIRS",
+			"USD Selling",
+			["ITEM-UNDEF-PAIRS"],
+		);
+		expect(cached).toHaveLength(1);
+		expect(cached[0]._buying_prices_by_uom.Nos.unresolved_fx).not.toBe(true);
+		expect(cached[0]._buying_prices_by_uom.Nos.base_price_list_rate).toBe(40500);
+		expect(
+			getItemCostFloor({
+				...cached[0],
+				qty: 1,
+				rate: 10.5,
+				uom: "Nos",
+				currency: "USD",
+				company_currency: "UGX",
+				conversion_rate: 3700,
+				valuation_rate: 100,
+			})?.rate,
+		).toBeCloseTo(40500);
+	});
 });

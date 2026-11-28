@@ -231,4 +231,47 @@ describe("SyncCoordinator", () => {
 			nextRetryAt: null,
 		});
 	});
+
+	it("preserves syncedCurrencyPairs across SyncCoordinator completion updates", async () => {
+		const { setSyncResourceState } = await import(
+			"../src/offline/sync/syncState"
+		);
+		const setStateMock = vi.mocked(setSyncResourceState);
+		setStateMock.mockClear();
+
+		const resource = makeResource("currency_matrix", "boot_critical", [
+			"boot",
+			"timer",
+		]);
+		const runResource = vi
+			.fn()
+			.mockResolvedValueOnce({
+				status: "fresh",
+				watermark: "2026-04-09T10:00:00",
+				syncedCurrencyPairs: ["USD::UGX"],
+			})
+			.mockResolvedValueOnce({
+				status: "fresh",
+				watermark: "2026-04-09T10:05:00",
+				syncedCurrencyPairs: undefined,
+			});
+
+		const coordinator = new SyncCoordinator({
+			concurrency: 1,
+			resources: [resource],
+			runResource,
+		});
+
+		await coordinator.runTrigger("boot");
+		expect(
+			coordinator.getResourceState("currency_matrix")?.syncedCurrencyPairs,
+		).toEqual(["USD::UGX"]);
+
+		await coordinator.runTrigger("timer");
+		expect(
+			coordinator.getResourceState("currency_matrix")?.syncedCurrencyPairs,
+		).toEqual(["USD::UGX"]);
+		const lastPersisted = setStateMock.mock.calls.at(-1)?.[0];
+		expect(lastPersisted?.syncedCurrencyPairs).toEqual(["USD::UGX"]);
+	});
 });

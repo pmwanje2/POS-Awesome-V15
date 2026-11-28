@@ -356,4 +356,103 @@ describe("exchange rate resolver", () => {
 		expect(second.found).toBe(false);
 		expect(second.rate).toBeNull();
 	});
+
+	it("probes direct sources instead of returning a cached derived_inverse when a direct rate becomes available", async () => {
+		offlineMocks.isOffline.mockReturnValue(true);
+		offlineMocks.getCachedExchangeRate.mockImplementation((query: any) => {
+			if (
+				query.fromCurrency === "UGX" &&
+				query.toCurrency === "USD" &&
+				query.purpose === "for_buying"
+			) {
+				return {
+					fromCurrency: "UGX",
+					toCurrency: "USD",
+					date: "2026-11-28",
+					purpose: "for_buying",
+					exchange_rate: 1 / 3700,
+				};
+			}
+			return null;
+		});
+
+		const first = await resolveExchangeRate({
+			profileName: "POS-1",
+			company: "Example Co",
+			fromCurrency: "USD",
+			toCurrency: "UGX",
+			effectiveDate: "2026-11-28",
+			purpose: "for_selling",
+		});
+		expect(first.found).toBe(true);
+		expect(first.rate).toBeCloseTo(3700, 2);
+		expect(first.source).toBe("derived_inverse");
+
+		// A direct rate now becomes available for the same date/purpose; ordinary lookup must upgrade to 4050.
+		repositoryMocks.currencyRateRepository.findDirectLatestOnOrBefore.mockResolvedValue({
+			name: "FX-USD-UGX-DIRECT-4050",
+			from_currency: "USD",
+			to_currency: "UGX",
+			date: "2026-11-28",
+			for_buying: 0,
+			for_selling: 1,
+			exchange_rate: 4050,
+		});
+
+		const second = await resolveExchangeRate({
+			profileName: "POS-1",
+			company: "Example Co",
+			fromCurrency: "USD",
+			toCurrency: "UGX",
+			effectiveDate: "2026-11-28",
+			purpose: "for_selling",
+		});
+		expect(second).toMatchObject({
+			found: true,
+			rate: 4050,
+			source: "offline_cache",
+		});
+	});
+
+	it("re-queries online server after an offline miss once connectivity returns", async () => {
+		offlineMocks.isOffline.mockReturnValue(true);
+
+		const offlineMiss = await resolveExchangeRate({
+			profileName: "POS-1",
+			company: "Example Co",
+			fromCurrency: "USD",
+			toCurrency: "UGX",
+			effectiveDate: "2026-11-28",
+			purpose: "for_buying",
+		});
+		expect(offlineMiss.found).toBe(false);
+		expect(offlineMiss.rate).toBeNull();
+		expect((globalThis as any).frappe.call).not.toHaveBeenCalled();
+
+		// Connectivity returns and server has a valid 4,050 rate.
+		offlineMocks.isOffline.mockReturnValue(false);
+		(globalThis as any).frappe.call.mockResolvedValue({
+			message: {
+				found: true,
+				exchange_rate: 4050,
+				date: "2026-11-28",
+				source: "currency_exchange",
+			},
+		});
+
+		const onlineHit = await resolveExchangeRate({
+			profileName: "POS-1",
+			company: "Example Co",
+			fromCurrency: "USD",
+			toCurrency: "UGX",
+			effectiveDate: "2026-11-28",
+			purpose: "for_buying",
+		});
+		expect(onlineHit).toMatchObject({
+			found: true,
+			rate: 4050,
+			source: "currency_exchange",
+		});
+		expect((globalThis as any).frappe.call).toHaveBeenCalledTimes(1);
+	});
 });

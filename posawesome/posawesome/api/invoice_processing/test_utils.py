@@ -353,6 +353,62 @@ class TestInvoiceCurrencyRates(unittest.TestCase):
         self.assertEqual(rate, 3700.0)
         self.assertEqual(rate_date, "2026-11-28")
 
+    def test_get_latest_rate_preserves_actual_currency_exchange_date_for_stored_inverse(self):
+        orig_get_cached_doc = self.frappe.get_cached_doc
+        orig_get_exchange_rate = self.utils.get_exchange_rate
+        rows = [
+            _AttrDict(
+                name="CX-INV-OCT29",
+                date="2026-10-29",
+                from_currency="UGX",
+                to_currency="USD",
+                for_selling=0,
+                for_buying=1,
+                exchange_rate=1.0 / 3700.0,
+                creation="2026-10-29 09:00:00",
+            ),
+        ]
+        self._install_exchange_rows(rows)
+        try:
+            # Simulate ERPNext get_exchange_rate returning the scalar inverted rate without date.
+            self.utils.get_exchange_rate = lambda from_c, to_c, tx_date=None, args=None: (
+                3700.0 if (from_c, to_c) == ("USD", "UGX") else 0.0
+            )
+            self.frappe.get_cached_doc = lambda doctype, *args, **kwargs: (
+                _AttrDict(allow_stale=1, stale_days=30)
+                if doctype == "Accounts Settings"
+                else _AttrDict()
+            )
+            rate, rate_date = self.utils.get_latest_rate(
+                "USD",
+                "UGX",
+                transaction_date="2026-11-28",
+                purpose="for_selling",
+                allow_external=True,
+            )
+            self.assertAlmostEqual(rate, 3700.0, places=6)
+            # Must preserve the stored Currency Exchange date (Oct 29), never stamp Nov 28.
+            self.assertEqual(rate_date, "2026-10-29")
+
+            # When allow_stale=0 and stale_days=30, ERPNext strict date > Oct 29 must exclude Oct 29 inverse.
+            self.frappe.get_cached_doc = lambda doctype, *args, **kwargs: (
+                _AttrDict(allow_stale=0, stale_days=30)
+                if doctype == "Accounts Settings"
+                else _AttrDict()
+            )
+            stale_rate, stale_date = self.utils.get_latest_rate(
+                "USD",
+                "UGX",
+                transaction_date="2026-11-28",
+                purpose="for_selling",
+                allow_external=False,
+            )
+            self.assertIsNone(stale_rate)
+            self.assertIsNone(stale_date)
+        finally:
+            self.frappe.get_cached_doc = orig_get_cached_doc
+            self.utils.get_exchange_rate = orig_get_exchange_rate
+
 
 if __name__ == "__main__":
     unittest.main()

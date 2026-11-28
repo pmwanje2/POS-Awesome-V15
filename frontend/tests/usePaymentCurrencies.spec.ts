@@ -136,4 +136,63 @@ describe("usePaymentCurrencies", () => {
 			expect(call.purpose).toBe("for_selling");
 		}
 	});
+
+	it("matches server three-currency tender parity via tender->invoice selling rate and invoice conversion_rate", async () => {
+		const rateMap: Record<string, number> = {
+			"EUR->USD": 1.1,
+			"USD->UGX": 3700,
+			"EUR->UGX": 4200,
+		};
+		vi.mocked(resolveExchangeRate).mockImplementation(
+			async ({ fromCurrency, toCurrency }) => ({
+				found: true,
+				fromCurrency,
+				toCurrency,
+				rate:
+					fromCurrency === toCurrency
+						? 1
+						: rateMap[`${fromCurrency}->${toCurrency}`] || 0,
+				effectiveDate: "2026-11-28",
+				rateDate: "2026-11-28",
+				source:
+					fromCurrency === toCurrency ? "same_currency" : "currency_exchange",
+			}),
+		);
+
+		const invoiceDoc = ref<any>({
+			currency: "USD",
+			company: "Uganda Co",
+			company_currency: "UGX",
+			conversion_rate: 3700,
+			posting_date: "2026-11-28",
+			payments: [],
+		});
+		const posProfile = ref({
+			name: "POS-USD-UGX",
+			company: "Uganda Co",
+			currency: "USD",
+			company_currency: "UGX",
+			posa_enable_multi_currency_payments: 1,
+		});
+		const payment: any = {
+			posa_payment_currency: "EUR",
+			posa_original_amount: 10,
+		};
+		invoiceDoc.value.payments = [payment];
+
+		const { normalizePayment } = usePaymentCurrencies({
+			invoiceDoc,
+			posProfile,
+			currencyPrecision: ref(2),
+			formatFloat: (value) => Number(Number(value || 0).toFixed(2)),
+		});
+
+		const ok = await normalizePayment(payment);
+		expect(ok).toBe(true);
+		// Must match server payment_currency.py: EUR 10 * 1.1 = USD 11; USD 11 * 3700 = UGX 40,700 (not direct EUR->UGX 42,000).
+		expect(payment.amount).toBe(11);
+		expect(payment.posa_exchange_rate).toBeCloseTo(1.1, 6);
+		expect(payment.posa_company_exchange_rate).toBeCloseTo(4070, 6);
+		expect(payment.base_amount).toBe(40700);
+	});
 });
