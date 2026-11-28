@@ -1282,4 +1282,109 @@ describe("loss prevention", () => {
 			}),
 		).toEqual([]);
 	});
+
+	it("does not treat uncalculated all-zero draft [0, 0, 0] as reconciled when 0.01 net remains, while honoring ERPNext [0, 0.01, 0]", () => {
+		const buildThreeLines = (netValues: [number, number, number]) =>
+			netValues.map((netVal, idx) => ({
+				item_code: `CENT-LINE-${idx + 1}`,
+				item_name: `Cent Line ${idx + 1}`,
+				qty: 1,
+				rate: 0.01,
+				net_amount: netVal,
+				net_rate: netVal,
+				base_net_rate: netVal * 3700,
+				currency: "USD",
+				company_currency: "UGX",
+				conversion_rate: 3700,
+				valuation_rate: 10,
+			}));
+
+		// Uncalculated all-zero draft [0, 0, 0] has sum 0.00 vs expected 0.01 (1 cent off):
+		// must NOT reconcile, falling back to 0.003333 * 3700 = UGX 12.33 >= UGX 10.
+		const draftItems = buildThreeLines([0, 0, 0]);
+		const draftPct = resolveInvoiceDiscountPercentage(
+			{
+				apply_discount_on: "Net Total",
+				discount_amount: 0.02,
+				items: draftItems,
+			},
+			draftItems,
+		);
+		expect(
+			findLossRiskItems(draftItems, {
+				invoiceDiscountPercentage: draftPct,
+				applyDiscountOn: "Net Total",
+				currencyPrecision: 2,
+			}),
+		).toEqual([]);
+
+		// ERPNext calculated [0, 0.01, 0] reconciles cleanly: middle line passes (UGX 37 >= 10), outer lines fail at 0.
+		const calculatedItems = buildThreeLines([0, 0.01, 0]);
+		const calcPct = resolveInvoiceDiscountPercentage(
+			{
+				apply_discount_on: "Net Total",
+				discount_amount: 0.02,
+				items: calculatedItems,
+			},
+			calculatedItems,
+		);
+		const calcRisks = findLossRiskItems(calculatedItems, {
+			invoiceDiscountPercentage: calcPct,
+			applyDiscountOn: "Net Total",
+			currencyPrecision: 2,
+		});
+		expect(calcRisks.map((risk) => risk.itemCode)).toEqual([
+			"CENT-LINE-1",
+			"CENT-LINE-3",
+		]);
+		expect(calcRisks.every((risk) => risk.sellingRate === 0)).toBe(true);
+	});
+
+	it("includes nonzero free_item_rate promotional row in invoice Net Total discount base while keeping the promo row floor-exempt", () => {
+		const items = [
+			{
+				item_code: "PAID-100",
+				item_name: "Paid Item",
+				qty: 1,
+				rate: 100,
+				trade_price: 90,
+			},
+			{
+				item_code: "PROMO-10",
+				item_name: "Discounted Promo Item",
+				qty: 1,
+				rate: 10,
+				is_free_item: 1,
+				pricing_rules: "PR-FREE",
+				trade_price: 100,
+			},
+		];
+		const doc = {
+			apply_discount_on: "Net Total",
+			discount_amount: 11,
+			items,
+		};
+		const pct = resolveInvoiceDiscountPercentage(doc, items);
+		expect(pct).toBeCloseTo(10, 6);
+		expect(
+			findLossRiskItems(items, {
+				invoiceDiscountPercentage: pct,
+				applyDiscountOn: "Net Total",
+				currencyPrecision: 2,
+			}),
+		).toEqual([]);
+
+		// Reconciled native net amounts [90, 9] also pass against floor 90.
+		const nativeItems = [
+			{ ...items[0]!, net_amount: 90, net_rate: 90 },
+			{ ...items[1]!, net_amount: 9, net_rate: 9 },
+		];
+		expect(
+			findLossRiskItems(nativeItems, {
+				invoiceDiscountPercentage: pct,
+				applyDiscountOn: "Net Total",
+				currencyPrecision: 2,
+			}),
+		).toEqual([]);
+	});
 });

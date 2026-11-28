@@ -45,16 +45,29 @@ def _apply_order_by(rows, order_by):
 
 
 def _matches_filters(row, filters):
-    for field, expected in (filters or {}).items():
+    if isinstance(filters, dict):
+        entries = [(field, expected) for field, expected in filters.items()]
+    else:
+        entries = [
+            (entry[0], [entry[1], entry[2]]) if len(entry) == 3 else (entry[0], entry[1])
+            for entry in (filters or [])
+        ]
+    for field, expected in entries:
         actual = row.get(field)
         if isinstance(expected, list) and len(expected) == 2:
             op, target = expected
             if op == "<=":
                 if not (str(actual) <= str(target)):
                     return False
+            elif op == ">":
+                if not (str(actual) > str(target)):
+                    return False
             elif op == "between":
                 start, end = target
                 if not (str(start) <= str(actual) <= str(end)):
+                    return False
+            elif op == "=":
+                if actual != target:
                     return False
             else:
                 if actual != target:
@@ -241,6 +254,67 @@ class TestInvoiceCurrencyRates(unittest.TestCase):
         self.assertEqual(rates["conversion_rate"], 3700.0)
         self.assertEqual(rates["plc_conversion_rate"], 4500.0)
         self.assertEqual(rates["exchange_rate_date"], "2026-11-26")
+
+    def test_get_latest_rate_excludes_rate_on_exact_stale_cutoff_date(self):
+        orig_get_cached_doc = self.frappe.get_cached_doc
+        try:
+            self.frappe.get_cached_doc = lambda doctype, *args, **kwargs: (
+                _AttrDict(allow_stale=0, stale_days=3)
+                if doctype == "Accounts Settings"
+                else _AttrDict()
+            )
+            cutoff_only_rows = [
+                _AttrDict(
+                    name="CX-CUTOFF",
+                    date="2026-11-25",
+                    from_currency="USD",
+                    to_currency="UGX",
+                    for_selling=1,
+                    for_buying=0,
+                    exchange_rate=3700.0,
+                    creation="2026-11-25 09:00:00",
+                ),
+            ]
+            self._install_exchange_rows(cutoff_only_rows)
+
+            # ERPNext erpnext/setup/utils.py:86 requires date > 2026-11-25 (strict lower bound);
+            # a rate dated exactly 2026-11-25 for posting_date 2026-11-28 with stale_days=3 is stale.
+            stale_rate, stale_date = self.utils.get_latest_rate(
+                "USD",
+                "UGX",
+                transaction_date="2026-11-28",
+                purpose="for_selling",
+                allow_external=False,
+            )
+            self.assertIsNone(stale_rate)
+            self.assertIsNone(stale_date)
+
+            # A rate dated 2026-11-26 strictly exceeds the 2026-11-25 cutoff and qualifies.
+            fresh_rows = [
+                *cutoff_only_rows,
+                _AttrDict(
+                    name="CX-FRESH",
+                    date="2026-11-26",
+                    from_currency="USD",
+                    to_currency="UGX",
+                    for_selling=1,
+                    for_buying=0,
+                    exchange_rate=3710.0,
+                    creation="2026-11-26 09:00:00",
+                ),
+            ]
+            self._install_exchange_rows(fresh_rows)
+            fresh_rate, fresh_date = self.utils.get_latest_rate(
+                "USD",
+                "UGX",
+                transaction_date="2026-11-28",
+                purpose="for_selling",
+                allow_external=False,
+            )
+            self.assertEqual(fresh_rate, 3710.0)
+            self.assertEqual(fresh_date, "2026-11-26")
+        finally:
+            self.frappe.get_cached_doc = orig_get_cached_doc
 
 
 if __name__ == "__main__":

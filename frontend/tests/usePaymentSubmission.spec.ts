@@ -1534,6 +1534,103 @@ describe("usePaymentSubmission", () => {
 		);
 	});
 
+	it("overrides stale positive child-row conversion_rate with authoritative invoice header conversion_rate", async () => {
+		const buildSubmission = (sellingRate: number) => {
+			const invoiceDoc = ref<any>({
+				is_return: 0,
+				currency: "USD",
+				conversion_rate: 3700,
+				items: [
+					{
+						item_code: "STALE-CHILD-FX",
+						item_name: "Stale Child FX Item",
+						qty: 1,
+						rate: sellingRate,
+						currency: "USD",
+						company_currency: "UGX",
+						conversion_rate: 1,
+						valuation_rate: 37000,
+					},
+				],
+				payments: [
+					{ mode_of_payment: "Cash", amount: sellingRate, type: "Cash" },
+				],
+				rounded_total: sellingRate,
+				grand_total: sellingRate,
+			});
+
+			return usePaymentSubmission({
+				invoiceDoc,
+				posProfile: ref({
+					posa_below_cost_action: "Block",
+					posa_missing_cost_action: "Block",
+				}),
+				stockSettings: ref({}),
+				invoiceType: ref("Invoice"),
+				formatFloat: (value) => Number(value || 0),
+				stores: { toastStore: { show: vi.fn() } },
+				currencyPrecision: ref(2),
+				diff_payment: ref(0) as any,
+				isCashback: ref(true),
+			});
+		};
+
+		// Authoritative invoice header conversion_rate=3700 yields USD 10 floor (not USD 37,000 from stale child conversion_rate=1).
+		await expect(buildSubmission(15).validateSubmission(true)).resolves.toBe(
+			true,
+		);
+		await expect(buildSubmission(8).validateSubmission(true)).rejects.toThrow(
+			/Stale Child FX Item is selling at 8, below Warehouse Valuation 10/i,
+		);
+	});
+
+	it("allows uncalculated all-zero draft [0, 0, 0] on 3 x USD 0.01 with 0.02 discount while blocking ERPNext [0, 0.01, 0]", async () => {
+		const buildSubmission = (netValues: [number, number, number]) => {
+			const invoiceDoc = ref<any>({
+				is_return: 0,
+				currency: "USD",
+				conversion_rate: 3700,
+				apply_discount_on: "Net Total",
+				discount_amount: 0.02,
+				items: netValues.map((netVal, idx) => ({
+					item_code: `CENT-CHK-${idx + 1}`,
+					item_name: `Cent Checkout Item ${idx + 1}`,
+					qty: 1,
+					rate: 0.01,
+					net_amount: netVal,
+					net_rate: netVal,
+					base_net_rate: netVal * 3700,
+					currency: "USD",
+					company_currency: "UGX",
+					conversion_rate: 3700,
+					valuation_rate: 10,
+				})),
+				payments: [{ mode_of_payment: "Cash", amount: 0.01, type: "Cash" }],
+				rounded_total: 0.01,
+				grand_total: 0.01,
+			});
+
+			return usePaymentSubmission({
+				invoiceDoc,
+				posProfile: ref({ posa_below_cost_action: "Block" }),
+				stockSettings: ref({}),
+				invoiceType: ref("Invoice"),
+				formatFloat: (value) => Number(value || 0),
+				stores: { toastStore: { show: vi.fn() } },
+				currencyPrecision: ref(2),
+				diff_payment: ref(0) as any,
+				isCashback: ref(true),
+			});
+		};
+
+		await expect(
+			buildSubmission([0, 0, 0]).validateSubmission(true),
+		).resolves.toBe(true);
+		await expect(
+			buildSubmission([0, 0.01, 0]).validateSubmission(true),
+		).rejects.toThrow(/Cent Checkout Item 1 is selling at 0/i);
+	});
+
 	it("defers print and schedules background wait when invoice submission is queued", async () => {
 		const invoiceService = (
 			await import("../src/posapp/services/invoiceService")

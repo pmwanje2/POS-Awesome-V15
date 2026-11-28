@@ -461,6 +461,139 @@ class TestItemFetchers(unittest.TestCase):
         self.assertIsNone(row["buying_rate_currency"])
         self.assertEqual(row["buying_price_currency"], "UGX")
 
+    def test_aggregator_requests_for_buying_for_buying_fx_and_for_selling_for_selling_fx(self):
+        fx_calls = []
+        orig_get_exchange_rate = self.module.get_exchange_rate
+        orig_db_get_value = self.module.frappe.db.get_value
+        lookup_names = (
+            "_fetch_item_prices",
+            "_fetch_bin_qty",
+            "_fetch_item_meta",
+            "_fetch_uoms",
+            "_fetch_barcodes",
+            "_fetch_bom_costs",
+            "_fetch_batches",
+            "_fetch_serials",
+        )
+        originals = {name: getattr(self.module, name) for name in lookup_names}
+        try:
+            def fake_get_exchange_rate(from_curr, to_curr, transaction_date=None, args=None):
+                fx_calls.append((from_curr, to_curr, args))
+                if (from_curr, to_curr) == ("EUR", "UGX"):
+                    return 4050.0 if args == "for_buying" else 3900.0
+                if (from_curr, to_curr) == ("USD", "UGX"):
+                    return 3700.0 if args == "for_selling" else 3850.0
+                return 1.0
+
+            def fake_db_get_value(doctype, name, fieldname=None):
+                if doctype == "Company" and fieldname == "default_currency":
+                    return "UGX"
+                if doctype == "Price List" and fieldname == "currency":
+                    return {"USD Selling": "USD", "EUR Buying": "EUR"}.get(name)
+                return None
+
+            self.module.get_exchange_rate = fake_get_exchange_rate
+            self.module.frappe.db.get_value = fake_db_get_value
+            for name in lookup_names:
+                setattr(
+                    self.module,
+                    name,
+                    (lambda *_args, **_kwargs: {}) if name == "_fetch_bom_costs" else (lambda *_args, **_kwargs: []),
+                )
+
+            aggregator = self.module.ItemDetailAggregator(
+                {
+                    "name": "POS Profile FX",
+                    "company": "Test Co",
+                    "currency": "USD",
+                    "selling_price_list": "USD Selling",
+                    "buying_price_list": "EUR Buying",
+                    "warehouse": "Main Store",
+                    "posa_allow_multi_currency": 1,
+                    "posa_use_server_cache": 0,
+                }
+            )
+            aggregator._prepare_lookup(["ITEM-EUR"])
+
+            self.assertEqual(aggregator.exchange_rate, 3700.0)
+            self.assertEqual(aggregator.buying_exchange_rate, 4050.0)
+            self.assertIn(("USD", "UGX", "for_selling"), fx_calls)
+            self.assertIn(("EUR", "UGX", "for_buying"), fx_calls)
+        finally:
+            self.module.get_exchange_rate = orig_get_exchange_rate
+            self.module.frappe.db.get_value = orig_db_get_value
+            for name, original in originals.items():
+                setattr(self.module, name, original)
+
+    def test_merge_item_row_does_not_leak_unrelated_uom_buying_price_into_stock_uom_scalars(self):
+        lookup = self.module.ItemLookupData(
+            price_map={
+                "ITEM-BOX": {
+                    "Each": AttrDict(
+                        {
+                            "price_list_rate": 12.0,
+                            "currency": "USD",
+                            "price_list": "USD Selling",
+                        }
+                    )
+                }
+            },
+            buying_price_map={
+                "ITEM-BOX": {
+                    "Box": AttrDict(
+                        {
+                            "price_list_rate": 80.0,
+                            "currency": "USD",
+                            "price_list": "Standard Buying",
+                        }
+                    )
+                }
+            },
+            stock_map={"ITEM-BOX": 50},
+            meta_map={
+                "ITEM-BOX": AttrDict(
+                    {
+                        "name": "ITEM-BOX",
+                        "stock_uom": "Each",
+                        "valuation_rate": 10.0,
+                    }
+                )
+            },
+            uom_map={"ITEM-BOX": [{"uom": "Box", "conversion_factor": 10.0}]},
+            barcode_map={},
+            batch_map={},
+            serial_map={},
+            bom_map={},
+            valuation_map={"ITEM-BOX": 10.0},
+        )
+
+        # Selling in Each (or with omitted uom defaulting to stock_uom Each) must NOT receive Box buying rate 80.
+        for item_input in ({"item_code": "ITEM-BOX", "uom": "Each"}, {"item_code": "ITEM-BOX"}):
+            row = self.module.merge_item_row(
+                item_input,
+                lookup,
+                "USD",
+                exchange_rate=1.0,
+                buying_exchange_rate=1.0,
+            )
+            self.assertIsNone(row["base_buying_rate"])
+            self.assertIsNone(row["trade_price"])
+            self.assertIsNone(row["buying_rate"])
+            self.assertEqual(row["valuation_rate"], 10.0)
+            self.assertEqual(row["stock_uom"], "Each")
+            self.assertEqual(row["_buying_prices_by_uom"]["Box"]["base_price_list_rate"], 80.0)
+
+        # Selling in Box still receives the exact Box buying price of 80.
+        box_row = self.module.merge_item_row(
+            {"item_code": "ITEM-BOX", "uom": "Box"},
+            lookup,
+            "USD",
+            exchange_rate=1.0,
+            buying_exchange_rate=1.0,
+        )
+        self.assertEqual(box_row["base_buying_rate"], 80.0)
+        self.assertEqual(box_row["trade_price"], 80.0)
+
 
 if __name__ == "__main__":
     unittest.main()
