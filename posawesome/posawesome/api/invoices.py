@@ -202,13 +202,23 @@ def resolve_exchange_rate(
             "error": "from_currency and to_currency are required",
         }
 
-    rate, rate_date = get_latest_rate(
+    resolved = get_latest_rate(
         from_currency,
         to_currency,
         transaction_date=transaction_date,
         purpose=purpose,
         allow_external=cint(allow_external),
         silent=True,
+        return_source=True,
+    )
+    if len(resolved) == 3:
+        rate, rate_date, rate_source = resolved
+    else:
+        rate, rate_date = resolved
+        rate_source = "same_currency" if from_currency == to_currency else "currency_exchange"
+    source = (
+        rate_source
+        or ("same_currency" if from_currency == to_currency else "currency_exchange")
     )
     return {
         "found": bool(rate and flt(rate) > 0),
@@ -216,7 +226,8 @@ def resolve_exchange_rate(
         "to_currency": to_currency,
         "exchange_rate": flt(rate) if rate else None,
         "date": rate_date,
-        "source": "same_currency" if from_currency == to_currency else "currency_exchange",
+        "source": source,
+        "is_inverse": source == "derived_inverse",
     }
 
 

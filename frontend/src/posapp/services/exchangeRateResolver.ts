@@ -240,6 +240,9 @@ const resolveUncached = async (
 			const payload = response?.message || {};
 			const rate = positiveFinite(payload.exchange_rate);
 			if (payload.found && rate) {
+				const isDerivedInverse =
+					payload.is_inverse === true ||
+					payload.source === "derived_inverse";
 				const result: ExchangeRateResult = {
 					found: true,
 					fromCurrency: args.fromCurrency,
@@ -247,18 +250,22 @@ const resolveUncached = async (
 					rate,
 					effectiveDate: args.effectiveDate,
 					rateDate: payload.date || args.effectiveDate,
-					source: payload.source || "currency_exchange",
+					source: isDerivedInverse
+						? "derived_inverse"
+						: payload.source || "currency_exchange",
 				};
-				offlineModule.saveExchangeRateCache({
-					profileName: args.profileName,
-					company: args.company,
-					fromCurrency: args.fromCurrency,
-					toCurrency: args.toCurrency,
-					rateDate: args.effectiveDate,
-					date: result.rateDate || args.effectiveDate,
-					...(args.purpose ? { purpose: args.purpose } : {}),
-					exchange_rate: rate,
-				});
+				if (!isDerivedInverse) {
+					offlineModule.saveExchangeRateCache({
+						profileName: args.profileName,
+						company: args.company,
+						fromCurrency: args.fromCurrency,
+						toCurrency: args.toCurrency,
+						rateDate: args.effectiveDate,
+						date: result.rateDate || args.effectiveDate,
+						...(args.purpose ? { purpose: args.purpose } : {}),
+						exchange_rate: rate,
+					});
+				}
 				return { result, resolvedOffline: false };
 			}
 			onlineError = payload.error || "rate_unavailable";

@@ -136,6 +136,11 @@ export function useInvoiceCurrency() {
 		return Number.isFinite(numeric) ? numeric : null;
 	};
 
+	const parsePositiveFinite = (value: unknown): number | null => {
+		const numeric = parseFinite(value);
+		return numeric !== null && numeric > 0 ? numeric : null;
+	};
+
 	const resolveOriginalBasePriceListRate = (
 		item: any,
 		currencyContext: Record<string, any>,
@@ -292,18 +297,22 @@ export function useInvoiceCurrency() {
 			toCurrency: selected_currency.value,
 		});
 
+		const resolvedCompanyRate = companyResult.found
+			? parsePositiveFinite(companyResult.rate)
+			: null;
 		internalConversionRateUpdate = true;
 		try {
-			conversion_rate.value = companyResult.rate || 0;
+			conversion_rate.value = resolvedCompanyRate || 0;
 		} finally {
 			internalConversionRateUpdate = false;
 		}
-		if (authoritativeCompanyCurrency) {
+		if (authoritativeCompanyCurrency && resolvedCompanyRate !== null) {
 			hasExplicitConversionRate = true;
 			explicitConversionCompanyCurrency = authoritativeCompanyCurrency;
 		} else {
-			// A fallback to pos_profile.currency with no authoritative company_currency
-			// must not lock conversion_rate=1 as explicit and overwrite restored foreign rows.
+			// A fallback to pos_profile.currency with no authoritative company_currency,
+			// or a failed FX lookup (rate <= 0 / unavailable), must not lock a bogus
+			// conversion_rate as explicit and overwrite restored foreign rows.
 			hasExplicitConversionRate = false;
 			explicitConversionCompanyCurrency = "";
 		}
@@ -326,11 +335,6 @@ export function useInvoiceCurrency() {
 
 		selected_currency.value = defaultCurrency;
 		await update_currency_and_rate();
-	};
-
-	const parsePositiveFinite = (value: unknown): number | null => {
-		const numeric = parseFinite(value);
-		return numeric !== null && numeric > 0 ? numeric : null;
 	};
 
 	const resolveStrictPlcToCompanyRate = (

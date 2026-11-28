@@ -56,7 +56,22 @@ function toCanonicalPairKey(
 export async function syncCurrencyMatrixResource(
 	args: CurrencyMatrixSyncArgs,
 ): Promise<ResourceSyncResult> {
-	if (!args.watermark) {
+	const scopeSignature = buildScopeSignature(args.posProfile);
+	let existingState: any = null;
+	try {
+		const getState = (syncStateModule as any)?.getSyncResourceState;
+		if (typeof getState === "function") {
+			existingState = await getState("currency_matrix");
+		}
+	} catch {
+		// Best-effort read of prior sync state.
+	}
+	const scopeChanged = Boolean(
+		existingState?.scopeSignature &&
+			existingState.scopeSignature !== scopeSignature,
+	);
+	const effectiveWatermark = scopeChanged ? null : args.watermark || null;
+	if (!effectiveWatermark) {
 		await currencyRateRepository.clear();
 	}
 
@@ -65,36 +80,24 @@ export async function syncCurrencyMatrixResource(
 	let offset = 0;
 	let finalResponse: SyncResponse = {};
 	let priorSyncedPairs: string[] = [];
-	if (args.watermark) {
+	if (effectiveWatermark && !scopeChanged) {
 		if (Array.isArray(args.syncedCurrencyPairs)) {
 			priorSyncedPairs = args.syncedCurrencyPairs.filter(Boolean);
-		} else {
-			try {
-				const getState = (syncStateModule as any)?.getSyncResourceState;
-				if (typeof getState === "function") {
-					const existingState = await getState("currency_matrix");
-					if (Array.isArray(existingState?.syncedCurrencyPairs)) {
-						priorSyncedPairs =
-							existingState.syncedCurrencyPairs.filter(Boolean);
-					}
-				}
-			} catch {
-				// Best-effort read of prior synced pair coverage.
-			}
+		} else if (Array.isArray(existingState?.syncedCurrencyPairs)) {
+			priorSyncedPairs = existingState.syncedCurrencyPairs.filter(Boolean);
 		}
 	}
 	const acknowledgedPairs = new Set<string>(priorSyncedPairs);
 	let hasServerSyncedPairs = false;
-	const scopeSignature = buildScopeSignature(args.posProfile);
 
 	while (true) {
 		const response = await args.fetcher({
 			posProfile: args.posProfile,
 			currencyPairs: args.currencyPairs || [],
-			...(args.backfillPairs?.length
+			...(effectiveWatermark && args.backfillPairs?.length
 				? { backfillPairs: args.backfillPairs }
 				: {}),
-			watermark: args.watermark || null,
+			watermark: effectiveWatermark,
 			offset,
 			schemaVersion: args.schemaVersion,
 		});
@@ -113,14 +116,14 @@ export async function syncCurrencyMatrixResource(
 				status: "limited",
 				posProfile: args.posProfile,
 				response,
-				watermark: args.watermark,
+				watermark: effectiveWatermark,
 				syncedCurrencyPairs: [],
 			});
 			return buildResourceSyncResult(
 				"currency_matrix",
 				"limited",
 				response,
-				args.watermark,
+				effectiveWatermark,
 				{
 					scopeSignature,
 					syncedCurrencyPairs: [],
@@ -219,7 +222,7 @@ export async function syncCurrencyMatrixResource(
 		// Fallback for servers that do not return `synced_pairs`: only treat explicitly
 		// full-synced or explicitly backfilled pairs as covered (never infer coverage from
 		// opportunistic incremental rows).
-		const fallbackCoveredPairs = args.watermark
+		const fallbackCoveredPairs = effectiveWatermark
 			? args.backfillPairs || []
 			: [...(args.currencyPairs || []), ...(args.backfillPairs || [])];
 		for (const pair of fallbackCoveredPairs) {
@@ -238,14 +241,14 @@ export async function syncCurrencyMatrixResource(
 		status: "fresh",
 		posProfile: args.posProfile,
 		response: finalResponse,
-		watermark: args.watermark,
+		watermark: effectiveWatermark,
 		syncedCurrencyPairs: persistedPairs,
 	});
 	return buildResourceSyncResult(
 		"currency_matrix",
 		"fresh",
 		finalResponse,
-		args.watermark,
+		effectiveWatermark,
 		{
 			scopeSignature,
 			syncedCurrencyPairs: persistedPairs,

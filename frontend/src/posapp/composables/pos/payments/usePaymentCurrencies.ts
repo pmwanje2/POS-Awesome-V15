@@ -8,6 +8,7 @@ import {
 type PaymentCurrencyOptions = {
 	invoiceDoc: Ref<any>;
 	posProfile: Ref<any>;
+	companyCurrency?: Ref<string | null | undefined>;
 	currencyPrecision: Ref<number>;
 	formatFloat?: (value: unknown, precision?: number) => number;
 };
@@ -40,6 +41,8 @@ export function usePaymentCurrencies(options: PaymentCurrencyOptions) {
 	);
 
 	const companyCurrency = computed(() => {
+		const explicit = String(unref(options.companyCurrency) || "").trim();
+		if (explicit) return explicit;
 		const profile = unref(options.posProfile) || {};
 		const doc = unref(options.invoiceDoc) || {};
 		return (
@@ -134,25 +137,31 @@ export function usePaymentCurrencies(options: PaymentCurrencyOptions) {
 				: null;
 		const invoiceRate = await resolveRate(paymentCurrency, invoiceCurrency, manualRate);
 		const resolvedCompanyCurrency = companyCurrency.value;
+		const docConversionRate = Number(doc.conversion_rate);
+		const hasValidDocConversionRate =
+			Number.isFinite(docConversionRate) && docConversionRate > 0;
 		let invoiceToCompanyRate: number | null = null;
 		if (
+			hasValidDocConversionRate &&
+			(docConversionRate !== 1 ||
+				(invoiceCurrency &&
+					resolvedCompanyCurrency &&
+					invoiceCurrency !== resolvedCompanyCurrency))
+		) {
+			invoiceToCompanyRate = docConversionRate;
+		} else if (
 			invoiceCurrency &&
 			resolvedCompanyCurrency &&
 			invoiceCurrency === resolvedCompanyCurrency
 		) {
 			invoiceToCompanyRate = 1;
 		} else {
-			const docConversionRate = Number(doc.conversion_rate);
-			if (Number.isFinite(docConversionRate) && docConversionRate > 0) {
-				invoiceToCompanyRate = docConversionRate;
-			} else {
-				const invoiceToCompanyResult = await resolveRate(
-					invoiceCurrency,
-					resolvedCompanyCurrency,
-				);
-				if (invoiceToCompanyResult.found && invoiceToCompanyResult.rate) {
-					invoiceToCompanyRate = invoiceToCompanyResult.rate;
-				}
+			const invoiceToCompanyResult = await resolveRate(
+				invoiceCurrency,
+				resolvedCompanyCurrency,
+			);
+			if (invoiceToCompanyResult.found && invoiceToCompanyResult.rate) {
+				invoiceToCompanyRate = invoiceToCompanyResult.rate;
 			}
 		}
 		const derivedCompanyRate =

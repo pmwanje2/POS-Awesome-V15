@@ -121,22 +121,25 @@ def get_latest_rate(
     purpose=None,
     allow_external=True,
     silent=False,
+    return_source=False,
 ):
     """Return the latest ERPNext-valid rate on or before ``transaction_date``.
 
     ``purpose`` may be ``for_buying`` or ``for_selling``. Optional POS lookups
     use ``silent=True`` so ERPNext's external-rate fallback cannot add repeated
-    desk messages when a rate is unavailable.
+    desk messages when a rate is unavailable. When ``return_source=True``,
+    returns ``(rate, rate_date, source)`` where ``source`` distinguishes
+    ``"same_currency"``, ``"currency_exchange"``, and ``"derived_inverse"``.
     """
     transaction_date = getdate(transaction_date or nowdate())
     if from_currency == to_currency:
-        result = 1.0, transaction_date
-        if cache is not None:
+        result = (1.0, transaction_date, "same_currency") if return_source else (1.0, transaction_date)
+        if cache is not None and not return_source:
             cache[(from_currency, to_currency, str(transaction_date), purpose)] = result
         return result
 
-    if cache is not None:
-        key = (from_currency, to_currency, str(transaction_date), purpose)
+    key = (from_currency, to_currency, str(transaction_date), purpose)
+    if cache is not None and not return_source:
         if key in cache:
             return cache[key]
 
@@ -186,6 +189,7 @@ def get_latest_rate(
         if direct_row
         else 0.0
     )
+    rate_source = None
     if direct_row and direct_rate > 0:
         row_date = (
             direct_row.get("date")
@@ -193,6 +197,7 @@ def get_latest_rate(
             else getattr(direct_row, "date", None)
         )
         result = direct_rate, row_date
+        rate_source = "currency_exchange"
     else:
         # Mirror ERPNext erpnext/setup/utils.py:124-134: when no direct Currency Exchange
         # record exists, check stored inverse rows with the opposite purpose so we preserve
@@ -245,6 +250,7 @@ def get_latest_rate(
                 else getattr(reverse_row, "date", None)
             )
             result = flt(1.0 / reverse_rate), reverse_date
+            rate_source = "derived_inverse"
         elif allow_external:
             message_log = getattr(frappe, "message_log", None)
             message_count = len(message_log) if isinstance(message_log, list) else None
@@ -259,13 +265,19 @@ def get_latest_rate(
                     flags.mute_messages = old_mute
                 if silent and message_count is not None:
                     del message_log[message_count:]
-            result = (flt(rate), transaction_date) if flt(rate) > 0 else (None, None)
+            if flt(rate) > 0:
+                result = flt(rate), transaction_date
+                rate_source = "currency_exchange"
+            else:
+                result = None, None
         else:
             result = None, None
 
-    if cache is not None:
+    if cache is not None and not return_source:
         cache[key] = result
 
+    if return_source:
+        return result[0], result[1], rate_source
     return result
 
 

@@ -129,12 +129,25 @@ def _enrich_je_accounts_with_currency(company, accounts, posting_date):
             continue
         multi_currency = 1
         if not row.get("exchange_rate"):
+            raw_rate = None
             try:
-                row["exchange_rate"] = frappe.utils.flt(
-                    get_exchange_rate(account_currency, company_currency, posting_date, "for_selling")
-                ) or 1
+                raw_rate = get_exchange_rate(
+                    account_currency, company_currency, posting_date, "for_selling"
+                )
             except Exception:
-                row["exchange_rate"] = 1
+                raw_rate = None
+            flt_fn = getattr(getattr(frappe, "utils", None), "flt", None)
+            try:
+                rate = flt_fn(raw_rate) if callable(flt_fn) else float(raw_rate or 0)
+            except Exception:
+                rate = 0.0
+            if rate <= 0:
+                frappe.throw(
+                    frappe._(
+                        "No selling exchange rate is available for {0} to {1} on {2}."
+                    ).format(account_currency, company_currency, posting_date)
+                )
+            row["exchange_rate"] = rate
     return multi_currency
 
 

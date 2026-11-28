@@ -492,6 +492,11 @@ export default {
 				pos_profile.value?.currency ||
 				"",
 		);
+		const exchangeRatePurpose = computed(() =>
+			paymentEntryType.value === "Pay" || partyType.value === "Supplier"
+				? "for_buying"
+				: "for_selling",
+		);
 		const requiresExchangeRate = computed(
 			() => invoiceTotalCurrency.value !== companyCurrencyLocal.value,
 		);
@@ -726,16 +731,12 @@ export default {
 				companyCurrency.value =
 					r.message?.default_currency ||
 					pos_profile.value?.company_currency ||
-					selected_invoices.value.find((inv) => inv?.company_currency)?.company_currency ||
-					pos_profile.value?.currency ||
-					"";
+					null;
 			} catch (e) {
 				console.error("Failed to fetch company currency", e);
 				companyCurrency.value =
 					pos_profile.value?.company_currency ||
-					selected_invoices.value.find((inv) => inv?.company_currency)?.company_currency ||
-					pos_profile.value?.currency ||
-					"";
+					null;
 			}
 		};
 
@@ -756,7 +757,7 @@ export default {
 					fromCurrency: invoiceTotalCurrency.value,
 					toCurrency: companyCurrencyLocal.value,
 					effectiveDate: postingDate.value || getTodayDate(),
-					purpose: "for_selling",
+					purpose: exchangeRatePurpose.value,
 				});
 				if (!result.found || !result.rate) throw new Error(__("Exchange rate unavailable"));
 				exchangeRate.value = result.rate;
@@ -797,7 +798,7 @@ export default {
 				company: company.value,
 				fromCurrency: paymentCurrency,
 				effectiveDate: postingDate.value || getTodayDate(),
-				purpose: "for_selling",
+				purpose: exchangeRatePurpose.value,
 			};
 			const [invoiceResult, companyResult] = await Promise.all([
 				resolveExchangeRate({ ...common, toCurrency: invoiceTotalCurrency.value }),
@@ -815,7 +816,12 @@ export default {
 		};
 
 		watch(
-			() => payment_methods.value.map((m) => [m.mode_of_payment, m.amount, m.bank_account, getPaymentMethodCurrency(m.mode_of_payment)]),
+			() => [
+				companyCurrencyLocal.value,
+				invoiceTotalCurrency.value,
+				exchangeRatePurpose.value,
+				...payment_methods.value.map((m) => [m.mode_of_payment, m.amount, m.bank_account, getPaymentMethodCurrency(m.mode_of_payment)]),
+			],
 			() => payment_methods.value.forEach((method) => void resolvePaymentMethodRate(method)),
 			{ deep: true },
 		);
@@ -830,7 +836,7 @@ export default {
 				fromCurrency,
 				toCurrency,
 				effectiveDate: postingDate.value || getTodayDate(),
-				purpose: "for_selling",
+				purpose: exchangeRatePurpose.value,
 			});
 			row._rate_error = !result.found;
 			row.invoice_equivalent = result.rate ? flt(row?.[amountField] || 0) * result.rate : 0;
@@ -839,6 +845,7 @@ export default {
 		watch(
 			() => [
 				invoiceTotalCurrency.value,
+				exchangeRatePurpose.value,
 				...selected_payments.value.map((row) => `${row.name}:${row.unallocated_amount}:${row.currency}`),
 				...selected_mpesa_payments.value.map((row) => `${row.name}:${row.amount}:${row.currency}`),
 			],
@@ -973,7 +980,6 @@ export default {
 			companyCurrency.value =
 				data.company?.default_currency ||
 				data.pos_profile?.company_currency ||
-				data.pos_profile?.currency ||
 				null;
 			uiStore.setRegisterData(data);
 			proxy?.eventBus?.emit("payments_register_pos_profile", data);
@@ -1309,8 +1315,9 @@ export default {
 		});
 
 		watch(invoiceTotalCurrency, fetchExchangeRate, { immediate: true });
-		watch(companyCurrency, fetchExchangeRate, { immediate: true });
+		watch(companyCurrencyLocal, fetchExchangeRate, { immediate: true });
 		watch(postingDate, fetchExchangeRate, { immediate: true });
+		watch(exchangeRatePurpose, fetchExchangeRate, { immediate: true });
 		watch([paymentRouteTarget, outstanding_invoices], () => {
 			applyPaymentRouteTarget();
 		});

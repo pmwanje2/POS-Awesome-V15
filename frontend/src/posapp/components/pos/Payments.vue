@@ -758,6 +758,7 @@ const {
 } = usePaymentCurrencies({
 	invoiceDoc: computed(() => invoiceStore.invoiceDoc),
 	posProfile: pos_profile,
+	companyCurrency,
 	currencyPrecision: currency_precision,
 	formatFloat: (value, precision) => flt(value, precision),
 });

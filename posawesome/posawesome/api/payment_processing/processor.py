@@ -1053,8 +1053,6 @@ def process_pos_payment(payload):
                         )
                     inv_outstanding_party = outstanding_amount
 
-                    inv_total_party = total_amount
-
                     if inv_outstanding_party <= 0:
                         continue
 

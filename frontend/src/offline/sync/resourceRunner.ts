@@ -12,7 +12,10 @@ import {
 import { syncInvoiceOutboxResource } from "../invoiceOutbox";
 import { db } from "../db";
 import { getCachedPriceListMeta, getOpeningStorage } from "../cache";
-import type { SyncScopedProfile } from "./adapters/common";
+import {
+	buildScopeSignature,
+	type SyncScopedProfile,
+} from "./adapters/common";
 import type {
 	SyncResourceDefinition,
 	SyncResourceId,
@@ -186,12 +189,18 @@ async function runSupportedOfflineSyncResourceOnce({
 	callOfflineSyncMethod,
 }: RunSupportedOfflineSyncResourceArgs) {
 	const persistedState = await getPersistedState(resource.id);
+	const currentScopeSignature = buildScopeSignature(posProfile);
+	const scopeChanged = Boolean(
+		persistedState?.scopeSignature &&
+			persistedState.scopeSignature !== currentScopeSignature,
+	);
+	const scopedPersistedState = scopeChanged ? null : persistedState;
 	const sharedArgs = {
 		posProfile,
-		watermark: getPersistedWatermark(persistedState),
+		watermark: getPersistedWatermark(scopedPersistedState),
 		// Resource endpoints evolve independently. Persisted server state is the
 		// protocol authority; a global frontend date cannot represent them all.
-		schemaVersion: persistedState?.schemaVersion || null,
+		schemaVersion: scopedPersistedState?.schemaVersion || null,
 	};
 
 	switch (resource.id) {
@@ -225,8 +234,8 @@ async function runSupportedOfflineSyncResourceOnce({
 			const discoveredCurrencyPairs =
 				await collectCurrencyMatrixPairs(posProfile);
 			const previousSyncedPairs = new Set(
-				Array.isArray(persistedState?.syncedCurrencyPairs)
-					? persistedState.syncedCurrencyPairs.filter(Boolean)
+				Array.isArray(scopedPersistedState?.syncedCurrencyPairs)
+					? scopedPersistedState.syncedCurrencyPairs.filter(Boolean)
 					: [],
 			);
 			const backfillPairs = sharedArgs.watermark
@@ -243,8 +252,11 @@ async function runSupportedOfflineSyncResourceOnce({
 					? { currencyPairs: discoveredCurrencyPairs }
 					: {}),
 				...(backfillPairs.length ? { backfillPairs } : {}),
-				...(Array.isArray(persistedState?.syncedCurrencyPairs)
-					? { syncedCurrencyPairs: persistedState.syncedCurrencyPairs }
+				...(Array.isArray(scopedPersistedState?.syncedCurrencyPairs)
+					? {
+							syncedCurrencyPairs:
+								scopedPersistedState.syncedCurrencyPairs,
+						}
 					: {}),
 				fetcher: ({
 					posProfile,

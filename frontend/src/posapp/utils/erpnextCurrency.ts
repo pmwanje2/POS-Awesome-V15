@@ -1,9 +1,13 @@
 type CurrencyLikeContext = {
+	company_currency?: string | null;
 	company?: { default_currency?: string } | null;
 	pos_profile?: {
 		currency?: string;
 		company?: string;
 		company_currency?: string;
+	} | null;
+	invoice_doc?: {
+		company_currency?: string | null;
 	} | null;
 	currency?: string | null;
 	selected_currency?: string | null;
@@ -21,8 +25,10 @@ const asNumber = (value: unknown, fallback = 1): number => {
 export const getCompanyCurrency = (
 	context: CurrencyLikeContext,
 ): string | undefined =>
+	context?.company_currency ||
 	context?.company?.default_currency ||
 	context?.pos_profile?.company_currency ||
+	context?.invoice_doc?.company_currency ||
 	context?.pos_profile?.currency;
 
 export const getSelectedCurrency = (

@@ -227,7 +227,7 @@ def get_outstanding_invoices(
                     "for_buying" if party_type == "Supplier" else "for_selling",
                 )
                 if party_to_inv:
-                    outstanding_in_invoice_currency = flt(outstanding_amount / party_to_inv, precision)
+                    outstanding_in_invoice_currency = flt(outstanding_amount * party_to_inv, precision)
                 else:
                     outstanding_in_invoice_currency = flt(outstanding_amount / conversion_rate, precision) if conversion_rate > 0 else outstanding_amount
             invoice_total = flt(
