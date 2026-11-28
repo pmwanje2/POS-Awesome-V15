@@ -455,4 +455,71 @@ describe("exchange rate resolver", () => {
 		});
 		expect((globalThis as any).frappe.call).toHaveBeenCalledTimes(1);
 	});
+
+	it("does not cache a server-derived inverse as direct so the next ordinary lookup upgrades to a new direct quote", async () => {
+		const warmCache = new Map<string, any>();
+		offlineMocks.saveExchangeRateCache.mockImplementation((entry: any) => {
+			warmCache.set(
+				`${entry.profileName}::${entry.fromCurrency}->${entry.toCurrency}::${entry.purpose || ""}`,
+				entry,
+			);
+		});
+		offlineMocks.getCachedExchangeRate.mockImplementation((query: any) => {
+			return (
+				warmCache.get(
+					`${query.profileName}::${query.fromCurrency}->${query.toCurrency}::${query.purpose || ""}`,
+				) || null
+			);
+		});
+
+		(globalThis as any).frappe.call
+			.mockResolvedValueOnce({
+				message: {
+					found: true,
+					exchange_rate: 3700,
+					date: "2026-11-28",
+					source: "derived_inverse",
+					is_inverse: true,
+				},
+			})
+			.mockResolvedValueOnce({
+				message: {
+					found: true,
+					exchange_rate: 4050,
+					date: "2026-11-28",
+					source: "currency_exchange",
+					is_inverse: false,
+				},
+			});
+
+		const first = await resolveExchangeRate({
+			profileName: "POS-1",
+			company: "Uganda Co",
+			fromCurrency: "USD",
+			toCurrency: "UGX",
+			effectiveDate: "2026-11-28",
+			purpose: "for_selling",
+		});
+		expect(first).toMatchObject({
+			found: true,
+			rate: 3700,
+			source: "derived_inverse",
+		});
+
+		// Second ordinary lookup (no forceRefresh) must re-query and upgrade to direct 4,050.
+		const second = await resolveExchangeRate({
+			profileName: "POS-1",
+			company: "Uganda Co",
+			fromCurrency: "USD",
+			toCurrency: "UGX",
+			effectiveDate: "2026-11-28",
+			purpose: "for_selling",
+		});
+		expect(second).toMatchObject({
+			found: true,
+			rate: 4050,
+			source: "currency_exchange",
+		});
+		expect((globalThis as any).frappe.call).toHaveBeenCalledTimes(2);
+	});
 });

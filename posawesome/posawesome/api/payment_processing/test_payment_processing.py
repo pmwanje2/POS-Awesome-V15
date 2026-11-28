@@ -2054,6 +2054,56 @@ class TestPosPaymentProcessing(unittest.TestCase):
         for _from_c, _to_c, purpose in captured_purposes:
             self.assertEqual(purpose, "for_selling")
 
+    @patch("posawesome.posawesome.api.payment_processing.data.get_exchange_rate")
+    @patch("posawesome.posawesome.api.payment_processing.data.frappe")
+    def test_get_outstanding_invoices_multiplies_third_currency_forward_rate(
+        self,
+        mock_frappe,
+        mock_get_exchange_rate,
+    ):
+        mock_frappe._dict.side_effect = lambda value: AttrDict(value)
+        mock_frappe.get_precision.return_value = 2
+
+        def fake_get_cached_value(doctype, name, fieldname):
+            if doctype == "Company" and fieldname == "default_currency":
+                return "UGX"
+            if doctype == "Customer" and fieldname == "customer_name":
+                return "Euro Debtor"
+            return None
+
+        mock_frappe.get_cached_value.side_effect = fake_get_cached_value
+        mock_frappe.get_list.return_value = [
+            AttrDict(
+                {
+                    "name": "SINV-3CCY-0001",
+                    "posting_date": "2026-11-28",
+                    "due_date": "2026-12-05",
+                    "outstanding_amount": 10.0,
+                    "conversion_rate": 3700.0,
+                    "rounded_total": 11.0,
+                    "grand_total": 11.0,
+                    "currency": "USD",
+                    "party_account_currency": "EUR",
+                    "pos_profile": "POS-USD",
+                    "customer_name": "Euro Debtor",
+                }
+            )
+        ]
+        # Forward rate: 1 EUR = 1.1 USD -> EUR 10 outstanding = USD 11.00 (not 10 / 1.1 = 9.09).
+        mock_get_exchange_rate.return_value = 1.1
+
+        rows = self.data.get_outstanding_invoices(
+            customer="CUST-EUR",
+            company="Uganda Co",
+            currency="USD",
+            pos_profile="POS-USD",
+            include_all_currencies=True,
+        )
+
+        self.assertEqual(len(rows), 1)
+        mock_get_exchange_rate.assert_called_once_with("EUR", "USD", "2026-11-28", "for_selling")
+        self.assertAlmostEqual(rows[0]["outstanding_amount_in_invoice_currency"], 11.0, places=2)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -585,4 +585,94 @@ describe("invoice offline fallbacks", () => {
 				?.belowCost,
 		).toBe(true);
 	});
+
+	it("does not lock conversion_rate=0 as explicit after a failed empty-cart FX lookup and preserves a restored foreign row rate", async () => {
+		const { db } = await import("../src/offline/db");
+		if (!db.isOpen()) await db.open();
+		await db.table("currency_rate_records").clear();
+
+		const { useUIStore } = await import("../src/posapp/stores/uiStore");
+		const { useInvoiceStore } = await import("../src/posapp/stores/invoiceStore");
+		const { useInvoiceCurrency } = await import(
+			"../src/posapp/composables/pos/invoice/useInvoiceCurrency"
+		);
+		const { getItemLossRisk } = await import(
+			"../src/posapp/utils/lossPrevention"
+		);
+		const { clearExchangeRateResolverCache } = await import(
+			"../src/posapp/services/exchangeRateResolver"
+		);
+		clearExchangeRateResolverCache();
+
+		const prevCall = (globalThis as any).frappe.call;
+		(globalThis as any).frappe.call = vi.fn(async () => ({
+			message: { found: false, exchange_rate: null, error: "rate_unavailable" },
+		}));
+
+		try {
+			const uiStore = useUIStore();
+			const invoiceStore = useInvoiceStore();
+			invoiceStore.clear();
+
+			uiStore.setCompanyDoc(null);
+			uiStore.setPosProfile({
+				name: "POS-USD-UGX-NOQUOTE",
+				company: "Uganda Co",
+				currency: "USD",
+				company_currency: "UGX",
+				selling_price_list: "USD Selling",
+				posa_decimal_precision: "2",
+			} as any);
+
+			const invoiceCurrency = useInvoiceCurrency();
+			invoiceCurrency.selected_currency.value = "USD";
+			invoiceCurrency.price_list_currency.value = "USD";
+			await invoiceCurrency.update_currency_and_rate();
+			expect(invoiceCurrency.conversion_rate.value).toBe(0);
+
+			invoiceStore.addItem({
+				item_code: "ITEM-PARKED-NOQUOTE",
+				qty: 1,
+				rate: 10.5,
+				price_list_rate: 10.5,
+				original_rate: 10.5,
+				original_currency: "USD",
+				currency: "USD",
+				company_currency: "UGX",
+				conversion_rate: 3700,
+				buying_price_list: "USD Buying",
+				buying_price_currency: "USD",
+				buying_exchange_rate: 4050,
+				base_buying_rate: 40500,
+				_buying_prices_by_uom: {
+					Nos: {
+						price_list_rate: 10,
+						base_price_list_rate: 40500,
+						currency: "USD",
+						price_list: "USD Buying",
+					},
+				},
+				uom: "Nos",
+				stock_uom: "Nos",
+				conversion_factor: 1,
+				discount_amount: 0,
+				base_discount_amount: 0,
+				amount: 10.5,
+				posa_row_id: "row-parked-noquote",
+			} as any);
+
+			await invoiceCurrency.update_item_rates();
+
+			expect(invoiceStore.items[0].company_currency).toBe("UGX");
+			expect(invoiceStore.items[0].conversion_rate).toBe(3700);
+			expect(invoiceStore.items[0].base_rate).toBeCloseTo(10.5 * 3700, 2);
+			expect(invoiceCurrency.conversion_rate.value).toBe(3700);
+			expect(
+				getItemLossRisk(invoiceStore.items[0], { currencyPrecision: 2 })
+					?.belowCost,
+			).toBe(true);
+		} finally {
+			(globalThis as any).frappe.call = prevCall;
+		}
+	});
 });

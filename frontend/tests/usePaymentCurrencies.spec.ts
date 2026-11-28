@@ -195,4 +195,86 @@ describe("usePaymentCurrencies", () => {
 		expect(payment.posa_company_exchange_rate).toBeCloseTo(4070, 6);
 		expect(payment.base_amount).toBe(40700);
 	});
+
+	it("preserves invoice conversion_rate and accepts explicit companyCurrency on three-currency tenders when doc and profile omit company_currency", async () => {
+		const rateMap: Record<string, number> = {
+			"EUR->USD": 1.1,
+			"USD->UGX": 3700,
+			"EUR->UGX": 4200,
+		};
+		vi.mocked(resolveExchangeRate).mockImplementation(
+			async ({ fromCurrency, toCurrency }) => ({
+				found: true,
+				fromCurrency,
+				toCurrency,
+				rate:
+					fromCurrency === toCurrency
+						? 1
+						: rateMap[`${fromCurrency}->${toCurrency}`] || 0,
+				effectiveDate: "2026-11-28",
+				rateDate: "2026-11-28",
+				source:
+					fromCurrency === toCurrency ? "same_currency" : "currency_exchange",
+			}),
+		);
+
+		// Neither invoiceDoc nor posProfile sets company_currency; only invoice conversion_rate=3700 is present.
+		const invoiceDoc = ref<any>({
+			currency: "USD",
+			company: "Uganda Co",
+			conversion_rate: 3700,
+			posting_date: "2026-11-28",
+			payments: [],
+		});
+		const posProfile = ref({
+			name: "POS-USD-OMITTED-CO",
+			company: "Uganda Co",
+			currency: "USD",
+			posa_enable_multi_currency_payments: 1,
+		});
+		const payment: any = {
+			posa_payment_currency: "EUR",
+			posa_original_amount: 10,
+		};
+		invoiceDoc.value.payments = [payment];
+
+		const { normalizePayment } = usePaymentCurrencies({
+			invoiceDoc,
+			posProfile,
+			currencyPrecision: ref(2),
+			formatFloat: (value) => Number(Number(value || 0).toFixed(2)),
+		});
+
+		const ok = await normalizePayment(payment);
+		expect(ok).toBe(true);
+		expect(payment.amount).toBe(11);
+		expect(payment.posa_company_exchange_rate).toBeCloseTo(4070, 6);
+		expect(payment.base_amount).toBe(40700);
+
+		// Also verify explicit companyCurrency ref (wired from Payments.vue) resolves USD->UGX when conversion_rate is absent.
+		const invoiceWithoutRate = ref<any>({
+			currency: "USD",
+			company: "Uganda Co",
+			posting_date: "2026-11-28",
+			payments: [],
+		});
+		const payment2: any = {
+			posa_payment_currency: "EUR",
+			posa_original_amount: 10,
+		};
+		const { normalizePayment: normalizeWithExplicitCompany } =
+			usePaymentCurrencies({
+				invoiceDoc: invoiceWithoutRate,
+				posProfile,
+				companyCurrency: ref("UGX"),
+				currencyPrecision: ref(2),
+				formatFloat: (value) => Number(Number(value || 0).toFixed(2)),
+			} as any);
+
+		const ok2 = await normalizeWithExplicitCompany(payment2);
+		expect(ok2).toBe(true);
+		expect(payment2.amount).toBe(11);
+		expect(payment2.posa_company_exchange_rate).toBeCloseTo(4070, 6);
+		expect(payment2.base_amount).toBe(40700);
+	});
 });

@@ -574,6 +574,55 @@ class TestGiftCardApi(unittest.TestCase):
             "2190 - Gift Card Liability - TC",
         )
 
+    def test_enrich_je_accounts_fails_closed_when_foreign_selling_rate_is_missing(self):
+        frappe_mod = sys.modules["frappe"]
+        erpnext_utils = sys.modules["erpnext.setup.utils"]
+        orig_get_cached_value = frappe_mod.get_cached_value
+        orig_get_exchange_rate = erpnext_utils.get_exchange_rate
+        orig_utils = frappe_mod.utils
+        captured_calls = []
+
+        try:
+            frappe_mod.utils = types.SimpleNamespace(
+                now_datetime=lambda: "2026-04-05 12:00:00",
+                flt=lambda value, *_args, **_kwargs: float(value or 0),
+            )
+            frappe_mod.get_cached_value = lambda doctype, name, fieldname: (
+                "UGX"
+                if doctype == "Company" and fieldname == "default_currency"
+                else "USD"
+                if doctype == "Account" and fieldname == "account_currency"
+                else None
+            )
+
+            def missing_selling_rate(from_c, to_c, tx_date, args=None):
+                captured_calls.append((from_c, to_c, tx_date, args))
+                return 0
+
+            erpnext_utils.get_exchange_rate = missing_selling_rate
+
+            accounts = [{"account": "1110 - Cash USD - TC", "debit_in_account_currency": 10}]
+            with self.assertRaisesRegex(Exception, "No selling exchange rate"):
+                self.module._enrich_je_accounts_with_currency("Test Company", accounts, "2026-11-28")
+
+            self.assertEqual(captured_calls, [("USD", "UGX", "2026-11-28", "for_selling")])
+            self.assertNotEqual(accounts[0].get("exchange_rate"), 1)
+
+            # When a positive selling rate exists, it is populated directly.
+            erpnext_utils.get_exchange_rate = lambda from_c, to_c, tx_date, args=None: (
+                3700.0 if args == "for_selling" else 4050.0
+            )
+            valid_accounts = [{"account": "1110 - Cash USD - TC", "debit_in_account_currency": 10}]
+            multi = self.module._enrich_je_accounts_with_currency(
+                "Test Company", valid_accounts, "2026-11-28"
+            )
+            self.assertEqual(multi, 1)
+            self.assertEqual(valid_accounts[0]["exchange_rate"], 3700.0)
+        finally:
+            frappe_mod.get_cached_value = orig_get_cached_value
+            erpnext_utils.get_exchange_rate = orig_get_exchange_rate
+            frappe_mod.utils = orig_utils
+
 
 if __name__ == "__main__":
     unittest.main()

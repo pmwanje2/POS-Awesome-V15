@@ -480,4 +480,58 @@ describe("offline sync resource runner", () => {
 			}),
 		);
 	});
+
+	it("resets watermark and syncedCurrencyPairs when switching to a different POS profile scope", async () => {
+		if (!db.isOpen()) {
+			await db.open();
+		}
+		await db.table("pos_profiles").clear();
+		await db.table("item_price_records").clear();
+		await db.table("pos_profiles").put({
+			name: "POS-NEW",
+			company: "Uganda Co",
+			currency: "USD",
+			company_currency: "UGX",
+			selling_price_list: "USD Selling",
+		});
+
+		const callOfflineSyncMethod = vi.fn(async () => ({
+			changes: [],
+			deleted: [],
+			has_more: false,
+			next_watermark: "2026-04-09T11:00:00",
+		}));
+
+		await runSupportedOfflineSyncResource({
+			resource: { id: "currency_matrix" } as any,
+			posProfile: {
+				name: "POS-NEW",
+				company: "Uganda Co",
+				currency: "USD",
+				selling_price_list: "USD Selling",
+			},
+			schemaVersion: "2026-04-09",
+			getPersistedState: vi.fn(async () => ({
+				resourceId: "currency_matrix",
+				status: "fresh",
+				lastSyncedAt: "2026-04-09T10:10:00",
+				watermark: "2026-04-09T10:10:00",
+				lastSuccessHash: null,
+				lastError: null,
+				consecutiveFailures: 0,
+				scopeSignature: JSON.stringify({
+					profile: "POS-OLD",
+					company: "Uganda Co",
+					warehouse: null,
+				}),
+				schemaVersion: "2026-04-09",
+				syncedCurrencyPairs: ["UGX::USD", "USD::UGX"],
+			})) as any,
+			callOfflineSyncMethod,
+		});
+
+		const syncCall = adapterMocks.syncCurrencyMatrixResource.mock.calls[0]?.[0];
+		expect(syncCall?.watermark).toBeNull();
+		expect(syncCall?.syncedCurrencyPairs).toBeUndefined();
+	});
 });

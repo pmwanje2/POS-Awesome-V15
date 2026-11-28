@@ -123,6 +123,7 @@ describe("PayView.vue company currency & selling FX resolution", () => {
 			payment_methods_list,
 		);
 
+		const exchangeRatePurpose = computed(() => "for_selling");
 		const fetchExchangeRate = new Function(
 			"exchangeRateLoading",
 			"requiresExchangeRate",
@@ -136,6 +137,7 @@ describe("PayView.vue company currency & selling FX resolution", () => {
 			"postingDate",
 			"getTodayDate",
 			"__",
+			"exchangeRatePurpose",
 			`return async () => { ${fetchExchangeBody} };`,
 		)(
 			exchangeRateLoading,
@@ -150,6 +152,7 @@ describe("PayView.vue company currency & selling FX resolution", () => {
 			postingDate,
 			() => "2026-11-28",
 			(s: string) => s,
+			exchangeRatePurpose,
 		);
 
 		const frappeStub = {
@@ -195,5 +198,306 @@ describe("PayView.vue company currency & selling FX resolution", () => {
 		// If fetchCompanyCurrency fails offline, it must keep pos_profile.company_currency ("UGX"), never overwrite with "USD".
 		await fetchCompanyCurrency();
 		expect(companyCurrency.value).toBe("UGX");
+	});
+
+	it("does not shadow selected invoice company_currency with pos_profile.currency when opening data omits companyDoc and profile.company_currency", async () => {
+		const applyOpeningBody = extractBlock(
+			payViewSource,
+			/\bconst applyOpeningData\s*=\s*async\s*\(data\)\s*=>\s*\{/,
+			"applyOpeningData",
+		);
+		const fetchExchangeBody = extractBlock(
+			payViewSource,
+			/\bconst fetchExchangeRate\s*=\s*async\s*\(\)\s*=>\s*\{/,
+			"fetchExchangeRate",
+		);
+		const companyCurrencyLocalExpr = extractExpression(
+			payViewSource,
+			/\bconst companyCurrencyLocal\s*=\s*computed\(\s*/,
+			"companyCurrencyLocal",
+		);
+
+		const pos_profile = ref<any>(null);
+		const pos_opening_shift = ref<any>(null);
+		const company = ref<string>("");
+		const companyCurrency = ref<string | null>(null);
+		const selected_invoices = ref<any[]>([]);
+		const invoiceTotalCurrency = computed(
+			() => selected_invoices.value[0]?.currency || pos_profile.value?.currency || "",
+		);
+		const exchangeRate = ref<number | null>(null);
+		const exchangeRateLoading = ref(false);
+		const exchangeRateError = ref<string | null>(null);
+		const postingDate = ref("2026-11-28");
+		const payment_methods_list = ref<string[]>([]);
+
+		const companyCurrencyLocal = new Function(
+			"computed",
+			"companyCurrency",
+			"pos_profile",
+			"selected_invoices",
+			`return computed(${companyCurrencyLocalExpr});`,
+		)(computed, companyCurrency, pos_profile, selected_invoices);
+		const requiresExchangeRate = computed(
+			() => invoiceTotalCurrency.value !== companyCurrencyLocal.value,
+		);
+		const exchangeRatePurpose = computed(() => "for_selling");
+
+		const resolveExchangeRate = vi.fn(async ({ fromCurrency, toCurrency }) => ({
+			found: true,
+			fromCurrency,
+			toCurrency,
+			rate: fromCurrency === toCurrency ? 1 : 3700,
+			effectiveDate: "2026-11-28",
+			rateDate: "2026-11-28",
+			source: fromCurrency === toCurrency ? "same_currency" : "currency_exchange",
+		}));
+
+		const applyOpeningData = new Function(
+			"pos_profile",
+			"pos_opening_shift",
+			"company",
+			"companyCurrency",
+			"uiStore",
+			"proxy",
+			"set_payment_methods",
+			"loadPaymentMethodCurrencies",
+			"payment_methods_list",
+			`return async (data) => { ${applyOpeningBody} };`,
+		)(
+			pos_profile,
+			pos_opening_shift,
+			company,
+			companyCurrency,
+			{ setRegisterData: vi.fn() },
+			{ eventBus: { emit: vi.fn() } },
+			vi.fn(),
+			vi.fn(async () => undefined),
+			payment_methods_list,
+		);
+
+		const fetchExchangeRate = new Function(
+			"exchangeRateLoading",
+			"requiresExchangeRate",
+			"exchangeRate",
+			"invoiceTotalCurrency",
+			"companyCurrencyLocal",
+			"exchangeRateError",
+			"resolveExchangeRate",
+			"pos_profile",
+			"company",
+			"postingDate",
+			"getTodayDate",
+			"__",
+			"exchangeRatePurpose",
+			`return async () => { ${fetchExchangeBody} };`,
+		)(
+			exchangeRateLoading,
+			requiresExchangeRate,
+			exchangeRate,
+			invoiceTotalCurrency,
+			companyCurrencyLocal,
+			exchangeRateError,
+			resolveExchangeRate,
+			pos_profile,
+			company,
+			postingDate,
+			() => "2026-11-28",
+			(s: string) => s,
+			exchangeRatePurpose,
+		);
+
+		// Open USD till with neither companyDoc nor pos_profile.company_currency.
+		await applyOpeningData({
+			pos_profile: {
+				name: "POS-USD-NO-CO",
+				company: "Uganda Co",
+				currency: "USD",
+				payments: [],
+			},
+			pos_opening_shift: { name: "OPEN-USD-1" },
+			company: null,
+		});
+
+		// Then select a USD invoice carrying authoritative company_currency = UGX.
+		selected_invoices.value = [{ currency: "USD", company_currency: "UGX" }];
+		await fetchExchangeRate();
+
+		expect(companyCurrencyLocal.value).toBe("UGX");
+		expect(requiresExchangeRate.value).toBe(true);
+		expect(exchangeRate.value).toBe(3700);
+		expect(resolveExchangeRate).toHaveBeenCalledWith(
+			expect.objectContaining({
+				fromCurrency: "USD",
+				toCurrency: "UGX",
+				purpose: "for_selling",
+			}),
+		);
+	});
+
+	it("uses purpose for_buying for Supplier Pay across fetchExchangeRate, resolvePaymentMethodRate, and normalizeSelectedPayment", async () => {
+		const fetchExchangeBody = extractBlock(
+			payViewSource,
+			/\bconst fetchExchangeRate\s*=\s*async\s*\(\)\s*=>\s*\{/,
+			"fetchExchangeRate",
+		);
+		const resolvePaymentMethodBody = extractBlock(
+			payViewSource,
+			/\bconst resolvePaymentMethodRate\s*=\s*async\s*\(method\)\s*=>\s*\{/,
+			"resolvePaymentMethodRate",
+		);
+		const normalizeSelectedBody = extractBlock(
+			payViewSource,
+			/\bconst normalizeSelectedPayment\s*=\s*async\s*\(row,\s*amountField\)\s*=>\s*\{/,
+			"normalizeSelectedPayment",
+		);
+
+		const paymentEntryType = ref("Pay");
+		const partyType = ref("Supplier");
+		const purposeMarker = /\bconst exchangeRatePurpose\s*=\s*computed\(\s*/;
+		const exchangeRatePurpose = purposeMarker.test(payViewSource)
+			? new Function(
+					"computed",
+					"paymentEntryType",
+					"partyType",
+					`return computed(${extractExpression(payViewSource, purposeMarker, "exchangeRatePurpose")});`,
+				)(computed, paymentEntryType, partyType)
+			: computed(() => "for_selling");
+
+		const pos_profile = ref<any>({
+			name: "POS-SUP-PAY",
+			company: "Uganda Co",
+			currency: "USD",
+			company_currency: "UGX",
+		});
+		const company = ref("Uganda Co");
+		const companyCurrencyLocal = computed(() => "UGX");
+		const invoiceTotalCurrency = computed(() => "USD");
+		const requiresExchangeRate = computed(() => true);
+		const exchangeRate = ref<number | null>(null);
+		const exchangeRateLoading = ref(false);
+		const exchangeRateError = ref<string | null>(null);
+		const postingDate = ref("2026-11-28");
+		const available_bank_accounts = ref<Record<string, any[]>>({});
+
+		const resolveExchangeRate = vi.fn(async ({ fromCurrency, toCurrency, purpose }) => ({
+			found: true,
+			fromCurrency,
+			toCurrency,
+			rate:
+				fromCurrency === toCurrency
+					? 1
+					: purpose === "for_buying"
+						? 4050
+						: 3700,
+			effectiveDate: "2026-11-28",
+			rateDate: "2026-11-28",
+			source: fromCurrency === toCurrency ? "same_currency" : "currency_exchange",
+		}));
+
+		const fetchExchangeRate = new Function(
+			"exchangeRateLoading",
+			"requiresExchangeRate",
+			"exchangeRate",
+			"invoiceTotalCurrency",
+			"companyCurrencyLocal",
+			"exchangeRateError",
+			"resolveExchangeRate",
+			"pos_profile",
+			"company",
+			"postingDate",
+			"getTodayDate",
+			"__",
+			"exchangeRatePurpose",
+			"paymentEntryType",
+			"partyType",
+			`return async () => { ${fetchExchangeBody} };`,
+		)(
+			exchangeRateLoading,
+			requiresExchangeRate,
+			exchangeRate,
+			invoiceTotalCurrency,
+			companyCurrencyLocal,
+			exchangeRateError,
+			resolveExchangeRate,
+			pos_profile,
+			company,
+			postingDate,
+			() => "2026-11-28",
+			(s: string) => s,
+			exchangeRatePurpose,
+			paymentEntryType,
+			partyType,
+		);
+
+		const resolvePaymentMethodRate = new Function(
+			"available_bank_accounts",
+			"getPaymentMethodCurrency",
+			"invoiceTotalCurrency",
+			"companyCurrencyLocal",
+			"pos_profile",
+			"company",
+			"postingDate",
+			"getTodayDate",
+			"resolveExchangeRate",
+			"flt",
+			"exchangeRatePurpose",
+			"paymentEntryType",
+			"partyType",
+			`return async (method) => { ${resolvePaymentMethodBody} };`,
+		)(
+			available_bank_accounts,
+			() => "USD",
+			invoiceTotalCurrency,
+			companyCurrencyLocal,
+			pos_profile,
+			company,
+			postingDate,
+			() => "2026-11-28",
+			resolveExchangeRate,
+			(v: unknown) => Number(v || 0),
+			exchangeRatePurpose,
+			paymentEntryType,
+			partyType,
+		);
+
+		const normalizeSelectedPayment = new Function(
+			"pos_profile",
+			"invoiceTotalCurrency",
+			"resolveExchangeRate",
+			"company",
+			"postingDate",
+			"getTodayDate",
+			"flt",
+			"exchangeRatePurpose",
+			"paymentEntryType",
+			"partyType",
+			`return async (row, amountField) => { ${normalizeSelectedBody} };`,
+		)(
+			pos_profile,
+			invoiceTotalCurrency,
+			resolveExchangeRate,
+			company,
+			postingDate,
+			() => "2026-11-28",
+			(v: unknown) => Number(v || 0),
+			exchangeRatePurpose,
+			paymentEntryType,
+			partyType,
+		);
+
+		await fetchExchangeRate();
+		const method: any = { mode_of_payment: "Cash", amount: 10, payment_currency: "USD" };
+		await resolvePaymentMethodRate(method);
+		const unallocatedRow: any = { currency: "EUR", unallocated_amount: 10 };
+		await normalizeSelectedPayment(unallocatedRow, "unallocated_amount");
+
+		expect(exchangeRate.value).toBe(4050);
+		expect(method.company_exchange_rate).toBe(4050);
+		const purposes = resolveExchangeRate.mock.calls.map(([arg]) => arg.purpose);
+		expect(purposes.length).toBeGreaterThanOrEqual(4);
+		for (const p of purposes) {
+			expect(p).toBe("for_buying");
+		}
 	});
 });

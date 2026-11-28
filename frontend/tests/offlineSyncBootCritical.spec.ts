@@ -41,6 +41,7 @@ const bootstrapSnapshotMocks = vi.hoisted(() => ({
 }));
 
 const syncStateMocks = vi.hoisted(() => ({
+	getSyncResourceState: vi.fn().mockResolvedValue(null),
 	setSyncResourceState: vi.fn().mockResolvedValue(undefined),
 }));
 
@@ -67,6 +68,7 @@ import { syncPaymentMethodCurrenciesResource } from "../src/offline/sync/adapter
 describe("boot-critical offline sync adapters", () => {
 	beforeEach(() => {
 		vi.clearAllMocks();
+		syncStateMocks.getSyncResourceState.mockResolvedValue(null);
 		cacheMocks.getBootstrapSnapshot.mockReturnValue({
 			build_version: "build-1",
 			profile_name: "POS-1",
@@ -453,5 +455,53 @@ describe("boot-critical offline sync adapters", () => {
 			}),
 		);
 		expect((result as any).syncedCurrencyPairs).toEqual(["USD::UGX"]);
+	});
+
+	it("clears stale watermark and does not inherit syncedCurrencyPairs across POS profile scope changes", async () => {
+		syncStateMocks.getSyncResourceState.mockResolvedValue({
+			resourceId: "currency_matrix",
+			status: "fresh",
+			watermark: "2026-04-09T10:10:00",
+			scopeSignature: JSON.stringify({
+				profile: "POS-OLD",
+				company: "Uganda Co",
+				warehouse: null,
+			}),
+			syncedCurrencyPairs: ["USD::UGX"],
+		});
+
+		const fetcher = vi.fn(async () => ({
+			schema_version: "2026-04-09",
+			next_watermark: "2026-04-09T11:00:00",
+			synced_pairs: [{ from_currency: "EUR", to_currency: "UGX" }],
+			changes: [],
+			deleted: [],
+			has_more: false,
+		}));
+
+		const result = await syncCurrencyMatrixResource({
+			posProfile: {
+				name: "POS-NEW",
+				company: "Uganda Co",
+				modified: "2026-04-09T11:00:00",
+			},
+			currencyPairs: [{ from_currency: "EUR", to_currency: "UGX" }],
+			watermark: "2026-04-09T10:10:00",
+			fetcher,
+		});
+
+		expect(repositoryMocks.currencyRateRepository.clear).toHaveBeenCalledOnce();
+		expect(fetcher).toHaveBeenCalledWith(
+			expect.objectContaining({
+				watermark: null,
+			}),
+		);
+		expect(syncStateMocks.setSyncResourceState).toHaveBeenCalledWith(
+			expect.objectContaining({
+				resourceId: "currency_matrix",
+				syncedCurrencyPairs: ["EUR::UGX"],
+			}),
+		);
+		expect((result as any).syncedCurrencyPairs).toEqual(["EUR::UGX"]);
 	});
 });

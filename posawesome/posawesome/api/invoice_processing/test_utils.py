@@ -409,6 +409,70 @@ class TestInvoiceCurrencyRates(unittest.TestCase):
             self.frappe.get_cached_doc = orig_get_cached_doc
             self.utils.get_exchange_rate = orig_get_exchange_rate
 
+    def test_get_latest_rate_distinguishes_derived_inverse_from_direct_currency_exchange(self):
+        orig_get_cached_doc = self.frappe.get_cached_doc
+        try:
+            self.frappe.get_cached_doc = lambda doctype, *args, **kwargs: (
+                _AttrDict(allow_stale=1, stale_days=30)
+                if doctype == "Accounts Settings"
+                else _AttrDict()
+            )
+            inverse_only_rows = [
+                _AttrDict(
+                    name="CX-INV-UGX-USD",
+                    date="2026-11-28",
+                    from_currency="UGX",
+                    to_currency="USD",
+                    for_selling=0,
+                    for_buying=1,
+                    exchange_rate=1.0 / 3700.0,
+                    creation="2026-11-28 09:00:00",
+                ),
+            ]
+            self._install_exchange_rows(inverse_only_rows)
+
+            inv_rate, inv_date, inv_source = self.utils.get_latest_rate(
+                "USD",
+                "UGX",
+                transaction_date="2026-11-28",
+                purpose="for_selling",
+                allow_external=False,
+                return_source=True,
+            )
+            self.assertAlmostEqual(inv_rate, 3700.0, places=6)
+            self.assertEqual(inv_date, "2026-11-28")
+            self.assertEqual(inv_source, "derived_inverse")
+
+            # Once a direct USD->UGX selling row is stored, source upgrades to currency_exchange.
+            with_direct_rows = [
+                *inverse_only_rows,
+                _AttrDict(
+                    name="CX-DIR-USD-UGX",
+                    date="2026-11-28",
+                    from_currency="USD",
+                    to_currency="UGX",
+                    for_selling=1,
+                    for_buying=0,
+                    exchange_rate=4050.0,
+                    creation="2026-11-28 10:00:00",
+                ),
+            ]
+            self._install_exchange_rows(with_direct_rows)
+
+            dir_rate, dir_date, dir_source = self.utils.get_latest_rate(
+                "USD",
+                "UGX",
+                transaction_date="2026-11-28",
+                purpose="for_selling",
+                allow_external=False,
+                return_source=True,
+            )
+            self.assertEqual(dir_rate, 4050.0)
+            self.assertEqual(dir_date, "2026-11-28")
+            self.assertEqual(dir_source, "currency_exchange")
+        finally:
+            self.frappe.get_cached_doc = orig_get_cached_doc
+
 
 if __name__ == "__main__":
     unittest.main()

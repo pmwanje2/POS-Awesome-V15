@@ -417,6 +417,40 @@ class TestInvoicesApi(unittest.TestCase):
         finally:
             self.invoices.get_latest_rate = orig_get_latest_rate
 
+    def test_resolve_exchange_rate_marks_derived_inverse_separately_from_direct_quote(self):
+        orig_get_latest_rate = self.invoices.get_latest_rate
+        responses = [
+            (3700.0, "2026-11-28", "derived_inverse"),
+            (4050.0, "2026-11-28", "currency_exchange"),
+        ]
+        captured_kwargs = []
+        try:
+            def fake_get_latest_rate(_from_c, _to_c, **kwargs):
+                captured_kwargs.append(kwargs)
+                rate, rate_date, source = responses.pop(0)
+                if kwargs.get("return_source"):
+                    return rate, rate_date, source
+                return rate, rate_date
+
+            self.invoices.get_latest_rate = fake_get_latest_rate
+
+            first = self.invoices.resolve_exchange_rate(
+                "USD", "UGX", transaction_date="2026-11-28", purpose="for_selling"
+            )
+            second = self.invoices.resolve_exchange_rate(
+                "USD", "UGX", transaction_date="2026-11-28", purpose="for_selling"
+            )
+
+            self.assertTrue(captured_kwargs[0].get("return_source"))
+            self.assertEqual(first["exchange_rate"], 3700.0)
+            self.assertEqual(first["source"], "derived_inverse")
+            self.assertTrue(first["is_inverse"])
+            self.assertEqual(second["exchange_rate"], 4050.0)
+            self.assertEqual(second["source"], "currency_exchange")
+            self.assertFalse(second["is_inverse"])
+        finally:
+            self.invoices.get_latest_rate = orig_get_latest_rate
+
 
 if __name__ == "__main__":
     unittest.main()
