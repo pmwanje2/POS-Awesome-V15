@@ -1,11 +1,15 @@
-import { describe, expect, it } from "vitest";
+import { ref } from "vue";
+import { describe, expect, it, vi } from "vitest";
 
 import { useItemCurrency } from "../src/posapp/composables/pos/items/useItemCurrency";
+import { registerItemsSelectorEvents } from "../src/posapp/composables/pos/items/useItemsSelectorEvents";
 import {
+	computeRowTaxParams,
 	findLossRiskItems,
 	getEffectiveSellingRate,
 	getItemCostFloor,
 	getItemLossRisk,
+	resolveInvoiceDiscountPercentage,
 	resolveSaleFloorPolicy,
 } from "../src/posapp/utils/lossPrevention";
 
@@ -695,5 +699,249 @@ describe("loss prevention", () => {
 		expect(risk?.belowCost).toBe(true);
 		expect(risk?.sellingRate).toBeCloseTo(20000);
 		expect(risk?.costRate).toBeCloseTo(25000);
+	});
+
+	it("clears selectedConversionRate on zero or omitted update_currency so useItemCurrency does not cache 1:1 buying cost", () => {
+		const handlers = new Map<string, (..._args: any[]) => void>();
+		const eventBus = {
+			on: (event: string, handler: (..._args: any[]) => void) => {
+				handlers.set(event, handler);
+			},
+			off: (event: string) => {
+				handlers.delete(event);
+			},
+		};
+		const selectedCurrency = ref("UGX");
+		const selectedExchangeRate = ref(1);
+		const selectedConversionRate = ref(1);
+		const selectedSupplier = ref<string | null>(null);
+
+		const cleanup = registerItemsSelectorEvents({
+			eventBus,
+			selectedCurrency,
+			selectedExchangeRate,
+			selectedConversionRate,
+			selectedSupplier,
+			syncSelectorPriceList: vi.fn(),
+			scheduleLastBuyingRateRefresh: vi.fn(),
+			requestItemSearchFocus: vi.fn(),
+			handleCartQuantitiesUpdated: vi.fn(),
+			handleRemoteStockAdjustment: vi.fn(),
+		});
+
+		const emitCurrency = handlers.get("update_currency")!;
+		emitCurrency({
+			currency: "USD",
+			exchange_rate: 1,
+			conversion_rate: 0,
+		});
+		expect(selectedCurrency.value).toBe("USD");
+		expect(selectedConversionRate.value).toBe(0);
+
+		const { applyCurrencyConversionToItem } = useItemCurrency();
+		const item: Record<string, unknown> = {
+			item_code: "USD-SWITCH-ZERO-FX",
+			qty: 1,
+			rate: 15,
+			price_list_rate: 15,
+			currency: "USD",
+			buying_rate_currency: "USD",
+			trade_price: 10,
+			buying_rate: 10,
+			uom: "Nos",
+			stock_uom: "Nos",
+			conversion_factor: 1,
+		};
+
+		applyCurrencyConversionToItem(item, {
+			company: { default_currency: "UGX" },
+			pos_profile: { currency: "UGX" },
+			price_list_currency: "USD",
+			selected_currency: selectedCurrency.value,
+			exchange_rate: selectedExchangeRate.value,
+			conversion_rate: selectedConversionRate.value,
+			currency_precision: 2,
+		});
+
+		expect(item._company_buying_price).toBeUndefined();
+		expect(item.base_buying_rate).toBeUndefined();
+
+		emitCurrency({
+			currency: "USD",
+			exchange_rate: 1,
+			conversion_rate: 3700,
+		});
+		expect(selectedConversionRate.value).toBe(3700);
+
+		applyCurrencyConversionToItem(item, {
+			company: { default_currency: "UGX" },
+			pos_profile: { currency: "UGX" },
+			price_list_currency: "USD",
+			selected_currency: selectedCurrency.value,
+			exchange_rate: selectedExchangeRate.value,
+			conversion_rate: selectedConversionRate.value,
+			currency_precision: 2,
+		});
+
+		expect(item._company_buying_price).toBeCloseTo(37000);
+		expect(item.base_buying_rate).toBeCloseTo(37000);
+
+		// Omitting conversion_rate on a currency switch also clears the stale rate.
+		emitCurrency({ currency: "EUR" });
+		expect(selectedCurrency.value).toBe("EUR");
+		expect(selectedConversionRate.value).toBe(0);
+		expect(selectedExchangeRate.value).toBe(0);
+
+		cleanup();
+	});
+
+	it("honors reconciled native net_rate on middle line where net_rate equals gross rate", () => {
+		const items = [
+			{
+				item_code: "LINE-1",
+				qty: 1,
+				rate: 1.0,
+				net_rate: 0.99,
+				net_amount: 0.99,
+				trade_price: 1.0,
+			},
+			{
+				item_code: "LINE-2",
+				qty: 1,
+				rate: 1.0,
+				net_rate: 1.0,
+				net_amount: 1.0,
+				trade_price: 1.0,
+			},
+			{
+				item_code: "LINE-3",
+				qty: 1,
+				rate: 1.0,
+				net_rate: 0.99,
+				net_amount: 0.99,
+				trade_price: 1.0,
+			},
+		];
+		const doc = {
+			apply_discount_on: "Net Total",
+			discount_amount: 0.02,
+			items,
+		};
+		const invoiceDiscountPercentage = resolveInvoiceDiscountPercentage(
+			doc,
+			items,
+		);
+		const risks = findLossRiskItems(items, {
+			invoiceDiscountPercentage,
+			applyDiscountOn: "Net Total",
+		});
+		expect(risks.map((risk) => risk.itemCode)).toEqual(["LINE-1", "LINE-3"]);
+
+		// Stale un-discounted net_rates must still be rejected.
+		const staleItems = items.map((row) => ({
+			...row,
+			net_rate: 1.0,
+			net_amount: 1.0,
+		}));
+		const staleRisks = findLossRiskItems(staleItems, {
+			invoiceDiscountPercentage,
+			applyDiscountOn: "Net Total",
+		});
+		expect(staleRisks.map((risk) => risk.itemCode)).toEqual([
+			"LINE-1",
+			"LINE-2",
+			"LINE-3",
+		]);
+	});
+
+	it("does not dilute Grand Total discount by On Item Quantity tax via grand_total fallback when net_rate is absent", () => {
+		const taxes = [
+			{
+				charge_type: "On Item Quantity",
+				account_head: "Levy - CO",
+				rate: 20,
+				included_in_print_rate: 0,
+			},
+		];
+		const items = [
+			{
+				item_code: "QTY-TAX-ITEM",
+				qty: 1,
+				rate: 100,
+				trade_price: 89,
+			},
+		];
+		const doc = {
+			apply_discount_on: "Grand Total",
+			discount_amount: 12,
+			grand_total: 108,
+			total_taxes_and_charges: 20,
+			taxes,
+			items,
+		};
+		const invoiceDiscountPercentage = resolveInvoiceDiscountPercentage(
+			doc,
+			items,
+		);
+		expect(invoiceDiscountPercentage).toBeCloseTo(12);
+
+		const risk = getItemLossRisk(items[0], {
+			invoiceDiscountPercentage,
+			applyDiscountOn: "Grand Total",
+			taxes,
+		});
+		expect(risk?.belowCost).toBe(true);
+		expect(risk?.sellingRate).toBeCloseTo(88);
+	});
+
+	it("returns null floor when foreign-currency buying price lacks FX even if lower valuation_rate exists", () => {
+		const item = {
+			item_code: "EUR-BUY-NO-FX",
+			qty: 1,
+			rate: 8,
+			currency: "USD",
+			company_currency: "USD",
+			conversion_rate: 1,
+			uom: "Nos",
+			stock_uom: "Nos",
+			conversion_factor: 1,
+			buying_price_currency: "EUR",
+			buying_rate_currency: "EUR",
+			trade_price: 10,
+			buying_rate: 10,
+			valuation_rate: 5,
+		};
+
+		expect(getItemCostFloor(item)).toBeNull();
+	});
+
+	it("treats item_tax_rate N/A as 0% tax instead of falling back to inclusive template rate", () => {
+		const taxes = [
+			{
+				charge_type: "On Net Total",
+				account_head: "VAT",
+				rate: 20,
+				included_in_print_rate: 1,
+			},
+		];
+		const item = {
+			item_code: "NA-TAX-ITEM",
+			qty: 1,
+			rate: 100,
+			trade_price: 95,
+			item_tax_rate: JSON.stringify({ VAT: "N/A" }),
+		};
+
+		expect(computeRowTaxParams(item, taxes)).toEqual({
+			inclA: 0,
+			inclB: 0,
+			allA: 0,
+			allB: 0,
+		});
+		expect(getItemLossRisk(item, { taxes })).toBeNull();
+
+		const below = getItemLossRisk({ ...item, trade_price: 101 }, { taxes });
+		expect(below?.belowCost).toBe(true);
+		expect(below?.sellingRate).toBeCloseTo(100);
 	});
 });

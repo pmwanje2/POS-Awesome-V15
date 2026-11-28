@@ -3146,6 +3146,388 @@ class TestItemSaleControls(unittest.TestCase):
             )
             self.assertEqual(len(errors), 1)
 
+    def test_validate_invoice_prefers_same_day_selling_only_fx_over_later_dual_purpose_via_real_utils(
+        self,
+    ):
+        self._install_bin_valuation(valuation_rate=4000, company_currency="UGX")
+
+        class _AttrRow(dict):
+            def __getattr__(self, name):
+                try:
+                    return self[name]
+                except KeyError as exc:
+                    raise AttributeError(name) from exc
+
+        class DeskInvoiceDoc(PrecisionDoc):
+            def calculate_taxes_and_totals(self):
+                for item in self["items"]:
+                    item["net_rate"] = item["rate"]
+                    item["base_net_rate"] = round(item["net_rate"] * self["conversion_rate"], 2)
+
+        fx_rows = [
+            _AttrRow(
+                name="CX-SELL-ONLY",
+                date="2026-11-27",
+                from_currency="USD",
+                to_currency="UGX",
+                for_selling=1,
+                for_buying=0,
+                exchange_rate=3700.0,
+                creation="2026-11-27 08:00:00",
+            ),
+            _AttrRow(
+                name="CX-DUAL",
+                date="2026-11-27",
+                from_currency="USD",
+                to_currency="UGX",
+                for_selling=1,
+                for_buying=1,
+                exchange_rate=4200.0,
+                creation="2026-11-27 12:00:00",
+            ),
+        ]
+
+        base_get_all = self.frappe.get_all
+
+        def fake_get_all(doctype, *args, **kwargs):
+            if doctype == "Currency Exchange":
+                filters = kwargs.get("filters") or {}
+                order_by = kwargs.get("order_by") or ""
+                limit = kwargs.get("limit")
+                matched = []
+                for row in fx_rows:
+                    ok = True
+                    for k, v in filters.items():
+                        if isinstance(v, list) and len(v) == 2 and v[0] == "<=":
+                            if not (str(row.get(k)) <= str(v[1])):
+                                ok = False
+                                break
+                        elif row.get(k) != v:
+                            ok = False
+                            break
+                    if ok:
+                        matched.append(row)
+                clauses = [part.strip() for part in str(order_by).split(",") if part.strip()]
+                for clause in reversed(clauses):
+                    tokens = clause.split()
+                    field = tokens[0]
+                    desc = len(tokens) > 1 and tokens[1].lower() == "desc"
+                    matched.sort(key=lambda r: r.get(field), reverse=desc)
+                return matched[: int(limit)] if limit is not None else matched
+            return base_get_all(doctype, *args, **kwargs)
+
+        self.frappe.get_all = fake_get_all
+        self.frappe.get_cached_doc = lambda *args, **kwargs: {"allow_stale": 1}
+        self.frappe.whitelist = lambda *args, **kwargs: (
+            args[0] if args and callable(args[0]) else (lambda fn: fn)
+        )
+        self.frappe.DoesNotExistError = type("DoesNotExistError", (Exception,), {})
+        self.frappe.flags = types.SimpleNamespace(mute_messages=False)
+        self.frappe.message_log = []
+        frappe_utils = sys.modules["frappe.utils"]
+        frappe_utils.add_days = lambda d, _days: str(d)
+        frappe_utils.formatdate = lambda d: str(d)
+        frappe_utils.getdate = lambda value=None: str(value or "2026-11-27")
+        frappe_utils.strip_html_tags = lambda s: str(s or "")
+
+        erpnext_pkg = types.ModuleType("erpnext")
+        erpnext_setup = types.ModuleType("erpnext.setup")
+        erpnext_utils = types.ModuleType("erpnext.setup.utils")
+        erpnext_utils.get_exchange_rate = lambda *args, **kwargs: 0.0
+
+        utils_path = REPO_ROOT / "posawesome" / "posawesome" / "api" / "invoice_processing" / "utils.py"
+        with patch.dict(
+            sys.modules,
+            {
+                "erpnext": erpnext_pkg,
+                "erpnext.setup": erpnext_setup,
+                "erpnext.setup.utils": erpnext_utils,
+                "posawesome": types.ModuleType("posawesome"),
+                "posawesome.posawesome": types.ModuleType("posawesome.posawesome"),
+                "posawesome.posawesome.api": types.ModuleType("posawesome.posawesome.api"),
+                "posawesome.posawesome.api.invoice_processing": types.ModuleType(
+                    "posawesome.posawesome.api.invoice_processing"
+                ),
+            },
+        ):
+            spec = importlib.util.spec_from_file_location(
+                "posawesome.posawesome.api.invoice_processing.utils", utils_path
+            )
+            real_utils = importlib.util.module_from_spec(spec)
+            sys.modules["posawesome.posawesome.api.invoice_processing.utils"] = real_utils
+            spec.loader.exec_module(real_utils)
+
+            row = PrecisionDoc(
+                item_code="LOW",
+                item_name="Same Day FX Item",
+                qty=1,
+                rate=1.0,
+                amount=1.0,
+                net_rate=1.0,
+                base_net_rate=4200.0,
+                uom="Nos",
+                warehouse="Shop Floor - JBS",
+                precision_value=2,
+            )
+            invoice = DeskInvoiceDoc(
+                doctype="POS Invoice",
+                is_pos=1,
+                pos_profile="Main POS",
+                company="Test Co",
+                currency="USD",
+                conversion_rate=4200.0,
+                posting_date="2026-11-27",
+                items=[row],
+                precision_value=2,
+            )
+            invoice.doctype = "POS Invoice"
+            invoice.flags = types.SimpleNamespace()
+
+            with self.assertRaisesRegex(Exception, "below Warehouse Valuation"):
+                self.controls.validate_pos_invoice_item_sale_controls(invoice)
+            self.assertEqual(invoice["conversion_rate"], 3700.0)
+            self.assertAlmostEqual(row["base_net_rate"], 3700.0, places=2)
+
+    def test_reconciles_native_net_amount_across_mixed_quantities_without_rejecting_middle_line(self):
+        self._install_bin_valuation(valuation_rate=1.00, company_currency="USD")
+        base_get_all = self.frappe.get_all
+
+        def get_all(doctype, *args, **kwargs):
+            if doctype == "Item":
+                return [
+                    {"item_code": code, "stock_uom": "Nos", "is_stock_item": 1}
+                    for code in ("ITEM-1", "ITEM-2", "ITEM-3")
+                ]
+            if doctype == "Bin":
+                return [
+                    {
+                        "item_code": code,
+                        "warehouse": "Shop Floor - JBS",
+                        "valuation_rate": 1.00,
+                    }
+                    for code in ("ITEM-1", "ITEM-2", "ITEM-3")
+                ]
+            return base_get_all(doctype, *args, **kwargs)
+
+        self.frappe.get_all = get_all
+        items = [
+            PrecisionDoc(
+                item_code="ITEM-1",
+                item_name="Line 1",
+                qty=1,
+                rate=1.00,
+                amount=1.00,
+                net_rate=0.99,
+                net_amount=0.99,
+                base_net_rate=0.99,
+                base_net_amount=0.99,
+                uom="Nos",
+                warehouse="Shop Floor - JBS",
+                precision_value=2,
+            ),
+            PrecisionDoc(
+                item_code="ITEM-2",
+                item_name="Line 2",
+                qty=1,
+                rate=1.00,
+                amount=1.00,
+                net_rate=1.00,
+                net_amount=1.00,
+                base_net_rate=1.00,
+                base_net_amount=1.00,
+                uom="Nos",
+                warehouse="Shop Floor - JBS",
+                precision_value=2,
+            ),
+            PrecisionDoc(
+                item_code="ITEM-3",
+                item_name="Line 3",
+                qty=5,
+                rate=1.00,
+                amount=5.00,
+                net_rate=0.99,
+                net_amount=4.97,
+                base_net_rate=0.99,
+                base_net_amount=4.97,
+                uom="Nos",
+                warehouse="Shop Floor - JBS",
+                precision_value=2,
+            ),
+        ]
+        invoice_doc = PrecisionDoc(
+            company="Test Co",
+            currency="USD",
+            conversion_rate=1,
+            apply_discount_on="Net Total",
+            discount_amount=0.04,
+            precision_value=2,
+        )
+        errors = self.controls.collect_below_buying_price_errors(
+            items,
+            invoice_doc=invoice_doc,
+        )
+        self.assertEqual([e["item_code"] for e in errors], ["ITEM-1", "ITEM-3"])
+
+    def test_recursive_free_item_checks_min_qty_against_stock_qty_when_rule_uom_is_blank(self):
+        self._install_promotional_rule(
+            is_recursive=1,
+            min_qty=4,
+            uom="",
+            recurse_for=1,
+            free_qty=1,
+            round_free_qty=1,
+            free_item_uom="Nos",
+        )
+        base_get_all = self.frappe.get_all
+
+        def get_all(doctype, *args, **kwargs):
+            if doctype == "Item":
+                return [
+                    {"item_code": "TRIG", "stock_uom": "Nos", "is_stock_item": 1},
+                    {"item_code": "LOW", "stock_uom": "Nos", "is_stock_item": 1},
+                ]
+            if doctype == "UOM Conversion Detail":
+                return [
+                    {"parent": "TRIG", "uom": "Case", "conversion_factor": 6.0},
+                ]
+            return base_get_all(doctype, *args, **kwargs)
+
+        self.frappe.get_all = get_all
+
+        with self.subTest("1 Case (stock_qty=6) qualifies for min_qty=4 with blank rule uom and awards 1 free unit"):
+            trigger = self._promo_trigger_row()
+            trigger["qty"] = 1
+            trigger["uom"] = "Case"
+            trigger["stock_uom"] = "Nos"
+            trigger["conversion_factor"] = 6.0
+            trigger["stock_qty"] = 6.0
+
+            ok_free = self._promo_free_row(rate=0)
+            ok_free["qty"] = 1
+            self.assertEqual(
+                self.controls.collect_below_buying_price_errors(
+                    [trigger, ok_free],
+                    invoice_doc=dict(self.PROMO_INVOICE),
+                ),
+                [],
+            )
+
+            over_free = self._promo_free_row(rate=0)
+            over_free["qty"] = 2
+            errors = self.controls.collect_below_buying_price_errors(
+                [trigger, over_free],
+                invoice_doc=dict(self.PROMO_INVOICE),
+            )
+            self.assertEqual(len(errors), 1)
+
+        with self.subTest("forged stock_qty on 1 Nos cannot satisfy min_qty=4"):
+            trigger = self._promo_trigger_row()
+            trigger["qty"] = 1
+            trigger["uom"] = "Nos"
+            trigger["stock_uom"] = "Nos"
+            trigger["stock_qty"] = 6.0
+
+            free_row = self._promo_free_row(rate=0)
+            free_row["qty"] = 1
+            errors = self.controls.collect_below_buying_price_errors(
+                [trigger, free_row],
+                invoice_doc=dict(self.PROMO_INVOICE),
+            )
+            self.assertEqual(len(errors), 1)
+
+        with self.subTest("explicit rule uom scales min_qty threshold in stock units"):
+            self._install_promotional_rule(
+                is_recursive=1,
+                min_qty=2,
+                uom="Box",
+                recurse_for=1,
+                free_qty=1,
+                round_free_qty=1,
+                free_item_uom="Nos",
+            )
+            rule_get_all = self.frappe.get_all
+
+            def get_all_with_uom(doctype, *args, **kwargs):
+                if doctype == "Item":
+                    return [
+                        {"item_code": "TRIG", "stock_uom": "Nos", "is_stock_item": 1},
+                        {"item_code": "LOW", "stock_uom": "Nos", "is_stock_item": 1},
+                    ]
+                if doctype == "UOM Conversion Detail":
+                    return [
+                        {"parent": "TRIG", "uom": "Box", "conversion_factor": 3.0},
+                        {"parent": "TRIG", "uom": "Case", "conversion_factor": 6.0},
+                    ]
+                return rule_get_all(doctype, *args, **kwargs)
+
+            self.frappe.get_all = get_all_with_uom
+
+            # 5 Nos < 2 Boxes (6 Nos) must fail even though transaction qty 5 >= min_qty 2.
+            five_nos = self._promo_trigger_row()
+            five_nos["qty"] = 5
+            five_nos["uom"] = "Nos"
+            five_nos["stock_uom"] = "Nos"
+            five_nos["stock_qty"] = 5.0
+            free_one = self._promo_free_row(rate=0)
+            free_one["qty"] = 1
+            self.assertEqual(
+                len(
+                    self.controls.collect_below_buying_price_errors(
+                        [five_nos, free_one],
+                        invoice_doc=dict(self.PROMO_INVOICE),
+                    )
+                ),
+                1,
+            )
+
+            # 1 Case (6 Nos) == 2 Boxes (6 Nos) qualifies and awards 1 free unit (transaction qty 1).
+            one_case = self._promo_trigger_row()
+            one_case["qty"] = 1
+            one_case["uom"] = "Case"
+            one_case["stock_uom"] = "Nos"
+            one_case["conversion_factor"] = 6.0
+            one_case["stock_qty"] = 6.0
+            self.assertEqual(
+                self.controls.collect_below_buying_price_errors(
+                    [one_case, free_one],
+                    invoice_doc=dict(self.PROMO_INVOICE),
+                ),
+                [],
+            )
+
+    def test_item_tax_rate_na_exempts_item_from_inclusive_tax_template(self):
+        self._install_bin_valuation(valuation_rate=95.0, company_currency="USD")
+        invoice_doc = PrecisionDoc(
+            company="Test Co",
+            currency="USD",
+            conversion_rate=1,
+            taxes=[
+                {
+                    "charge_type": "On Net Total",
+                    "account_head": "VAT - CO",
+                    "rate": 20.0,
+                    "included_in_print_rate": 1,
+                }
+            ],
+            precision_value=2,
+        )
+        row = PrecisionDoc(
+            item_code="LOW",
+            item_name="Tax Exempt NA Item",
+            qty=1,
+            rate=100.0,
+            amount=100.0,
+            uom="Nos",
+            warehouse="Shop Floor - JBS",
+            item_tax_rate='{"VAT - CO": "N/A"}',
+            precision_value=2,
+        )
+        errors = self.controls.collect_below_buying_price_errors(
+            [row],
+            invoice_doc=invoice_doc,
+        )
+        self.assertEqual(errors, [])
+
 
 if __name__ == "__main__":
     unittest.main()

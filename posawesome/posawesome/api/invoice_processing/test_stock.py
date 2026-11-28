@@ -246,6 +246,78 @@ class TestStripClientFreebies(unittest.TestCase):
         self.assertEqual(len(errors), 1)
         self.assertAlmostEqual(errors[0]["selling_rate"], 0.0, places=2)
 
+    def test_merge_duplicate_taxes_remaps_downstream_row_id_references_after_dropping_duplicates(
+        self,
+    ):
+        class InvoiceStub(dict):
+            def set(self, key, value):
+                self[key] = value
+
+            def calculate_taxes_and_totals(self):
+                return None
+
+        taxes = [
+            {
+                "idx": 1,
+                "charge_type": "On Net Total",
+                "account_head": "Tax A - CO",
+                "rate": 10.0,
+                "included_in_print_rate": 0,
+            },
+            {
+                "idx": 2,
+                "charge_type": "On Net Total",
+                "account_head": "Tax A - CO",
+                "rate": 10.0,
+                "included_in_print_rate": 0,
+            },
+            {
+                "idx": 3,
+                "charge_type": "On Net Total",
+                "account_head": "Tax B - CO",
+                "rate": 20.0,
+                "included_in_print_rate": 0,
+            },
+            {
+                "idx": 4,
+                "charge_type": "On Previous Row Amount",
+                "account_head": "Tax C - CO",
+                "row_id": "3",
+                "rate": 10.0,
+                "included_in_print_rate": 0,
+            },
+        ]
+        invoice_doc = InvoiceStub(
+            company="Test Co",
+            currency="USD",
+            conversion_rate=1.0,
+            taxes=[dict(row) for row in taxes],
+        )
+
+        self.stock._merge_duplicate_taxes(invoice_doc, recalculate=False)
+
+        merged = invoice_doc["taxes"]
+        self.assertEqual(len(merged), 3)
+        self.assertEqual([row.get("account_head") for row in merged], ["Tax A - CO", "Tax B - CO", "Tax C - CO"])
+        self.assertEqual([row.get("idx") for row in merged], [1, 2, 3])
+        self.assertEqual(merged[2].get("row_id"), "2")
+
+        # Verify downstream tax calculation preserves C = 10% of B (20%) = 2.00 on 100 net
+        # instead of dropping to 0.00 / self-referencing row 3.
+        controls_path = REPO_ROOT / "posawesome" / "posawesome" / "api" / "item_sale_controls.py"
+        spec = importlib.util.spec_from_file_location(
+            "posawesome.posawesome.api.item_sale_controls", controls_path
+        )
+        controls = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(controls)
+
+        _incl_a, _incl_b, all_a, all_b = controls._row_tax_params(
+            {"item_code": "ITEM-1"},
+            invoice_doc,
+        )
+        self.assertAlmostEqual(all_a, 0.32, places=6)
+        self.assertAlmostEqual(all_b, 0.0, places=6)
+
 
 if __name__ == "__main__":
     unittest.main()

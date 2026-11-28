@@ -479,6 +479,187 @@ describe("usePaymentSubmission", () => {
 		}
 	});
 
+	it("accepts middle line with native net_rate == gross rate when 3x 1.00 lines share 0.02 discount", async () => {
+		const invoiceDoc = ref<any>({
+			is_return: 0,
+			currency: "USD",
+			apply_discount_on: "Net Total",
+			discount_amount: 0.02,
+			items: [
+				{
+					item_code: "ITEM-1",
+					item_name: "Line 1",
+					qty: 1,
+					rate: 1.0,
+					net_rate: 0.99,
+					net_amount: 0.99,
+					trade_price: 0.99,
+				},
+				{
+					item_code: "ITEM-2",
+					item_name: "Line 2",
+					qty: 1,
+					rate: 1.0,
+					net_rate: 1.0,
+					net_amount: 1.0,
+					trade_price: 1.0,
+				},
+				{
+					item_code: "ITEM-3",
+					item_name: "Line 3",
+					qty: 1,
+					rate: 1.0,
+					net_rate: 0.99,
+					net_amount: 0.99,
+					trade_price: 0.99,
+				},
+			],
+			payments: [{ mode_of_payment: "Cash", amount: 2.98, type: "Cash" }],
+			rounded_total: 2.98,
+			grand_total: 2.98,
+		});
+
+		const submission = usePaymentSubmission({
+			invoiceDoc,
+			posProfile: ref({ posa_below_cost_action: "Block" }),
+			stockSettings: ref({}),
+			invoiceType: ref("Invoice"),
+			formatFloat: (value) => Number(value || 0),
+			stores: { toastStore: { show: vi.fn() } },
+			diff_payment: ref(0) as any,
+			isCashback: ref(true),
+		});
+
+		await expect(submission.validateSubmission(true)).resolves.toBe(true);
+	});
+
+	it("blocks below-cost Grand Total discount on On Item Quantity tax without net_rate", async () => {
+		const invoiceDoc = ref<any>({
+			is_return: 0,
+			currency: "USD",
+			apply_discount_on: "Grand Total",
+			discount_amount: 12,
+			grand_total: 108,
+			total_taxes_and_charges: 20,
+			taxes: [
+				{
+					charge_type: "On Item Quantity",
+					account_head: "Levy - CO",
+					rate: 20,
+					included_in_print_rate: 0,
+				},
+			],
+			items: [
+				{
+					item_code: "QTY-TAX-ITEM",
+					item_name: "Qty Tax Item",
+					qty: 1,
+					rate: 100,
+					trade_price: 89,
+				},
+			],
+			payments: [{ mode_of_payment: "Cash", amount: 108, type: "Cash" }],
+			rounded_total: 108,
+		});
+
+		const submission = usePaymentSubmission({
+			invoiceDoc,
+			posProfile: ref({ posa_below_cost_action: "Block" }),
+			stockSettings: ref({}),
+			invoiceType: ref("Invoice"),
+			formatFloat: (value) => Number(value || 0),
+			stores: { toastStore: { show: vi.fn() } },
+			diff_payment: ref(0) as any,
+			isCashback: ref(true),
+		});
+
+		await expect(submission.validateSubmission(true)).rejects.toThrow(
+			/Qty Tax Item is selling at 88, below Trade Price 89/i,
+		);
+	});
+
+	it("blocks checkout under Block missing-cost policy when foreign buying price lacks FX even if lower valuation_rate exists", async () => {
+		const invoiceDoc = ref<any>({
+			is_return: 0,
+			currency: "USD",
+			items: [
+				{
+					item_code: "EUR-BUY-NO-FX",
+					item_name: "EUR Cost Item",
+					qty: 1,
+					rate: 8,
+					currency: "USD",
+					company_currency: "USD",
+					conversion_rate: 1,
+					buying_price_currency: "EUR",
+					buying_rate_currency: "EUR",
+					trade_price: 10,
+					buying_rate: 10,
+					valuation_rate: 5,
+				},
+			],
+			payments: [{ mode_of_payment: "Cash", amount: 8, type: "Cash" }],
+			rounded_total: 8,
+			grand_total: 8,
+		});
+
+		const submission = usePaymentSubmission({
+			invoiceDoc,
+			posProfile: ref({ posa_missing_cost_action: "Block" }),
+			stockSettings: ref({}),
+			invoiceType: ref("Invoice"),
+			formatFloat: (value) => Number(value || 0),
+			stores: { toastStore: { show: vi.fn() } },
+			diff_payment: ref(0) as any,
+			isCashback: ref(true),
+		});
+
+		await expect(submission.validateSubmission(true)).rejects.toThrow(
+			/no valid buying floor is available for EUR Cost Item/i,
+		);
+	});
+
+	it("allows checkout when item_tax_rate N/A exempts item from 20% inclusive VAT template", async () => {
+		const invoiceDoc = ref<any>({
+			is_return: 0,
+			currency: "USD",
+			taxes: [
+				{
+					charge_type: "On Net Total",
+					account_head: "VAT",
+					rate: 20,
+					included_in_print_rate: 1,
+				},
+			],
+			items: [
+				{
+					item_code: "NA-TAX-ITEM",
+					item_name: "NA Tax Item",
+					qty: 1,
+					rate: 100,
+					trade_price: 95,
+					item_tax_rate: JSON.stringify({ VAT: "N/A" }),
+				},
+			],
+			payments: [{ mode_of_payment: "Cash", amount: 100, type: "Cash" }],
+			rounded_total: 100,
+			grand_total: 100,
+		});
+
+		const submission = usePaymentSubmission({
+			invoiceDoc,
+			posProfile: ref({ posa_below_cost_action: "Block" }),
+			stockSettings: ref({}),
+			invoiceType: ref("Invoice"),
+			formatFloat: (value) => Number(value || 0),
+			stores: { toastStore: { show: vi.fn() } },
+			diff_payment: ref(0) as any,
+			isCashback: ref(true),
+		});
+
+		await expect(submission.validateSubmission(true)).resolves.toBe(true);
+	});
+
 	it("defers print and schedules background wait when invoice submission is queued", async () => {
 		const invoiceService = (
 			await import("../src/posapp/services/invoiceService")
