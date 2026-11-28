@@ -4702,6 +4702,124 @@ class TestItemSaleControls(unittest.TestCase):
             self.assertEqual(len(errors), 1)
             self.assertEqual(errors[0]["item_code"], "LOW")
 
+    def test_carried_inclusive_tax_rounding_reconciles_across_same_tax_group_rows(self):
+        erpnext_pkg = types.ModuleType("erpnext")
+        erpnext_setup = types.ModuleType("erpnext.setup")
+        erpnext_utils = types.ModuleType("erpnext.setup.utils")
+        erpnext_utils.get_exchange_rate = (
+            lambda from_curr, to_curr, *_args, **_kwargs: 3700.0
+            if (from_curr, to_curr) == ("USD", "UGX")
+            else 1.0
+        )
+
+        # Two USD 0.04 lines @ 18% inclusive VAT -> ERPNext taxes_and_totals.py:438-455
+        # carries rounding within the tax group: [0.03, 0.04] (sum 0.07 == round(0.08/1.18, 2)).
+        # At FX 3,700, row 1 earns UGX 111 (>= 100) and row 2 earns UGX 148 (>= 140).
+        def fake_get_all(doctype, **kwargs):
+            if doctype == "Item":
+                return [
+                    {"name": "ITEM-CARRY-1", "stock_uom": "Nos", "is_stock_item": 1, "valuation_rate": 0},
+                    {"name": "ITEM-CARRY-2", "stock_uom": "Nos", "is_stock_item": 1, "valuation_rate": 0},
+                    {"name": "ITEM-TAX-FREE", "stock_uom": "Nos", "is_stock_item": 1, "valuation_rate": 0},
+                ]
+            if doctype == "Bin":
+                return [
+                    {"item_code": "ITEM-CARRY-1", "warehouse": "Shop Floor - JBS", "valuation_rate": 100.0},
+                    {"item_code": "ITEM-CARRY-2", "warehouse": "Shop Floor - JBS", "valuation_rate": 140.0},
+                    {"item_code": "ITEM-TAX-FREE", "warehouse": "Shop Floor - JBS", "valuation_rate": 1000.0},
+                ]
+            return []
+
+        self.frappe.get_all = fake_get_all
+        self.frappe.db.get_value = lambda doctype, name, fieldname=None: (
+            "UGX" if doctype == "Company" and fieldname == "default_currency" else None
+        )
+
+        row_1 = PrecisionDoc(
+            item_code="ITEM-CARRY-1",
+            item_name="Carry Row 1",
+            qty=1,
+            rate=0.04,
+            amount=0.04,
+            net_rate=0.03,
+            net_amount=0.03,
+            base_net_rate=111.0,
+            base_net_amount=111.0,
+            uom="Nos",
+            warehouse="Shop Floor - JBS",
+            precision_value=2,
+        )
+        row_2 = PrecisionDoc(
+            item_code="ITEM-CARRY-2",
+            item_name="Carry Row 2",
+            qty=1,
+            rate=0.04,
+            amount=0.04,
+            net_rate=0.04,
+            net_amount=0.04,
+            base_net_rate=148.0,
+            base_net_amount=148.0,
+            uom="Nos",
+            warehouse="Shop Floor - JBS",
+            precision_value=2,
+        )
+        invoice = PrecisionDoc(
+            company="Test Co",
+            currency="USD",
+            conversion_rate=3700.0,
+            taxes=[
+                {
+                    "charge_type": "On Net Total",
+                    "account_head": "VAT 18% - CO",
+                    "rate": 18,
+                    "included_in_print_rate": 1,
+                }
+            ],
+            precision_value=2,
+        )
+
+        with patch.dict(
+            sys.modules,
+            {
+                "erpnext": erpnext_pkg,
+                "erpnext.setup": erpnext_setup,
+                "erpnext.setup.utils": erpnext_utils,
+            },
+        ):
+            # Valid ERPNext carried rounding [0.03, 0.04] across same-tax-group rows passes.
+            self.assertEqual(
+                self.controls.collect_below_buying_price_errors([row_1, row_2], invoice_doc=invoice),
+                [],
+            )
+
+            # Single forged row claiming net_amount=0.04 (unrounded 0.0339 -> UGX 125.42 < 140) still blocks.
+            single_errors = self.controls.collect_below_buying_price_errors([row_2], invoice_doc=invoice)
+            self.assertEqual(len(single_errors), 1)
+            self.assertEqual(single_errors[0]["item_code"], "ITEM-CARRY-2")
+
+            # Cross-tax-group tampering (0% tax row shaved 10.00 -> 9.99 to fund +0.01 on 18% VAT row) still blocks.
+            tax_free_shaved = PrecisionDoc(
+                item_code="ITEM-TAX-FREE",
+                item_name="Tax Free Shaved",
+                qty=1,
+                rate=10.00,
+                amount=10.00,
+                net_rate=9.99,
+                net_amount=9.99,
+                base_net_rate=36963.0,
+                base_net_amount=36963.0,
+                item_tax_rate='{"VAT 18% - CO": 0}',
+                uom="Nos",
+                warehouse="Shop Floor - JBS",
+                precision_value=2,
+            )
+            cross_group_errors = self.controls.collect_below_buying_price_errors(
+                [tax_free_shaved, row_2],
+                invoice_doc=invoice,
+            )
+            self.assertEqual(len(cross_group_errors), 1)
+            self.assertEqual(cross_group_errors[0]["item_code"], "ITEM-CARRY-2")
+
 
 if __name__ == "__main__":
     unittest.main()

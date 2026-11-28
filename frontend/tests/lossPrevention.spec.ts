@@ -1497,4 +1497,207 @@ describe("loss prevention", () => {
 		});
 		expect(floor?.rate).toBeCloseTo(8);
 	});
+
+	it("applies buying_exchange_rate on raw foreign buying scalars even when source currency equals invoice currency", () => {
+		// Raw USD 10 trade_price @ buying FX 4,050 vs USD invoice @ selling FX 3,700 (UGX company):
+		// floor in USD is 10 * 4050 / 3700 = 10.945946 -> USD 10.50 MUST block, USD 11.00 passes.
+		const baseItem = {
+			item_code: "USD-RAW-SCALAR",
+			item_name: "USD Raw Scalar Item",
+			qty: 1,
+			currency: "USD",
+			company_currency: "UGX",
+			conversion_rate: 3700,
+			buying_price_currency: "USD",
+			buying_exchange_rate: 4050,
+			trade_price: 10,
+			uom: "Nos",
+			stock_uom: "Nos",
+			conversion_factor: 1,
+		};
+
+		const risk = getItemLossRisk(
+			{ ...baseItem, rate: 10.5 },
+			{ currencyPrecision: 2 },
+		);
+		expect(risk?.belowCost).toBe(true);
+		expect(risk?.costRate).toBeCloseTo((10 * 4050) / 3700, 4);
+
+		expect(
+			getItemLossRisk(
+				{ ...baseItem, rate: 11.0 },
+				{ currencyPrecision: 2 },
+			),
+		).toBeNull();
+
+		// Explicit invalid buying_exchange_rate (<= 0) on a foreign buying scalar MUST fail closed.
+		for (const badFx of [0, -1]) {
+			expect(
+				getItemCostFloor({ ...baseItem, buying_exchange_rate: badFx }),
+			).toBeNull();
+		}
+	});
+
+	it("accepts valid ERPNext carried tax-group rounding [0.03, 0.04] while rejecting forged or cross-group inflation", () => {
+		const taxes = [
+			{
+				charge_type: "On Net Total",
+				account_head: "VAT 18% - CO",
+				rate: 18,
+				included_in_print_rate: 1,
+			},
+		];
+		const row1 = {
+			item_code: "CARRY-1",
+			qty: 1,
+			rate: 0.04,
+			amount: 0.04,
+			net_rate: 0.03,
+			net_amount: 0.03,
+			currency: "USD",
+			company_currency: "UGX",
+			conversion_rate: 3700,
+			valuation_rate: 100,
+		};
+		const row2 = {
+			item_code: "CARRY-2",
+			qty: 1,
+			rate: 0.04,
+			amount: 0.04,
+			net_rate: 0.04,
+			net_amount: 0.04,
+			currency: "USD",
+			company_currency: "UGX",
+			conversion_rate: 3700,
+			valuation_rate: 140,
+		};
+
+		// Two same-tax-group rows: native [0.03, 0.04] sums to 0.07 == round(0.08/1.18, 2).
+		expect(
+			findLossRiskItems([row1, row2], { taxes, currencyPrecision: 2 }),
+		).toEqual([]);
+
+		// Single forged row claiming 0.04 (unrounded 0.0339 -> UGX 125.42 < 140) MUST still block.
+		const singleBlocked = findLossRiskItems([row2], {
+			taxes,
+			currencyPrecision: 2,
+		});
+		expect(singleBlocked).toHaveLength(1);
+		expect(singleBlocked[0]?.itemCode).toBe("CARRY-2");
+
+		// Cross-tax-group tampering (0% tax row shaved 10.00 -> 9.99 to fund +0.01 on 18% VAT row) MUST still block.
+		const taxFreeShaved = {
+			item_code: "TAX-FREE",
+			qty: 1,
+			rate: 10.0,
+			amount: 10.0,
+			net_rate: 9.99,
+			net_amount: 9.99,
+			item_tax_rate: JSON.stringify({ "VAT 18% - CO": 0 }),
+			currency: "USD",
+			company_currency: "UGX",
+			conversion_rate: 3700,
+			valuation_rate: 1000,
+		};
+		const crossGroupBlocked = findLossRiskItems([taxFreeShaved, row2], {
+			taxes,
+			currencyPrecision: 2,
+		});
+		expect(crossGroupBlocked).toHaveLength(1);
+		expect(crossGroupBlocked[0]?.itemCode).toBe("CARRY-2");
+	});
+
+	it("matches Frappe banker's rounding (legacy default at 0dp and explicit Banker's Rounding at 2dp)", () => {
+		// Default Frappe "Banker's Rounding (legacy)" at 0 decimals: 42.5 -> 42 (passes), 43.5 -> 44 (blocks).
+		expect(
+			getItemLossRisk(
+				{
+					item_code: "BANKER-EVEN-0DP",
+					qty: 1,
+					rate: 42,
+					valuation_rate: 42.5,
+				},
+				{ currencyPrecision: 0 },
+			),
+		).toBeNull();
+
+		expect(
+			getItemLossRisk(
+				{
+					item_code: "BANKER-ODD-0DP",
+					qty: 1,
+					rate: 43,
+					valuation_rate: 43.5,
+				},
+				{ currencyPrecision: 0 },
+			)?.belowCost,
+		).toBe(true);
+
+		// At 2 decimals, default legacy mode avoids binary FP drift (10.005 -> 10.01, 10.015 -> 10.02).
+		expect(
+			getItemLossRisk(
+				{
+					item_code: "LEGACY-2DP-005",
+					qty: 1,
+					rate: 10.0,
+					valuation_rate: 10.005,
+				},
+				{ currencyPrecision: 2 },
+			)?.belowCost,
+		).toBe(true);
+		expect(
+			getItemLossRisk(
+				{
+					item_code: "LEGACY-2DP-015",
+					qty: 1,
+					rate: 10.01,
+					valuation_rate: 10.015,
+				},
+				{ currencyPrecision: 2 },
+			)?.belowCost,
+		).toBe(true);
+
+		// Explicit Frappe "Banker's Rounding" applies round-half-to-even at 2 decimals too (10.005 -> 10.00, 10.015 -> 10.02).
+		const previousFrappe = (globalThis as any).frappe;
+		(globalThis as any).frappe = {
+			...(previousFrappe || {}),
+			boot: {
+				...(previousFrappe?.boot || {}),
+				sysdefaults: {
+					...(previousFrappe?.boot?.sysdefaults || {}),
+					rounding_method: "Banker's Rounding",
+				},
+			},
+		};
+		try {
+			expect(
+				getItemLossRisk(
+					{
+						item_code: "BANKER-2DP-EVEN",
+						qty: 1,
+						rate: 10.0,
+						valuation_rate: 10.005,
+					},
+					{ currencyPrecision: 2 },
+				),
+			).toBeNull();
+			expect(
+				getItemLossRisk(
+					{
+						item_code: "BANKER-2DP-ODD",
+						qty: 1,
+						rate: 10.01,
+						valuation_rate: 10.015,
+					},
+					{ currencyPrecision: 2 },
+				)?.belowCost,
+			).toBe(true);
+		} finally {
+			if (previousFrappe === undefined) {
+				delete (globalThis as any).frappe;
+			} else {
+				(globalThis as any).frappe = previousFrappe;
+			}
+		}
+	});
 });

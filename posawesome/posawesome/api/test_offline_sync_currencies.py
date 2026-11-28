@@ -231,6 +231,73 @@ class TestOfflineSyncCurrencies(unittest.TestCase):
         self.assertIn("next_watermark", response)
         self.assertIn("has_more", response)
 
+    def test_sync_currency_scope_requests_and_emits_purpose_flags_and_name(self):
+        orig_get_all = self.module.frappe.get_all
+        orig_get_latest_rate = self.module.get_latest_rate
+        captured_fields = []
+        latest_rate_calls = []
+
+        def fake_get_all(doctype, **kwargs):
+            if doctype == "Currency Exchange":
+                captured_fields.append(list(kwargs.get("fields") or []))
+                return [
+                    AttrDict(
+                        {
+                            "name": "FX-USD-UGX-BUY",
+                            "from_currency": "USD",
+                            "to_currency": "UGX",
+                            "exchange_rate": 4050.0,
+                            "date": "2026-04-08",
+                            "for_buying": 1,
+                            "for_selling": 0,
+                            "modified": "2026-04-08T10:00:00",
+                        }
+                    ),
+                    AttrDict(
+                        {
+                            "name": "FX-USD-UGX-SELL",
+                            "from_currency": "USD",
+                            "to_currency": "UGX",
+                            "exchange_rate": 3700.0,
+                            "date": "2026-04-09",
+                            "for_buying": 0,
+                            "for_selling": 1,
+                            "modified": "2026-04-09T10:00:00",
+                        }
+                    ),
+                ]
+            return orig_get_all(doctype, **kwargs)
+
+        def fake_get_latest_rate(from_currency, to_currency, **kwargs):
+            latest_rate_calls.append((from_currency, to_currency, kwargs))
+            return 3700.0, "2026-04-09"
+
+        self.module.frappe.get_all = fake_get_all
+        self.module.get_latest_rate = fake_get_latest_rate
+        try:
+            response = self.module.sync_currency_scope(
+                pos_profile="POS-TEST",
+                watermark=None,
+                currency_pairs='[{"from_currency":"USD","to_currency":"UGX"}]',
+            )
+        finally:
+            self.module.frappe.get_all = orig_get_all
+            self.module.get_latest_rate = orig_get_latest_rate
+
+        self.assertEqual(len(captured_fields), 1)
+        for required_field in ("name", "for_buying", "for_selling"):
+            self.assertIn(required_field, captured_fields[0])
+        rate_changes = {
+            row["key"]: row["data"]
+            for row in response["changes"]
+            if row["key"].startswith("currency_rate::")
+        }
+        self.assertEqual(rate_changes["currency_rate::FX-USD-UGX-BUY"]["for_buying"], 1)
+        self.assertEqual(rate_changes["currency_rate::FX-USD-UGX-BUY"]["for_selling"], 0)
+        self.assertEqual(rate_changes["currency_rate::FX-USD-UGX-SELL"]["for_buying"], 0)
+        self.assertEqual(rate_changes["currency_rate::FX-USD-UGX-SELL"]["for_selling"], 1)
+        self.assertEqual(latest_rate_calls[0][2].get("purpose"), "for_selling")
+
 
 if __name__ == "__main__":
     unittest.main()

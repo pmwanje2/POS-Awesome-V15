@@ -705,6 +705,103 @@ class TestItemFetchers(unittest.TestCase):
         finally:
             self.module.frappe.db.get_value = orig_db_get_value
 
+    def test_aggregator_resolves_selling_fx_for_fixed_foreign_profile_with_multi_currency_disabled(self):
+        fx_calls = []
+        orig_get_exchange_rate = self.module.get_exchange_rate
+        orig_db_get_value = self.module.frappe.db.get_value
+        lookup_names = (
+            "_fetch_item_prices",
+            "_fetch_bin_qty",
+            "_fetch_item_meta",
+            "_fetch_uoms",
+            "_fetch_barcodes",
+            "_fetch_bom_costs",
+            "_fetch_batches",
+            "_fetch_serials",
+        )
+        originals = {name: getattr(self.module, name) for name in lookup_names}
+        try:
+            def fake_get_exchange_rate(from_curr, to_curr, transaction_date=None, args=None):
+                fx_calls.append((from_curr, to_curr, args))
+                if (from_curr, to_curr) == ("USD", "UGX"):
+                    return 4050.0 if args == "for_buying" else 3700.0
+                return 1.0
+
+            def fake_db_get_value(doctype, name, fieldname=None):
+                if doctype == "Company" and fieldname == "default_currency":
+                    return "UGX"
+                if doctype == "Price List" and fieldname == "currency":
+                    return {"USD Selling": "USD", "USD Buying": "USD"}.get(name)
+                return None
+
+            def fake_fetch_item_prices(price_list, currency, item_codes, customer, today):
+                if price_list == "USD Buying":
+                    return [
+                        AttrDict(
+                            {
+                                "item_code": "ITEM-USD-TILL",
+                                "uom": "Nos",
+                                "price_list_rate": 10.0,
+                                "currency": "USD",
+                                "price_list": "USD Buying",
+                            }
+                        )
+                    ]
+                return [
+                    AttrDict(
+                        {
+                            "item_code": "ITEM-USD-TILL",
+                            "uom": "Nos",
+                            "price_list_rate": 10.50,
+                            "currency": "USD",
+                            "price_list": "USD Selling",
+                        }
+                    )
+                ]
+
+            self.module.get_exchange_rate = fake_get_exchange_rate
+            self.module.frappe.db.get_value = fake_db_get_value
+            self.module._fetch_item_prices = fake_fetch_item_prices
+            self.module._fetch_bin_qty = lambda *_a, **_k: []
+            self.module._fetch_item_meta = lambda *_a, **_k: [
+                AttrDict({"name": "ITEM-USD-TILL", "stock_uom": "Nos"})
+            ]
+            self.module._fetch_uoms = lambda *_a, **_k: []
+            self.module._fetch_barcodes = lambda *_a, **_k: []
+            self.module._fetch_bom_costs = lambda *_a, **_k: {}
+            self.module._fetch_batches = lambda *_a, **_k: []
+            self.module._fetch_serials = lambda *_a, **_k: []
+
+            aggregator = self.module.ItemDetailAggregator(
+                {
+                    "name": "USD Fixed Till",
+                    "company": "Test Co",
+                    "currency": "USD",
+                    "selling_price_list": "USD Selling",
+                    "buying_price_list": "USD Buying",
+                    "warehouse": "Main Store",
+                    "posa_allow_multi_currency": 0,
+                    "posa_use_server_cache": 0,
+                }
+            )
+            details = aggregator.build_details([{"item_code": "ITEM-USD-TILL"}])
+
+            self.assertEqual(aggregator.exchange_rate, 3700.0)
+            self.assertEqual(aggregator.buying_exchange_rate, 4050.0)
+            self.assertIn(("USD", "UGX", "for_selling"), fx_calls)
+            self.assertIn(("USD", "UGX", "for_buying"), fx_calls)
+            self.assertEqual(len(details), 1)
+            row = details[0]
+            self.assertEqual(row["conversion_rate"], 3700.0)
+            self.assertEqual(row["buying_rate_currency"], "USD")
+            self.assertAlmostEqual(row["base_buying_rate"], 40500.0, places=4)
+            self.assertAlmostEqual(row["trade_price"], 10.0 * 4050.0 / 3700.0, places=4)
+        finally:
+            self.module.get_exchange_rate = orig_get_exchange_rate
+            self.module.frappe.db.get_value = orig_db_get_value
+            for name, original in originals.items():
+                setattr(self.module, name, original)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -247,4 +247,75 @@ describe("offline pricing repositories", () => {
 			}),
 		);
 	});
+
+	it("filters Currency Exchange rows by purpose and breaks same-day ties by specificity then name desc", async () => {
+		await currencyRateRepository.upsertMany([
+			{
+				name: "FX-001",
+				profile_name: "POS-1",
+				company: "Test Co",
+				from_currency: "USD",
+				to_currency: "UGX",
+				exchange_rate: 4000,
+				date: "2026-05-10",
+				for_buying: 1,
+				for_selling: 1,
+			},
+			{
+				name: "FX-002",
+				profile_name: "POS-1",
+				company: "Test Co",
+				from_currency: "USD",
+				to_currency: "UGX",
+				exchange_rate: 4050,
+				date: "2026-05-10",
+				for_buying: 1,
+				for_selling: 0,
+			},
+			{
+				name: "FX-003",
+				profile_name: "POS-1",
+				company: "Test Co",
+				from_currency: "USD",
+				to_currency: "UGX",
+				exchange_rate: 4080,
+				date: "2026-05-10",
+				for_buying: 1,
+				for_selling: 0,
+			},
+			{
+				name: "FX-004",
+				profile_name: "POS-1",
+				company: "Test Co",
+				from_currency: "USD",
+				to_currency: "UGX",
+				exchange_rate: 3700,
+				date: "2026-05-15",
+				for_buying: 0,
+				for_selling: 1,
+			},
+		]);
+
+		const buyingRate = await currencyRateRepository.findLatestOnOrBefore({
+			profileName: "POS-1",
+			company: "Test Co",
+			fromCurrency: "USD",
+			toCurrency: "UGX",
+			date: "2026-05-20",
+			purpose: "for_buying",
+		});
+		expect(buyingRate?.name).toBe("FX-003");
+		expect(buyingRate?.exchange_rate).toBe(4080);
+
+		const sellingRate = await currencyRateRepository.findLatestOnOrBefore({
+			profileName: "POS-1",
+			company: "Test Co",
+			fromCurrency: "USD",
+			toCurrency: "UGX",
+			date: "2026-05-20",
+			purpose: "for_selling",
+		});
+		expect(sellingRate?.name).toBe("FX-004");
+		expect(sellingRate?.exchange_rate).toBe(3700);
+	});
 });

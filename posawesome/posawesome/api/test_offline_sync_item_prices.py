@@ -215,6 +215,39 @@ class TestOfflineSyncItemPrices(unittest.TestCase):
         self.assertEqual(ITEM_PRICE_QUERY_STARTS, [994000])
         self.assertFalse(response["has_more"])
 
+    def test_sync_item_prices_propagates_price_not_uom_dependent_for_buying_price_list(self):
+        orig_get_all = self.module.frappe.get_all
+
+        def fake_get_all(doctype, **kwargs):
+            if doctype == "Price List":
+                filters = kwargs.get("filters") or {}
+                if filters.get("selling") == 1:
+                    return [
+                        {"name": "Retail", "selling": 1, "price_not_uom_dependent": 0},
+                        {"name": "Export", "selling": 1, "price_not_uom_dependent": 0},
+                    ]
+                return [
+                    {"name": "Retail", "price_not_uom_dependent": 0},
+                    {"name": "Export", "price_not_uom_dependent": 0},
+                    {"name": "Buying", "price_not_uom_dependent": 1},
+                ]
+            return orig_get_all(doctype, **kwargs)
+
+        self.module.frappe.get_all = fake_get_all
+        try:
+            response = self.module.sync_item_prices(
+                pos_profile="POS-TEST",
+                watermark="2026-05-31T00:00:00",
+                limit=10,
+            )
+        finally:
+            self.module.frappe.get_all = orig_get_all
+
+        changes_by_key = {row["key"]: row["data"] for row in response["changes"]}
+        self.assertEqual(changes_by_key["item_price::IP-003"].get("price_not_uom_dependent"), 1)
+        self.assertEqual(changes_by_key["item_price::IP-001"].get("price_not_uom_dependent"), 0)
+        self.assertEqual(response["scope"].get("buying_price_not_uom_dependent"), 1)
+
 
 if __name__ == "__main__":
     unittest.main()
