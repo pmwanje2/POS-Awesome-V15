@@ -97,25 +97,63 @@ export function toFiniteNumber(value: unknown): number | null {
 	return Number.isFinite(parsed) ? parsed : null;
 }
 
+function resolveInvoiceToCompanyRate(
+	item: Record<string, unknown>,
+	buyingTableCurrency = "",
+): number | null {
+	const invoiceCurrency = String(
+		item.currency || item.price_list_currency || "",
+	).trim();
+	const companyCurrency = String(item.company_currency || "").trim();
+	const buyingPriceCurrency = String(
+		item.buying_price_currency || buyingTableCurrency || "",
+	).trim();
+
+	if (
+		invoiceCurrency &&
+		companyCurrency &&
+		invoiceCurrency === companyCurrency
+	) {
+		return 1;
+	}
+
+	const rawCurrencyRate = toFiniteNumber(item.conversion_rate);
+	if (rawCurrencyRate !== null && rawCurrencyRate > EPSILON) {
+		return rawCurrencyRate;
+	}
+
+	const isCrossCurrency = Boolean(
+		(invoiceCurrency &&
+			companyCurrency &&
+			invoiceCurrency !== companyCurrency) ||
+			(invoiceCurrency &&
+				!companyCurrency &&
+				buyingPriceCurrency &&
+				buyingPriceCurrency !== invoiceCurrency),
+	);
+	if (isCrossCurrency) {
+		return null;
+	}
+
+	return 1;
+}
+
 export function getItemCostFloor(
 	item: Record<string, unknown> | null | undefined,
 ): LossCostFloor | null {
 	if (!item) {
 		return null;
 	}
-	const rawCurrencyRate = toFiniteNumber(item.conversion_rate);
-	const currencyConversionRate =
-		rawCurrencyRate !== null && rawCurrencyRate > EPSILON
-			? rawCurrencyRate
-			: 1;
 	const rawUomFactor = toFiniteNumber(item.conversion_factor);
 	const uomConversionFactor =
 		rawUomFactor !== null && rawUomFactor > EPSILON ? rawUomFactor : 1;
 
 	const resolvedCandidates: LossCostFloor[] = [];
 	let hasNormalizedBuyingPrice = false;
+	let selectedTableCurrency = "";
 
 	const pricesByUom = item._buying_prices_by_uom;
+	let selectedTableRate: number | null = null;
 	if (pricesByUom && typeof pricesByUom === "object") {
 		const prices = pricesByUom as Record<
 			string,
@@ -126,15 +164,49 @@ export function getItemCostFloor(
 		const exact = prices[selectedUom];
 		const fallback = prices[stockUom] || prices[""];
 		const selected = exact || fallback;
+		selectedTableCurrency = String(selected?.currency || "").trim();
 		const baseRate = toFiniteNumber(selected?.base_price_list_rate);
 		if (baseRate !== null && baseRate > EPSILON) {
 			const conversionFactor = exact ? 1 : uomConversionFactor;
-			resolvedCandidates.push({
-				field: "_buying_prices_by_uom",
-				label: "Trade Price",
-				rate: baseRate * conversionFactor,
-				baseCurrency: true,
-			});
+			selectedTableRate = baseRate * conversionFactor;
+			hasNormalizedBuyingPrice = true;
+		}
+	}
+
+	const invoiceToCompanyRate = resolveInvoiceToCompanyRate(
+		item,
+		selectedTableCurrency,
+	);
+	if (selectedTableRate !== null && invoiceToCompanyRate !== null) {
+		resolvedCandidates.push({
+			field: "_buying_prices_by_uom",
+			label: "Trade Price",
+			rate: selectedTableRate,
+			baseCurrency: true,
+		});
+	}
+
+	if (!hasNormalizedBuyingPrice) {
+		const storedCompanyBuying = toFiniteNumber(item._company_buying_price);
+		const baseBuyingRate = toFiniteNumber(item.base_buying_rate);
+		const companyBuyingPrice =
+			storedCompanyBuying !== null && storedCompanyBuying > EPSILON
+				? storedCompanyBuying
+				: baseBuyingRate !== null && baseBuyingRate > EPSILON
+					? baseBuyingRate
+					: null;
+		if (companyBuyingPrice !== null) {
+			if (invoiceToCompanyRate !== null) {
+				resolvedCandidates.push({
+					field:
+						storedCompanyBuying !== null && storedCompanyBuying > EPSILON
+							? "_company_buying_price"
+							: "base_buying_rate",
+					label: "Trade Price",
+					rate: companyBuyingPrice,
+					baseCurrency: true,
+				});
+			}
 			hasNormalizedBuyingPrice = true;
 		}
 	}
@@ -152,23 +224,36 @@ export function getItemCostFloor(
 		if (rawRate === null || rawRate <= EPSILON) {
 			continue;
 		}
+		if (candidate.baseCurrency && invoiceToCompanyRate === null) {
+			continue;
+		}
 		if (candidate.buyingListField) {
 			if (hasNormalizedBuyingPrice) {
 				continue;
 			}
-			const alreadyInInvoiceCurrency = Boolean(
-				buyingRateCurrency &&
-					invoiceCurrency &&
-					buyingRateCurrency === invoiceCurrency,
-			);
+			const scalarCurrency = buyingRateCurrency || buyingPriceCurrency;
 			const currencyMismatch = Boolean(
-				!alreadyInInvoiceCurrency &&
-					buyingPriceCurrency &&
+				scalarCurrency &&
 					invoiceCurrency &&
-					buyingPriceCurrency !== invoiceCurrency,
+					scalarCurrency !== invoiceCurrency,
 			);
 			if (currencyMismatch) {
+				if (invoiceToCompanyRate === null) {
+					continue;
+				}
 				if (
+					companyCurrency &&
+					scalarCurrency === companyCurrency
+				) {
+					resolvedCandidates.push({
+						field: candidate.field,
+						label: candidate.label,
+						rate: rawRate,
+						baseCurrency: true,
+					});
+				} else if (
+					buyingPriceCurrency &&
+					scalarCurrency === buyingPriceCurrency &&
 					rawBuyingExchangeRate !== null &&
 					rawBuyingExchangeRate > EPSILON
 				) {
@@ -176,16 +261,6 @@ export function getItemCostFloor(
 						field: candidate.field,
 						label: candidate.label,
 						rate: rawRate * rawBuyingExchangeRate,
-						baseCurrency: true,
-					});
-				} else if (
-					companyCurrency &&
-					buyingPriceCurrency === companyCurrency
-				) {
-					resolvedCandidates.push({
-						field: candidate.field,
-						label: candidate.label,
-						rate: rawRate,
 						baseCurrency: true,
 					});
 				}
@@ -207,15 +282,16 @@ export function getItemCostFloor(
 		return null;
 	}
 
+	const comparisonRate = invoiceToCompanyRate ?? 1;
 	let highest = resolvedCandidates[0]!;
 	let highestBaseRate = highest.baseCurrency
 		? highest.rate
-		: highest.rate * currencyConversionRate;
+		: highest.rate * comparisonRate;
 
 	for (const candidate of resolvedCandidates.slice(1)) {
 		const candidateBaseRate = candidate.baseCurrency
 			? candidate.rate
-			: candidate.rate * currencyConversionRate;
+			: candidate.rate * comparisonRate;
 		if (candidateBaseRate > highestBaseRate + EPSILON) {
 			highest = candidate;
 			highestBaseRate = candidateBaseRate;
@@ -307,7 +383,14 @@ export function getItemLossRisk(
 	);
 	const minimumCostRate =
 		cost.rate * (1 + minimumMarginPercentage / 100);
-	const currencyConversionRate = toFiniteNumber(item.conversion_rate) || 1;
+	let currencyConversionRate = 1;
+	if (cost.baseCurrency) {
+		const resolvedRate = resolveInvoiceToCompanyRate(item);
+		if (resolvedRate === null) {
+			return null;
+		}
+		currencyConversionRate = resolvedRate;
+	}
 	const comparisonSellingRate = cost.baseCurrency
 		? effectiveSellingRate * currencyConversionRate
 		: effectiveSellingRate;

@@ -560,6 +560,11 @@ def merge_item_row(
         if buying_price_row and buying_price_row.get("price_list_rate") is not None
         else None
     )
+    base_buying_rate = (
+        raw_buying_rate * flt(buying_exchange_rate)
+        if raw_buying_rate is not None and flt(buying_exchange_rate) > 0
+        else None
+    )
     if raw_buying_rate is None:
         normalized_buying_rate = None
         buying_rate_currency = None
@@ -587,6 +592,7 @@ def merge_item_row(
             "valuation_rate": effective_valuation,
             "warehouse_valuation_rate": warehouse_valuation if warehouse_valuation > 0 else None,
             "last_purchase_rate": meta.get("last_purchase_rate"),
+            "base_buying_rate": base_buying_rate,
             "trade_price": normalized_buying_rate,
             "buying_rate": normalized_buying_rate,
             "buying_rate_currency": buying_rate_currency,

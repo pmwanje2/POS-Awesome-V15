@@ -35,6 +35,68 @@ const parseFinite = (value: unknown): number | null => {
 	return Number.isFinite(numeric) ? numeric : null;
 };
 
+const parsePositiveFinite = (value: unknown): number | null => {
+	const numeric = parseFinite(value);
+	return numeric !== null && numeric > 0 ? numeric : null;
+};
+
+const resolveCompanyBuyingPrice = (
+	item: CurrencyItem,
+	companyCurrency: string,
+	previousCurrency: string,
+	previousConversionRate: number | null,
+	priceListCurrency: string,
+	plcToCompanyRate: number,
+): number | null => {
+	const storedCompanyBuying =
+		parsePositiveFinite(item._company_buying_price) ??
+		parsePositiveFinite(item.base_buying_rate);
+	if (storedCompanyBuying !== null) {
+		return storedCompanyBuying;
+	}
+
+	const scalarBuying =
+		parsePositiveFinite(item.trade_price) ??
+		parsePositiveFinite(item.buying_rate) ??
+		parsePositiveFinite(item.buying_price);
+	if (scalarBuying === null) {
+		return null;
+	}
+
+	const buyingRateCurrency = String(item.buying_rate_currency || "").trim();
+	const buyingPriceCurrency = String(item.buying_price_currency || "").trim();
+	const scalarCurrency =
+		buyingRateCurrency || buyingPriceCurrency || previousCurrency;
+
+	if (!scalarCurrency || scalarCurrency === companyCurrency) {
+		return scalarBuying;
+	}
+	const buyingExchangeRate = parsePositiveFinite(item.buying_exchange_rate);
+	if (
+		buyingPriceCurrency &&
+		scalarCurrency === buyingPriceCurrency &&
+		buyingExchangeRate !== null
+	) {
+		return scalarBuying * buyingExchangeRate;
+	}
+	if (
+		previousCurrency &&
+		scalarCurrency === previousCurrency &&
+		previousConversionRate !== null &&
+		previousConversionRate > 0
+	) {
+		return scalarBuying * previousConversionRate;
+	}
+	if (
+		priceListCurrency &&
+		scalarCurrency === priceListCurrency &&
+		plcToCompanyRate > 0
+	) {
+		return scalarBuying * plcToCompanyRate;
+	}
+	return null;
+};
+
 export function useItemCurrency() {
 	/**
 	 * Calculates the rate from Price List Currency to Company Currency.
@@ -62,6 +124,8 @@ export function useItemCurrency() {
 	) => {
 		if (!item) return;
 		const base = getCompanyCurrency(context) || context.pos_profile.currency;
+		const previousCurrency = String(item.currency || "").trim();
+		const previousConversionRate = parsePositiveFinite(item.conversion_rate);
 
 		if (!item.original_rate) {
 			const sourceRate =
@@ -90,6 +154,20 @@ export function useItemCurrency() {
 		const priceListCurrency = getPriceListCurrency(context) || base;
 		const selectedCurrency = getSelectedCurrency(context) || base;
 
+		// Preserve company-currency buying cost before switching item.currency/conversion_rate.
+		const companyBuyingPrice = resolveCompanyBuyingPrice(
+			item,
+			base,
+			previousCurrency,
+			previousConversionRate,
+			priceListCurrency,
+			plc_to_cc_rate,
+		);
+		if (companyBuyingPrice !== null) {
+			item._company_buying_price = companyBuyingPrice;
+			item.base_buying_rate = companyBuyingPrice;
+		}
+
 		// Benchmark note: when PLC === SC, keep the displayed rate in PLC to avoid CC bleed-through.
 		const converted_rate =
 			selectedCurrency === priceListCurrency
@@ -103,7 +181,43 @@ export function useItemCurrency() {
 
 		item.rate = flt(converted_rate, context.currency_precision);
 		item.currency = selectedCurrency;
+		item.company_currency = base;
 		item.price_list_rate = item.rate;
+
+		let nextConversionRate: number;
+		if (selectedCurrency === base) {
+			nextConversionRate = 1;
+		} else if (context.conversion_rate !== undefined) {
+			nextConversionRate = parsePositiveFinite(context.conversion_rate) ?? 0;
+		} else {
+			const displayRate = parsePositiveFinite(context.exchange_rate);
+			nextConversionRate =
+				displayRate !== null && plc_to_cc_rate > 0
+					? plc_to_cc_rate / displayRate
+					: 0;
+		}
+		item.conversion_rate = nextConversionRate;
+
+		if (companyBuyingPrice !== null) {
+			if (nextConversionRate > 0) {
+				const normalizedBuying =
+					selectedCurrency === base
+						? companyBuyingPrice
+						: companyBuyingPrice / nextConversionRate;
+				if (item.trade_price !== undefined) {
+					item.trade_price = normalizedBuying;
+				}
+				if (item.buying_rate !== undefined) {
+					item.buying_rate = normalizedBuying;
+				}
+				if (item.buying_price !== undefined) {
+					item.buying_price = normalizedBuying;
+				}
+				item.buying_rate_currency = selectedCurrency;
+			} else if (item.buying_rate_currency !== undefined) {
+				item.buying_rate_currency = undefined;
+			}
+		}
 	};
 
 	/**

@@ -1235,8 +1235,12 @@ export function saveItemDetailsCache(profileName, priceList, items) {
 				price_list_rate: it.price_list_rate,
 				trade_price: it.trade_price,
 				buying_rate: it.buying_rate,
+				base_buying_rate: it.base_buying_rate,
+				buying_rate_currency: it.buying_rate_currency,
+				buying_exchange_rate: it.buying_exchange_rate,
 				buying_price_list: it.buying_price_list,
 				buying_price_currency: it.buying_price_currency,
+				company_currency: it.company_currency,
 				_buying_prices_by_uom: it._buying_prices_by_uom,
 			}));
 			cleanItems = JSON.parse(JSON.stringify(cleanItems));

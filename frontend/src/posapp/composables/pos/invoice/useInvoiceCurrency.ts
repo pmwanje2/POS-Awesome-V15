@@ -272,6 +272,73 @@ export function useInvoiceCurrency() {
 		await update_currency_and_rate();
 	};
 
+	const parsePositiveFinite = (value: unknown): number | null => {
+		const numeric = parseFinite(value);
+		return numeric !== null && numeric > 0 ? numeric : null;
+	};
+
+	const preserveItemCompanyBuyingPrice = (
+		item: any,
+		companyCurrency: string,
+		priceListCurrency: string,
+		plcToCompanyRate: number,
+	): number | null => {
+		const storedCompanyBuying =
+			parsePositiveFinite(item?._company_buying_price) ??
+			parsePositiveFinite(item?.base_buying_rate);
+		if (storedCompanyBuying !== null) {
+			return storedCompanyBuying;
+		}
+		const scalarBuying =
+			parsePositiveFinite(item?.trade_price) ??
+			parsePositiveFinite(item?.buying_rate) ??
+			parsePositiveFinite(item?.buying_price);
+		if (scalarBuying === null) {
+			return null;
+		}
+		const previousCurrency = String(item?.currency || "").trim();
+		const previousConversionRate = parsePositiveFinite(
+			item?.conversion_rate,
+		);
+		const buyingRateCurrency = String(
+			item?.buying_rate_currency || "",
+		).trim();
+		const buyingPriceCurrency = String(
+			item?.buying_price_currency || "",
+		).trim();
+		const scalarCurrency =
+			buyingRateCurrency || buyingPriceCurrency || previousCurrency;
+
+		if (!scalarCurrency || scalarCurrency === companyCurrency) {
+			return scalarBuying;
+		}
+		const buyingExchangeRate = parsePositiveFinite(
+			item?.buying_exchange_rate,
+		);
+		if (
+			buyingPriceCurrency &&
+			scalarCurrency === buyingPriceCurrency &&
+			buyingExchangeRate !== null
+		) {
+			return scalarBuying * buyingExchangeRate;
+		}
+		if (
+			previousCurrency &&
+			scalarCurrency === previousCurrency &&
+			previousConversionRate !== null
+		) {
+			return scalarBuying * previousConversionRate;
+		}
+		if (
+			priceListCurrency &&
+			scalarCurrency === priceListCurrency &&
+			plcToCompanyRate > 0
+		) {
+			return scalarBuying * plcToCompanyRate;
+		}
+		return null;
+	};
+
 	const update_item_rates = async () => {
 		console.log(
 			"Updating item rates with exchange rate:",
@@ -280,25 +347,47 @@ export function useInvoiceCurrency() {
 		const items = invoiceStore.items;
 		const companyCurrency =
 			(company.value && company.value.default_currency) ||
-			pos_profile.value?.currency;
+			pos_profile.value?.currency ||
+			"";
+		const selectedCurrency = selected_currency.value || companyCurrency;
+		const rawConversionRate = parsePositiveFinite(conversion_rate.value);
+		const itemConversionRate =
+			selectedCurrency === companyCurrency
+				? 1
+				: rawConversionRate !== null
+					? rawConversionRate
+					: 0;
 		const conversionRate = conversion_rate.value || 1;
 		const precision = currency_precision.value;
+		const resolvedPriceListCurrency =
+			price_list_currency.value || companyCurrency;
 		const currencyContext = {
 			pos_profile: pos_profile.value,
 			company: company.value,
-			price_list_currency: price_list_currency.value || companyCurrency,
-			selected_currency: selected_currency.value,
+			price_list_currency: resolvedPriceListCurrency,
+			selected_currency: selectedCurrency,
 			exchange_rate: exchange_rate.value || 1,
 			conversion_rate: conversionRate,
 		};
+		const plcToCompanyRate = getPlcConversionRate(currencyContext);
 
 		items.forEach((item: any) => {
 			item._skip_calc = true;
+			const companyBuyingPrice = preserveItemCompanyBuyingPrice(
+				item,
+				companyCurrency,
+				resolvedPriceListCurrency,
+				plcToCompanyRate,
+			);
+			if (companyBuyingPrice !== null) {
+				item._company_buying_price = companyBuyingPrice;
+				item.base_buying_rate = companyBuyingPrice;
+			}
 			refreshCanonicalBaseRates(item, currencyContext);
 
 			// Ensure base rates exist
 			if (!item.base_rate) {
-				if (selected_currency.value === companyCurrency) {
+				if (selectedCurrency === companyCurrency) {
 					item.base_rate = item.rate;
 					item.base_price_list_rate = item.price_list_rate;
 					item.base_discount_amount = item.discount_amount || 0;
@@ -320,7 +409,7 @@ export function useInvoiceCurrency() {
 				}
 			}
 
-			if (selected_currency.value === companyCurrency) {
+			if (selectedCurrency === companyCurrency) {
 				item.price_list_rate = item.base_price_list_rate;
 				item.rate = item.base_rate;
 				item.discount_amount = item.base_discount_amount;
@@ -352,6 +441,30 @@ export function useInvoiceCurrency() {
 				item.rate = converted_rate < 0.000001 ? 0 : converted_rate;
 				item.discount_amount =
 					converted_discount < 0.000001 ? 0 : converted_discount;
+			}
+
+			item.company_currency = companyCurrency;
+			item.currency = selectedCurrency;
+			item.conversion_rate = itemConversionRate;
+			if (companyBuyingPrice !== null) {
+				if (itemConversionRate > 0) {
+					const normalizedBuying =
+						selectedCurrency === companyCurrency
+							? companyBuyingPrice
+							: companyBuyingPrice / itemConversionRate;
+					if (item.trade_price !== undefined) {
+						item.trade_price = normalizedBuying;
+					}
+					if (item.buying_rate !== undefined) {
+						item.buying_rate = normalizedBuying;
+					}
+					if (item.buying_price !== undefined) {
+						item.buying_price = normalizedBuying;
+					}
+					item.buying_rate_currency = selectedCurrency;
+				} else if (item.buying_rate_currency !== undefined) {
+					item.buying_rate_currency = undefined;
+				}
 			}
 
 			item.amount = flt(item.qty * item.rate, precision);

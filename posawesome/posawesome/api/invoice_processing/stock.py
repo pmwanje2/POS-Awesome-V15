@@ -268,22 +268,27 @@ def _apply_item_name_overrides(invoice_doc, overrides=None):
             item.name_overridden = 0
 
 
-def _merge_duplicate_taxes(invoice_doc):
+def _merge_duplicate_taxes(invoice_doc, recalculate=True):
     """Remove duplicate tax rows with same account and rate.
 
-    If duplicates are found, keep the first occurrence and recalculate totals.
+    If duplicates are found, keep the first occurrence and recalculate totals
+    when ``recalculate`` is enabled.
     """
     seen = set()
     unique = []
     for tax in invoice_doc.get("taxes", []):
-        key = (tax.account_head, flt(tax.rate), cstr(tax.charge_type))
+        account_head = tax.get("account_head") if isinstance(tax, dict) else tax.account_head
+        tax_rate = tax.get("rate") if isinstance(tax, dict) else tax.rate
+        charge_type = tax.get("charge_type") if isinstance(tax, dict) else tax.charge_type
+        key = (account_head, flt(tax_rate), cstr(charge_type))
         if key in seen:
             continue
         seen.add(key)
         unique.append(tax)
     if len(unique) != len(invoice_doc.get("taxes", [])):
         invoice_doc.set("taxes", unique)
-        invoice_doc.calculate_taxes_and_totals()
+        if recalculate:
+            invoice_doc.calculate_taxes_and_totals()
 
 
 def _deduplicate_free_items(invoice_doc):

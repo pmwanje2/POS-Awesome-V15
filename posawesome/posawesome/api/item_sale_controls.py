@@ -1,4 +1,5 @@
 import json
+import math
 
 import frappe
 from frappe import _
@@ -421,19 +422,12 @@ def _convert_floor_to_invoice_currency(
     return invoice_rate
 
 
-def resolve_buying_floors(items, pos_profile=None, invoice_doc=None):
-    """Resolve authoritative per-line cost floors across buying list, warehouse valuation, and LPR.
-
-    Client-provided ``trade_price``/``buying_rate``/``conversion_factor`` values are
-    intentionally ignored.
-    Evaluates (1) active Buying Item Price, (2) warehouse Bin.valuation_rate (stock items,
-    matching SAP VPRS / ERPNext SellingController), and (3) Item.last_purchase_rate,
-    selecting the highest normalized floor in company currency.
-    """
+def _resolve_buying_floors_with_context(items, pos_profile=None, invoice_doc=None):
+    """Resolve authoritative per-line cost floors and item stock UOM context."""
 
     item_rows = list(items or [])
     if not item_rows:
-        return {}
+        return {}, {}
 
     price_list, price_rows = _get_buying_price_rows(
         [row.get("item_code") for row in item_rows if hasattr(row, "get")],
@@ -626,6 +620,24 @@ def resolve_buying_floors(items, pos_profile=None, invoice_doc=None):
 
         if candidates_floors:
             floors[index] = max(candidates_floors, key=lambda entry: flt(entry.get("base_rate")))
+    return floors, stock_uoms
+
+
+def resolve_buying_floors(items, pos_profile=None, invoice_doc=None):
+    """Resolve authoritative per-line cost floors across buying list, warehouse valuation, and LPR.
+
+    Client-provided ``trade_price``/``buying_rate``/``conversion_factor`` values are
+    intentionally ignored.
+    Evaluates (1) active Buying Item Price, (2) warehouse Bin.valuation_rate (stock items,
+    matching SAP VPRS / ERPNext SellingController), and (3) Item.last_purchase_rate,
+    selecting the highest normalized floor in company currency.
+    """
+
+    floors, _stock_uoms = _resolve_buying_floors_with_context(
+        items,
+        pos_profile=pos_profile,
+        invoice_doc=invoice_doc,
+    )
     return floors
 
 
@@ -691,27 +703,34 @@ def _parse_item_tax_rate(row):
     return {}
 
 
-def _row_inclusive_tax_params(row, invoice_doc):
-    """Return ``(tax_fraction, per_unit_tax)`` for tax-inclusive rows on ``invoice_doc``."""
+def _row_tax_params(row, invoice_doc):
+    """Return ``(incl_a, incl_b, all_a, all_b)`` linear per-unit tax coefficients.
+
+    Matches ERPNext ``taxes_and_totals.py`` for ``On Net Total``,
+    ``On Item Quantity``, ``On Previous Row Amount``, and
+    ``On Previous Row Total``. For a per-unit net rate ``x``:
+    - Inclusive taxes equal ``incl_a * x + incl_b``
+    - All non-Actual taxes (inclusive + exclusive) equal ``all_a * x + all_b``
+    """
 
     if not invoice_doc or not hasattr(invoice_doc, "get"):
-        return 0.0, 0.0
+        return 0.0, 0.0, 0.0, 0.0
     taxes = invoice_doc.get("taxes") or []
     if not taxes:
-        return 0.0, 0.0
+        return 0.0, 0.0, 0.0, 0.0
 
     item_tax_map = _parse_item_tax_rate(row)
-    tax_fractions = []
-    running_fraction = 0.0
-    per_unit_tax = 0.0
+    incl_terms = []
+    all_terms = []
+    incl_a = incl_b = 0.0
+    all_a = all_b = 0.0
 
     for tax in taxes:
         if not hasattr(tax, "get"):
-            tax_fractions.append(0.0)
+            incl_terms.append((0.0, 0.0))
+            all_terms.append((0.0, 0.0))
             continue
-        if not cint(tax.get("included_in_print_rate")):
-            tax_fractions.append(0.0)
-            continue
+
         charge_type = cstr(tax.get("charge_type")).strip()
         account_head = tax.get("account_head")
         tax_rate = (
@@ -719,33 +738,82 @@ def _row_inclusive_tax_params(row, invoice_doc):
             if account_head and account_head in item_tax_map
             else flt(tax.get("rate"))
         )
-        if charge_type == "On Net Total":
-            current_fraction = tax_rate / 100.0
-            running_fraction += current_fraction
-            tax_fractions.append(current_fraction)
-        elif charge_type == "On Previous Row Amount":
-            ref_idx = cint(tax.get("row_id")) - 1
-            prev_fraction = tax_fractions[ref_idx] if 0 <= ref_idx < len(tax_fractions) else 0.0
-            current_fraction = (tax_rate / 100.0) * prev_fraction
-            running_fraction += current_fraction
-            tax_fractions.append(current_fraction)
-        elif charge_type == "On Previous Row Total":
-            ref_idx = cint(tax.get("row_id")) - 1
-            prev_total_fraction = (
-                1.0 + sum(tax_fractions[: ref_idx + 1])
-                if 0 <= ref_idx < len(tax_fractions)
-                else 1.0
-            )
-            current_fraction = (tax_rate / 100.0) * prev_total_fraction
-            running_fraction += current_fraction
-            tax_fractions.append(current_fraction)
-        elif charge_type == "On Item Quantity":
-            per_unit_tax += tax_rate
-            tax_fractions.append(0.0)
-        else:
-            tax_fractions.append(0.0)
+        is_inclusive = bool(cint(tax.get("included_in_print_rate")))
 
-    return max(running_fraction, 0.0), max(per_unit_tax, 0.0)
+        def _compute_term(terms_list):
+            if charge_type == "On Net Total":
+                return tax_rate / 100.0, 0.0
+            if charge_type == "On Item Quantity":
+                return 0.0, tax_rate
+            if charge_type == "On Previous Row Amount":
+                ref_idx = cint(tax.get("row_id")) - 1
+                if 0 <= ref_idx < len(terms_list):
+                    prev_a, prev_b = terms_list[ref_idx]
+                    return (tax_rate / 100.0) * prev_a, (tax_rate / 100.0) * prev_b
+                return 0.0, 0.0
+            if charge_type == "On Previous Row Total":
+                ref_idx = cint(tax.get("row_id")) - 1
+                if 0 <= ref_idx < len(terms_list):
+                    prev_sum_a = sum(a for a, _ in terms_list[: ref_idx + 1])
+                    prev_sum_b = sum(b for _, b in terms_list[: ref_idx + 1])
+                    return (tax_rate / 100.0) * (1.0 + prev_sum_a), (tax_rate / 100.0) * prev_sum_b
+                return tax_rate / 100.0, 0.0
+            return 0.0, 0.0
+
+        cur_all_a, cur_all_b = _compute_term(all_terms)
+        all_terms.append((cur_all_a, cur_all_b))
+        all_a += cur_all_a
+        all_b += cur_all_b
+
+        if is_inclusive:
+            cur_incl_a, cur_incl_b = _compute_term(incl_terms)
+        else:
+            cur_incl_a, cur_incl_b = 0.0, 0.0
+        incl_terms.append((cur_incl_a, cur_incl_b))
+        incl_a += cur_incl_a
+        incl_b += cur_incl_b
+
+    return max(incl_a, 0.0), max(incl_b, 0.0), max(all_a, 0.0), max(all_b, 0.0)
+
+
+def _row_inclusive_tax_params(row, invoice_doc):
+    """Return ``(tax_fraction, per_unit_tax)`` for tax-inclusive rows on ``invoice_doc``."""
+
+    incl_a, incl_b, _all_a, _all_b = _row_tax_params(row, invoice_doc)
+    return incl_a, incl_b
+
+
+def _is_descendant_tree_node(doctype, child_name, ancestor_name):
+    """Return whether ``child_name`` falls within ``ancestor_name``'s nested-set subtree."""
+
+    if not child_name or not ancestor_name:
+        return False
+    if child_name == ancestor_name:
+        return True
+    rows = (
+        frappe.get_all(
+            doctype,
+            filters={"name": ["in", [child_name, ancestor_name]]},
+            fields=["name", "lft", "rgt"],
+            limit_page_length=2,
+        )
+        or []
+    )
+    by_name = {cstr(row.get("name")).strip(): row for row in rows if hasattr(row, "get")}
+    child = by_name.get(child_name)
+    ancestor = by_name.get(ancestor_name)
+    if not child or not ancestor:
+        return False
+    ancestor_lft = cint(ancestor.get("lft"))
+    ancestor_rgt = cint(ancestor.get("rgt"))
+    child_lft = cint(child.get("lft"))
+    child_rgt = cint(child.get("rgt"))
+    return (
+        ancestor_lft > 0
+        and ancestor_rgt >= ancestor_lft
+        and child_lft >= ancestor_lft
+        and child_rgt <= ancestor_rgt
+    )
 
 
 def _rule_matches_invoice_party(rule, invoice_doc, has_doc):
@@ -760,11 +828,18 @@ def _rule_matches_invoice_party(rule, invoice_doc, has_doc):
     expected = cstr(rule.get(invoice_field)).strip()
     if not expected:
         return True
-    actual = cstr(invoice_doc.get(invoice_field)).strip() if has_doc else ""
+    if not has_doc:
+        return False
+    if applicable_for == "Campaign":
+        actual = cstr(invoice_doc.get("utm_campaign") or invoice_doc.get("campaign")).strip()
+        return actual == expected
+    actual = cstr(invoice_doc.get(invoice_field)).strip()
+    if applicable_for in ("Customer Group", "Territory"):
+        return _is_descendant_tree_node(applicable_for, actual, expected)
     return actual == expected
 
 
-def _server_applied_free_row_indexes(item_rows, invoice_doc=None):
+def _server_applied_free_row_indexes(item_rows, invoice_doc=None, stock_uoms=None):
     """Return the free rows ERPNext itself applied from an active promotional rule.
 
     ERPNext marks a promotional free row with ``is_free_item`` and the single
@@ -808,6 +883,8 @@ def _server_applied_free_row_indexes(item_rows, invoice_doc=None):
                 "free_item",
                 "free_qty",
                 "is_recursive",
+                "recurse_for",
+                "apply_recursion_over",
                 "free_item_uom",
                 "currency",
                 "applicable_for",
@@ -831,6 +908,8 @@ def _server_applied_free_row_indexes(item_rows, invoice_doc=None):
         if rule.get("name")
     }
     paid_items_by_rule = {}
+    paid_qty_by_rule = {}
+    paid_qty_by_rule_item = {}
     paid_qty = paid_amount = 0.0
     for row in item_rows:
         if (
@@ -839,18 +918,23 @@ def _server_applied_free_row_indexes(item_rows, invoice_doc=None):
             and not cint(row.get("is_free_item"))
             and flt(row.get("qty")) > 0
         ):
-            paid_qty += flt(row.get("qty"))
+            row_qty = flt(row.get("qty"))
+            paid_qty += row_qty
             # ERPNext's doc.total: rounded line amounts, then a rounded sum.
             paid_amount += flt(
-                flt(row.get("rate")) * flt(row.get("qty")), _field_precision(row, "amount")
+                flt(row.get("rate")) * row_qty, _field_precision(row, "amount")
             )
             for rule_name in _applied_pricing_rule_names(row.get("pricing_rules")):
                 paid_items_by_rule.setdefault(rule_name, set()).add(row.get("item_code"))
+                paid_qty_by_rule[rule_name] = paid_qty_by_rule.get(rule_name, 0.0) + row_qty
+                key = (rule_name, row.get("item_code"))
+                paid_qty_by_rule_item[key] = paid_qty_by_rule_item.get(key, 0.0) + row_qty
     paid_amount = flt(paid_amount, _field_precision(invoice_doc, "total"))
 
     posting_date = invoice_doc.get("posting_date") if has_doc else None
     company = invoice_doc.get("company") if has_doc else None
     invoice_currency = cstr(invoice_doc.get("currency")).strip() if has_doc else ""
+    stock_uoms_map = stock_uoms or {}
     authorized = set()
     seen = set()
     for index, rule_name in free_rules.items():
@@ -878,12 +962,10 @@ def _server_applied_free_row_indexes(item_rows, invoice_doc=None):
             or cstr(rule.get("condition"))
         ):
             continue
-        free_item_uom = cstr(rule.get("free_item_uom")).strip()
-        row_uom = cstr(free_row.get("uom") or free_row.get("stock_uom")).strip()
-        if free_item_uom and row_uom and row_uom != free_item_uom:
-            continue
-        free_qty = flt(rule.get("free_qty"))
-        if not cint(rule.get("is_recursive")) and free_qty > 0 and flt(free_row.get("qty")) > free_qty:
+        item_stock_uom = cstr(stock_uoms_map.get(item_code) or free_row.get("stock_uom")).strip()
+        expected_uom = cstr(rule.get("free_item_uom")).strip() or item_stock_uom
+        row_uom = cstr(free_row.get("uom") or item_stock_uom).strip()
+        if expected_uom and row_uom != expected_uom:
             continue
         if rule.get("apply_on") == "Transaction":
             # ERPNext's own check (filter_pricing_rules_for_qty_amount) counts free
@@ -896,16 +978,58 @@ def _server_applied_free_row_indexes(item_rows, invoice_doc=None):
                 and paid_amount >= flt(rule.get("min_amt"))
                 and (not flt(rule.get("max_amt")) or paid_amount <= flt(rule.get("max_amt")))
             )
+            qualifying_qty = paid_qty
         else:
             paid_items = paid_items_by_rule.get(rule_name) or set()
+            is_same_item_award = bool(cint(rule.get("same_item")) and item_code in paid_items)
             gives_item = bool(paid_items) and (
-                item_code == rule.get("free_item")
-                or (cint(rule.get("same_item")) and item_code in paid_items)
+                item_code == rule.get("free_item") or is_same_item_award
             )
-        if gives_item:
-            seen.add((item_code, rule_name))
-            authorized.add(index)
+            qualifying_qty = (
+                paid_qty_by_rule_item.get((rule_name, item_code), 0.0)
+                if is_same_item_award
+                else paid_qty_by_rule.get(rule_name, 0.0)
+            )
+        if not gives_item:
+            continue
+        raw_free_qty = flt(rule.get("free_qty"))
+        base_free_qty = raw_free_qty if raw_free_qty > 0 else 1.0
+        if cint(rule.get("is_recursive")):
+            recurse_for = flt(rule.get("recurse_for"))
+            if recurse_for <= 0:
+                continue
+            effective_qty = qualifying_qty
+            max_qty = flt(rule.get("max_qty"))
+            if max_qty > 0:
+                effective_qty = min(effective_qty, max_qty)
+            apply_recursion_over = flt(rule.get("apply_recursion_over"))
+            if apply_recursion_over > 0:
+                effective_qty = max(effective_qty - apply_recursion_over, 0.0)
+            max_awarded_qty = math.floor(effective_qty / recurse_for) * base_free_qty
+        else:
+            max_awarded_qty = base_free_qty
+        free_row_qty = flt(free_row.get("qty"))
+        if free_row_qty <= 0 or free_row_qty > max_awarded_qty:
+            continue
+        seen.add((item_code, rule_name))
+        authorized.add(index)
     return authorized
+
+
+def _has_populated_net_field(row, fieldname, gross_rate):
+    """Return whether ``fieldname`` on ``row`` carries a meaningful net rate (including 0.0)."""
+
+    if row.get(fieldname) in (None, ""):
+        return False
+    if abs(flt(row.get(fieldname))) > 0 or gross_rate <= 0:
+        return True
+    if isinstance(row, dict):
+        return True
+    return (
+        abs(flt(row.get("amount"))) > 0
+        or abs(flt(row.get("base_rate"))) > 0
+        or abs(flt(row.get("base_amount"))) > 0
+    )
 
 
 def collect_below_buying_price_errors(
@@ -918,7 +1042,7 @@ def collect_below_buying_price_errors(
     policy = policy or resolve_sale_floor_policy(pos_profile)
     if not policy.get("enabled"):
         return []
-    buying_floors = resolve_buying_floors(
+    buying_floors, stock_uoms = _resolve_buying_floors_with_context(
         item_rows,
         pos_profile=pos_profile,
         invoice_doc=invoice_doc,
@@ -934,16 +1058,21 @@ def collect_below_buying_price_errors(
         if has_doc
         else "Grand Total"
     )
-    promotional_free_rows = _server_applied_free_row_indexes(item_rows, invoice_doc)
+    promotional_free_rows = _server_applied_free_row_indexes(
+        item_rows,
+        invoice_doc,
+        stock_uoms=stock_uoms,
+    )
 
     row_tax_params = {}
-    eligible_row_total = 0.0
     eligible_net_total = 0.0
+    eligible_scalable_grand_total = 0.0
+    eligible_grand_total = 0.0
     for index, item in enumerate(item_rows):
         if not hasattr(item, "get"):
             continue
-        tax_fraction, per_unit_tax = _row_inclusive_tax_params(item, invoice_doc)
-        row_tax_params[index] = (tax_fraction, per_unit_tax)
+        incl_a, incl_b, all_a, all_b = _row_tax_params(item, invoice_doc)
+        row_tax_params[index] = (incl_a, incl_b, all_a, all_b)
         if (
             not item.get("is_return")
             and not item.get("posa_is_replace")
@@ -952,9 +1081,11 @@ def collect_below_buying_price_errors(
         ):
             qty = abs(flt(item.get("qty")))
             gross_rate = abs(flt(item.get("rate")))
-            pre_discount_net = max((gross_rate - per_unit_tax) / (1.0 + tax_fraction), 0.0)
-            eligible_row_total += gross_rate * qty
+            pre_discount_net = max((gross_rate - incl_b) / (1.0 + incl_a), 0.0)
+            scalable_grand_total = pre_discount_net * (1.0 + all_a) * qty
             eligible_net_total += pre_discount_net * qty
+            eligible_scalable_grand_total += scalable_grand_total
+            eligible_grand_total += scalable_grand_total + (all_b * qty)
 
     for index, row in enumerate(item_rows):
         item_code = row.get("item_code") if hasattr(row, "get") else None
@@ -1006,10 +1137,10 @@ def collect_below_buying_price_errors(
         minimum_selling_rate = floor * (1 + minimum_margin / 100)
         base_minimum_selling_rate = base_floor * (1 + minimum_margin / 100)
 
-        tax_fraction, per_unit_tax = row_tax_params.get(index, (0.0, 0.0))
+        incl_a, incl_b, _all_a, _all_b = row_tax_params.get(index, (0.0, 0.0, 0.0, 0.0))
         gross_rate = abs(flt(row.get("rate")))
+        pre_discount_net = max((gross_rate - incl_b) / (1.0 + incl_a), 0.0)
         if apply_discount_on == "Net Total":
-            pre_discount_net = max((gross_rate - per_unit_tax) / (1.0 + tax_fraction), 0.0)
             if invoice_discount_percentage > 0:
                 computed_net_rate = pre_discount_net * max(
                     1.0 - invoice_discount_percentage / 100.0, 0.0
@@ -1021,41 +1152,42 @@ def collect_below_buying_price_errors(
             else:
                 computed_net_rate = pre_discount_net
         else:
-            discounted_gross = gross_rate
-            if invoice_discount_percentage > 0:
-                discounted_gross *= max(1.0 - invoice_discount_percentage / 100.0, 0.0)
-            elif invoice_discount_amount > 0 and eligible_row_total > 0:
-                discounted_gross *= max(1.0 - invoice_discount_amount / eligible_row_total, 0.0)
-            computed_net_rate = max((discounted_gross - per_unit_tax) / (1.0 + tax_fraction), 0.0)
+            if invoice_discount_percentage > 0 and eligible_scalable_grand_total > 0:
+                effective_discount = (invoice_discount_percentage / 100.0) * eligible_grand_total
+                discount_fraction = min(effective_discount / eligible_scalable_grand_total, 1.0)
+                computed_net_rate = pre_discount_net * max(1.0 - discount_fraction, 0.0)
+            elif invoice_discount_amount > 0 and eligible_scalable_grand_total > 0:
+                discount_fraction = min(invoice_discount_amount / eligible_scalable_grand_total, 1.0)
+                computed_net_rate = pre_discount_net * max(1.0 - discount_fraction, 0.0)
+            else:
+                computed_net_rate = pre_discount_net
 
         net_rate_precision = _resolve_currency_precision(row, invoice_doc, "net_rate")
         base_precision = _resolve_currency_precision(row, invoice_doc, "base_net_rate")
 
         selling_rate = computed_net_rate
-        if row.get("net_rate") not in (None, ""):
+        if _has_populated_net_field(row, "net_rate", gross_rate):
             row_net_rate = abs(flt(row.get("net_rate")))
-            if row_net_rate > 0 or gross_rate <= 0:
-                if net_rate_precision is not None:
-                    if flt(row_net_rate, net_rate_precision) < flt(
-                        selling_rate, net_rate_precision
-                    ):
-                        selling_rate = row_net_rate
-                elif row_net_rate < selling_rate:
+            if net_rate_precision is not None:
+                if flt(row_net_rate, net_rate_precision) < flt(
+                    selling_rate, net_rate_precision
+                ):
                     selling_rate = row_net_rate
+            elif row_net_rate < selling_rate:
+                selling_rate = row_net_rate
 
         base_selling_rate = selling_rate * invoice_to_company
-        if row.get("base_net_rate") not in (None, ""):
+        if _has_populated_net_field(row, "base_net_rate", gross_rate):
             row_base_net_rate = abs(flt(row.get("base_net_rate")))
-            if row_base_net_rate > 0 or gross_rate <= 0:
-                if base_precision is not None:
-                    if flt(row_base_net_rate, base_precision) < flt(
-                        base_selling_rate, base_precision
-                    ):
-                        base_selling_rate = row_base_net_rate
-                        selling_rate = row_base_net_rate / invoice_to_company
-                elif row_base_net_rate < base_selling_rate:
+            if base_precision is not None:
+                if flt(row_base_net_rate, base_precision) < flt(
+                    base_selling_rate, base_precision
+                ):
                     base_selling_rate = row_base_net_rate
                     selling_rate = row_base_net_rate / invoice_to_company
+            elif row_base_net_rate < base_selling_rate:
+                base_selling_rate = row_base_net_rate
+                selling_rate = row_base_net_rate / invoice_to_company
 
         if base_precision is not None:
             compared_base_selling = flt(base_selling_rate, base_precision)
@@ -1187,19 +1319,99 @@ def _apply_below_cost_override(invoice_doc, errors):
     )
 
 
+def _resolve_authoritative_exchange_rate(from_currency, to_currency, posting_date):
+    """Resolve the authoritative posting-date exchange rate from ``from_currency`` to ``to_currency``."""
+
+    if not from_currency or not to_currency or from_currency == to_currency:
+        return 1.0
+
+    rate = 0.0
+    try:
+        from posawesome.posawesome.api.invoice_processing.utils import get_latest_rate
+
+        latest_rate, _rate_date = get_latest_rate(
+            from_currency,
+            to_currency,
+            transaction_date=posting_date,
+        )
+        rate = flt(latest_rate)
+    except Exception:
+        rate = 0.0
+
+    if rate <= 0:
+        from erpnext.setup.utils import get_exchange_rate
+
+        rate = flt(get_exchange_rate(from_currency, to_currency, posting_date))
+
+    if rate <= 0:
+        frappe.throw(
+            _(
+                "Cannot validate the buying floor because the exchange rate between {0} and {1} is missing."
+            ).format(from_currency, to_currency)
+        )
+    return rate
+
+
+def _refresh_authoritative_conversion_rate(invoice_doc):
+    """Refresh stale/forged foreign-currency conversion rates at the POS validation boundary."""
+
+    if not invoice_doc or not hasattr(invoice_doc, "get"):
+        return
+    company = invoice_doc.get("company")
+    invoice_currency = cstr(invoice_doc.get("currency")).strip()
+    if not company or not invoice_currency:
+        return
+    company_currency = cstr(frappe.db.get_value("Company", company, "default_currency")).strip()
+    if not company_currency:
+        return
+
+    posting_date = invoice_doc.get("posting_date") or nowdate()
+    resolved_rate = (
+        1.0
+        if invoice_currency == company_currency
+        else _resolve_authoritative_exchange_rate(
+            invoice_currency,
+            company_currency,
+            posting_date,
+        )
+    )
+    current_rate = flt(invoice_doc.get("conversion_rate"))
+    if abs(current_rate - resolved_rate) <= 1e-9:
+        return
+
+    _set_invoice_value(invoice_doc, "conversion_rate", resolved_rate)
+    calculate = getattr(invoice_doc, "calculate_taxes_and_totals", None)
+    if callable(calculate):
+        calculate()
+        return
+
+    for row in invoice_doc.get("items") or []:
+        if not hasattr(row, "get"):
+            continue
+        if row.get("net_rate") not in (None, ""):
+            base_precision = _resolve_currency_precision(row, invoice_doc, "base_net_rate")
+            updated_base_net = flt(flt(row.get("net_rate")) * resolved_rate, base_precision)
+            _set_invoice_value(row, "base_net_rate", updated_base_net)
+        elif row.get("base_net_rate") not in (None, ""):
+            _set_invoice_value(row, "base_net_rate", None)
+
+
 def validate_invoice_item_sale_controls(invoice_doc):
     flags = getattr(invoice_doc, "flags", None)
     if flags is not None and getattr(flags, "posa_item_sale_controls_validated", False):
         return
 
+    is_return = bool(invoice_doc.get("is_return"))
     errors = collect_item_sale_control_errors(
         invoice_doc.get("items") or [],
-        is_return=bool(invoice_doc.get("is_return")),
+        is_return=is_return,
     )
     policy = resolve_sale_floor_policy(invoice_doc.get("pos_profile"))
+    if not is_return and policy.get("enabled"):
+        _refresh_authoritative_conversion_rate(invoice_doc)
     floor_errors = collect_below_buying_price_errors(
         invoice_doc.get("items") or [],
-        is_return=bool(invoice_doc.get("is_return")),
+        is_return=is_return,
         pos_profile=invoice_doc.get("pos_profile"),
         invoice_doc=invoice_doc,
         policy=policy,

@@ -1844,8 +1844,11 @@ def _save_draft_with_latest_timestamp(invoice_doc, retries=2):
 
 
 def _apply_tax_contract_before_save(invoice_doc):
-    _merge_duplicate_taxes(invoice_doc)
-    apply_pos_tax_inclusion_contract(invoice_doc)
+    _merge_duplicate_taxes(invoice_doc, recalculate=False)
+    apply_pos_tax_inclusion_contract(invoice_doc, recalculate=False)
+    calculate = getattr(invoice_doc, "calculate_taxes_and_totals", None)
+    if callable(calculate):
+        calculate()
 
 
 def _row_field_precision(row, invoice_doc, fieldname):
@@ -2379,15 +2382,6 @@ def update_invoice(data):
     # Reapply any custom item names after defaults are set
     _apply_item_name_overrides(invoice_doc, overrides)
 
-    _apply_tax_contract_before_save(invoice_doc)
-
-    if locked_items:
-        for item in invoice_doc.items:
-            locked = locked_items.get(item.idx)
-            if locked:
-                item.update(locked)
-        invoice_doc.calculate_taxes_and_totals()
-
     rate_info = _apply_authoritative_currency_rates(
         invoice_doc,
         payload={
@@ -2401,6 +2395,45 @@ def update_invoice(data):
     conversion_rate = rate_info["conversion_rate"]
     plc_conversion_rate = rate_info["plc_conversion_rate"]
     exchange_rate_date = rate_info["exchange_rate_date"]
+
+    if locked_items:
+        for item in invoice_doc.items:
+            locked = locked_items.get(item.idx)
+            if locked:
+                item.update(locked)
+
+    _apply_tax_contract_before_save(invoice_doc)
+
+    if invoice_doc.get("total") is not None:
+        invoice_doc.base_total = flt(
+            flt(invoice_doc.get("total")) * conversion_rate,
+            invoice_doc.precision("base_total"),
+        )
+    if invoice_doc.get("net_total") is not None:
+        invoice_doc.base_net_total = flt(
+            flt(invoice_doc.get("net_total")) * conversion_rate,
+            invoice_doc.precision("base_net_total"),
+        )
+    if invoice_doc.get("grand_total") is not None:
+        invoice_doc.base_grand_total = flt(
+            flt(invoice_doc.get("grand_total")) * conversion_rate,
+            invoice_doc.precision("base_grand_total"),
+        )
+    if invoice_doc.get("rounded_total") is not None:
+        invoice_doc.base_rounded_total = flt(
+            flt(invoice_doc.get("rounded_total")) * conversion_rate,
+            invoice_doc.precision("base_rounded_total"),
+        )
+    if invoice_doc.get("discount_amount") is not None:
+        invoice_doc.base_discount_amount = flt(
+            flt(invoice_doc.get("discount_amount")) * conversion_rate,
+            invoice_doc.precision("base_discount_amount"),
+        )
+    if invoice_doc.get("base_rounded_total") is not None:
+        invoice_doc.base_in_words = money_in_words(
+            invoice_doc.base_rounded_total,
+            rate_info["company_currency"],
+        )
 
     for payment in invoice_doc.payments:
         payment.amount, payment.base_amount = _resolve_payment_amounts(payment, conversion_rate)
