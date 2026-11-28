@@ -1067,7 +1067,7 @@ describe("loss prevention", () => {
 		expect(getItemLossRisk(item)).toBeNull();
 	});
 
-	it("resolves invoice-currency _buying_prices_by_uom entry with null base_price_list_rate in a foreign-currency company", () => {
+	it("fails closed when foreign _buying_prices_by_uom entry has null base_price_list_rate without positive buying_exchange_rate in a different company currency", () => {
 		const item = {
 			item_code: "USD-INV-UGX-CO-NULL-BASE",
 			qty: 1,
@@ -1087,11 +1087,8 @@ describe("loss prevention", () => {
 			},
 		};
 
-		const floor = getItemCostFloor(item);
-		expect(floor).not.toBeNull();
-		expect(floor?.rate).toBeCloseTo(10);
+		expect(getItemCostFloor(item)).toBeNull();
 		expect(getItemLossRisk(item)).toBeNull();
-		expect(getItemLossRisk({ ...item, rate: 8 })?.belowCost).toBe(true);
 	});
 
 	it("preserves legitimate rounded zero net_rate === 0 on 3 x USD 0.01 with 0.02 discount against UGX 10 floor", () => {
@@ -1860,6 +1857,212 @@ describe("loss prevention", () => {
 				currencyPrecision: 2,
 				roundRowWiseTax: true,
 			}),
+		).toHaveLength(1);
+	});
+
+	it("preserves item.company_currency and foreign conversion_rate in useItemCurrency when context omits company on a foreign till", () => {
+		const { applyCurrencyConversionToItem } = useItemCurrency();
+		const item: Record<string, any> = {
+			item_code: "USD-TILL-UGX-CO",
+			qty: 1,
+			rate: 10.5,
+			price_list_rate: 10.5,
+			original_rate: 10.5,
+			original_currency: "USD",
+			currency: "USD",
+			company_currency: "UGX",
+			conversion_rate: 3700,
+			buying_price_list: "USD Buying",
+			buying_price_currency: "USD",
+			buying_exchange_rate: 4050,
+			base_buying_rate: 40500,
+			trade_price: 40500 / 3700,
+			buying_rate: 40500 / 3700,
+			_buying_prices_by_uom: {
+				Nos: {
+					price_list_rate: 10,
+					base_price_list_rate: 40500,
+					currency: "USD",
+					price_list: "USD Buying",
+				},
+			},
+			uom: "Nos",
+			stock_uom: "Nos",
+			conversion_factor: 1,
+		};
+
+		// Context omits `company` (and omits `conversion_rate`) on a fixed USD till:
+		// must NOT overwrite item.company_currency ("UGX") with pos_profile.currency ("USD")
+		// or replace conversion_rate (3700) with 1.
+		applyCurrencyConversionToItem(item, {
+			pos_profile: { currency: "USD" },
+			price_list_currency: "USD",
+			selected_currency: "USD",
+			exchange_rate: 1,
+			currency_precision: 2,
+		});
+
+		expect(item.company_currency).toBe("UGX");
+		expect(item.conversion_rate).toBe(3700);
+		expect(item.trade_price).toBeCloseTo(40500 / 3700, 4);
+		const risk = getItemLossRisk(item, { currencyPrecision: 2 });
+		expect(risk?.belowCost).toBe(true);
+		expect(risk?.costRate).toBeCloseTo(40500 / 3700, 4);
+	});
+
+	it("fails closed when API emits buying_exchange_rate: null and base_price_list_rate: null for foreign buying currency matching invoice currency", () => {
+		// Exact shape emitted by item_fetchers.py:665 & :708 when for_buying FX is unavailable.
+		const apiTableItem = {
+			item_code: "API-NULL-FX-TABLE",
+			qty: 1,
+			rate: 10.5,
+			currency: "USD",
+			company_currency: "UGX",
+			conversion_rate: 3700,
+			uom: "Nos",
+			stock_uom: "Nos",
+			valuation_rate: 100,
+			buying_price_list: "USD Buying",
+			buying_price_currency: "USD",
+			buying_exchange_rate: null,
+			base_buying_rate: null,
+			trade_price: null,
+			buying_rate: null,
+			buying_rate_currency: null,
+			_buying_prices_by_uom: {
+				Nos: {
+					price_list_rate: 10,
+					base_price_list_rate: null,
+					currency: "USD",
+					price_list: "USD Buying",
+					price_not_uom_dependent: 0,
+				},
+			},
+		};
+		expect(getItemCostFloor(apiTableItem)).toBeNull();
+		expect(getItemLossRisk(apiTableItem, { currencyPrecision: 2 })).toBeNull();
+
+		// Raw scalar paths (trade_price / buying_rate / _source_buying_price) with buying_exchange_rate: null
+		// must also fail closed instead of using raw USD 10 as a 1:1 USD floor.
+		const apiScalarItem = {
+			item_code: "API-NULL-FX-SCALAR",
+			qty: 1,
+			rate: 10.5,
+			currency: "USD",
+			company_currency: "UGX",
+			conversion_rate: 3700,
+			uom: "Nos",
+			stock_uom: "Nos",
+			valuation_rate: 100,
+			buying_price_currency: "USD",
+			buying_rate_currency: "USD",
+			buying_exchange_rate: null,
+			base_buying_rate: null,
+			trade_price: 10,
+			buying_rate: 10,
+		};
+		expect(getItemCostFloor(apiScalarItem)).toBeNull();
+
+		const apiSourceScalarItem = {
+			item_code: "API-NULL-FX-SOURCE",
+			qty: 1,
+			rate: 10.5,
+			currency: "USD",
+			company_currency: "UGX",
+			conversion_rate: 3700,
+			uom: "Nos",
+			stock_uom: "Nos",
+			valuation_rate: 100,
+			buying_price_currency: "USD",
+			buying_exchange_rate: null,
+			base_buying_rate: null,
+			_source_buying_currency: "USD",
+			_source_buying_price: 10,
+		};
+		expect(getItemCostFloor(apiSourceScalarItem)).toBeNull();
+	});
+
+	it("reads ERPNext browser frappe.flags.round_row_wise_tax when reconciling row-wise inclusive tax", () => {
+		const taxes = [
+			{
+				charge_type: "On Net Total",
+				account_head: "VAT 18% - CO",
+				rate: 18,
+				included_in_print_rate: 1,
+			},
+		];
+		const items = [1, 2].map((idx) => ({
+			item_code: `FLAG-RW-${idx}`,
+			qty: 1,
+			rate: 0.03,
+			amount: 0.03,
+			net_rate: 0.03,
+			net_amount: 0.03,
+			currency: "USD",
+			company_currency: "UGX",
+			conversion_rate: 3700,
+			valuation_rate: 100,
+		}));
+
+		const previousFrappe = (globalThis as any).frappe;
+		(globalThis as any).frappe = {
+			flags: { round_row_wise_tax: 1 },
+		};
+		try {
+			expect(
+				findLossRiskItems(items, { taxes, currencyPrecision: 2 }),
+			).toEqual([]);
+		} finally {
+			if (previousFrappe === undefined) {
+				delete (globalThis as any).frappe;
+			} else {
+				(globalThis as any).frappe = previousFrappe;
+			}
+		}
+	});
+
+	it("rounds gross line amount before extracting inclusive tax on fractional quantities matching ERPNext taxes_and_totals.py:287", () => {
+		const taxes = [
+			{
+				charge_type: "On Net Total",
+				account_head: "VAT 18% - CO",
+				rate: 18,
+				included_in_print_rate: 1,
+			},
+		];
+		// qty=0.6, rate=0.03 -> ERPNext rounds amount=flt(0.018, 2)=0.02, net_amount=flt(0.02/1.18, 2)=0.02,
+		// net_rate=flt(0.02/0.6, 2)=0.03 -> base_net_rate=UGX 111 >= UGX 100 floor.
+		const validFractional = [
+			{
+				item_code: "FRAC-INCL-VAT",
+				qty: 0.6,
+				rate: 0.03,
+				amount: 0.02,
+				net_amount: 0.02,
+				net_rate: 0.03,
+				base_net_amount: 74,
+				base_net_rate: 111,
+				currency: "USD",
+				company_currency: "UGX",
+				conversion_rate: 3700,
+				valuation_rate: 100,
+			},
+		];
+		expect(
+			findLossRiskItems(validFractional, { taxes, currencyPrecision: 2 }),
+		).toEqual([]);
+
+		// Forged fractional line claiming net_amount=0.03 (above rounded gross 0.02) must still block.
+		const forgedFractional = [
+			{
+				...validFractional[0],
+				item_code: "FRAC-INCL-VAT-FORGED",
+				net_amount: 0.03,
+				net_rate: 0.05,
+			},
+		];
+		expect(
+			findLossRiskItems(forgedFractional, { taxes, currencyPrecision: 2 }),
 		).toHaveLength(1);
 	});
 });

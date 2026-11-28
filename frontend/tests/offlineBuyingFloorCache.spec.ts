@@ -15,6 +15,8 @@ import {
 	getItemCostFloor,
 	getItemLossRisk,
 } from "../src/posapp/utils/lossPrevention";
+import { useItemDetailFetcher } from "../src/posapp/composables/pos/items/useItemDetailFetcher";
+import { useItemCurrency } from "../src/posapp/composables/pos/items/useItemCurrency";
 
 async function clearOfflineDb() {
 	if (!db.isOpen()) {
@@ -226,7 +228,7 @@ describe("offline buying floor cache reconstruction", () => {
 		expect(floor?.rate).toBeCloseTo(40500);
 	});
 
-	it("preserves legacy currency rate compatibility and cached price_not_uom_dependent when offline rows omit newer fields", async () => {
+	it("preserves name desc tie-breaking on qualified for_buying rates and cached price_not_uom_dependent when offline rows omit newer fields", async () => {
 		const profile = {
 			name: "POS-LEGACY",
 			company: "Test Co",
@@ -256,8 +258,7 @@ describe("offline buying floor cache reconstruction", () => {
 				modified: "2025-04-01T10:00:00",
 			},
 		]);
-		// Same-day legacy Currency Exchange rows without for_buying/for_selling flags:
-		// must remain usable and tie-break by name desc (ERPNext setup/utils.py:77).
+		// Same-day qualified for_buying rows tie-break by name desc (ERPNext setup/utils.py:77).
 		await db.table("currency_rate_records").bulkPut([
 			{
 				name: "FX-LEG-001",
@@ -267,6 +268,8 @@ describe("offline buying floor cache reconstruction", () => {
 				to_currency: "UGX",
 				exchange_rate: 3900,
 				date: "2025-04-01",
+				for_buying: 1,
+				for_selling: 0,
 				modified: "2025-04-01T11:00:00",
 			},
 			{
@@ -277,6 +280,8 @@ describe("offline buying floor cache reconstruction", () => {
 				to_currency: "UGX",
 				exchange_rate: 4050,
 				date: "2025-04-01",
+				for_buying: 1,
+				for_selling: 0,
 				modified: "2025-04-01T10:00:00",
 			},
 		]);
@@ -669,5 +674,420 @@ describe("offline buying floor cache reconstruction", () => {
 				purpose: "for_buying",
 			})?.exchange_rate,
 		).toBe(4050);
+	});
+
+	it("propagates reconstructed offline buying floors end-to-end through update_items_details and useItemCurrency into getItemLossRisk", async () => {
+		const profile = {
+			name: "POS-E2E-OFFLINE",
+			company: "Test Co",
+			currency: "USD",
+			company_currency: "UGX",
+			selling_price_list: "USD Selling",
+			buying_price_list: "USD Buying",
+		};
+		await setProfileBuyingPriceList(profile, "USD Buying");
+		await db.table("items").put({
+			item_code: "ITEM-E2E-FLOOR",
+			item_name: "Offline E2E Floor Item",
+			stock_uom: "Nos",
+		});
+		await db.table("item_price_records").bulkPut([
+			{
+				name: "IP-E2E-BUY",
+				price_list: "USD Buying",
+				item_code: "ITEM-E2E-FLOOR",
+				uom: "Nos",
+				currency: "USD",
+				price_list_rate: 10,
+				buying: 1,
+				selling: 0,
+				valid_from: "2025-01-01",
+				modified: "2025-04-01T10:00:00",
+			},
+		]);
+		await db.table("currency_rate_records").bulkPut([
+			{
+				name: "FX-E2E-BUY",
+				profile_name: "POS-E2E-OFFLINE",
+				company: "Test Co",
+				from_currency: "USD",
+				to_currency: "UGX",
+				exchange_rate: 4050,
+				date: "2025-04-01",
+				for_buying: 1,
+				for_selling: 0,
+				modified: "2025-04-01T10:00:00",
+			},
+		]);
+		saveItemDetailsCache("POS-E2E-OFFLINE", "USD Selling", [
+			{
+				item_code: "ITEM-E2E-FLOOR",
+				stock_uom: "Nos",
+				actual_qty: 10,
+				rate: 10.5,
+				price_list_rate: 10.5,
+				currency: "USD",
+				company_currency: "UGX",
+				conversion_rate: 3700,
+				item_uoms: [{ uom: "Nos", conversion_factor: 1 }],
+			},
+		]);
+
+		const { applyCurrencyConversionToItem } = useItemCurrency();
+		const fetcher = useItemDetailFetcher();
+		fetcher.registerContext({
+			pos_profile: profile,
+			active_price_list: "USD Selling",
+			itemAvailability: null,
+			applyCurrencyConversionToItem: (it: any) =>
+				applyCurrencyConversionToItem(it, {
+					pos_profile: profile,
+					price_list_currency: it?.original_currency || "USD",
+					selected_currency: "USD",
+					exchange_rate: 1,
+					conversion_rate: 3700,
+					currency_precision: 2,
+				}),
+			items: [],
+			displayedItems: [],
+			usesLimitSearch: false,
+			storageAvailable: false,
+		});
+
+		const item: any = {
+			item_code: "ITEM-E2E-FLOOR",
+			stock_uom: "Nos",
+			uom: "Nos",
+			qty: 1,
+			rate: 10.5,
+			currency: "USD",
+		};
+		await fetcher.update_items_details([item]);
+
+		expect(item.company_currency).toBe("UGX");
+		expect(item.conversion_rate).toBe(3700);
+		expect(item._buying_prices_by_uom?.Nos?.base_price_list_rate).toBeCloseTo(
+			40500,
+		);
+		const risk = getItemLossRisk(item, { currencyPrecision: 2 });
+		expect(risk?.belowCost).toBe(true);
+		expect(risk?.costRate).toBeCloseTo((10 * 4050) / 3700, 4);
+	});
+
+	it("rejects legacy unqualified currency_rate_records in offline buying-floor reconstruction", async () => {
+		const profile = {
+			name: "POS-LEGACY-REJECT",
+			company: "Test Co",
+			currency: "USD",
+			company_currency: "UGX",
+			selling_price_list: "USD Selling",
+			buying_price_list: "USD Buying",
+		};
+		await setProfileBuyingPriceList(profile, "USD Buying");
+		await db.table("items").put({
+			item_code: "ITEM-LEGACY-REJECT",
+			item_name: "Legacy Unqualified FX Item",
+			stock_uom: "Nos",
+			valuation_rate: 100,
+		});
+		await db.table("item_price_records").bulkPut([
+			{
+				name: "IP-LEGACY-REJECT",
+				price_list: "USD Buying",
+				item_code: "ITEM-LEGACY-REJECT",
+				uom: "Nos",
+				currency: "USD",
+				price_list_rate: 10,
+				buying: 1,
+				selling: 0,
+				valid_from: "2025-01-01",
+				modified: "2025-04-01T10:00:00",
+			},
+		]);
+		// Newer unqualified legacy row (3,700) must NEVER override an older verified for_buying=1 row (4,050).
+		await db.table("currency_rate_records").bulkPut([
+			{
+				name: "FX-BUY-VERIFIED",
+				profile_name: "POS-LEGACY-REJECT",
+				company: "Test Co",
+				from_currency: "USD",
+				to_currency: "UGX",
+				exchange_rate: 4050,
+				date: "2025-04-01",
+				for_buying: 1,
+				for_selling: 0,
+				modified: "2025-04-01T10:00:00",
+			},
+			{
+				name: "FX-LEGACY-UNQUALIFIED",
+				profile_name: "POS-LEGACY-REJECT",
+				company: "Test Co",
+				from_currency: "USD",
+				to_currency: "UGX",
+				exchange_rate: 3700,
+				date: "2025-04-10",
+				modified: "2025-04-10T10:00:00",
+			},
+		]);
+		saveItemDetailsCache("POS-LEGACY-REJECT", "USD Selling", [
+			{
+				item_code: "ITEM-LEGACY-REJECT",
+				stock_uom: "Nos",
+				rate: 10.5,
+				price_list_rate: 10.5,
+				company_currency: "UGX",
+			},
+		]);
+
+		const withVerified = await getCachedItemDetails(
+			"POS-LEGACY-REJECT",
+			"USD Selling",
+			["ITEM-LEGACY-REJECT"],
+		);
+		expect(
+			withVerified.cached[0]._buying_prices_by_uom.Nos.base_price_list_rate,
+		).toBeCloseTo(40500);
+
+		// When ONLY the unqualified legacy row exists, reconstruction must fail closed (unresolved_fx).
+		await db.table("currency_rate_records").delete("FX-BUY-VERIFIED");
+		const onlyLegacy = await getCachedItemDetails(
+			"POS-LEGACY-REJECT",
+			"USD Selling",
+			["ITEM-LEGACY-REJECT"],
+		);
+		expect(
+			onlyLegacy.cached[0]._buying_prices_by_uom.Nos.unresolved_fx,
+		).toBe(true);
+		expect(
+			getItemCostFloor({
+				...onlyLegacy.cached[0],
+				qty: 1,
+				rate: 10.5,
+				uom: "Nos",
+				currency: "USD",
+				company_currency: "UGX",
+				conversion_rate: 3700,
+				valuation_rate: 100,
+			}),
+		).toBeNull();
+	});
+
+	it("preserves verified server-computed base buying floor on a fresh till before currency_rate_records are synced, but fails closed if price changes", async () => {
+		const profile = {
+			name: "POS-FRESH-TILL",
+			company: "Test Co",
+			currency: "USD",
+			company_currency: "UGX",
+			selling_price_list: "USD Selling",
+			buying_price_list: "USD Buying",
+		};
+		await setProfileBuyingPriceList(profile, "USD Buying");
+		await db.table("items").put({
+			item_code: "ITEM-FRESH-FLOOR",
+			item_name: "Fresh Till Floor Item",
+			stock_uom: "Nos",
+		});
+		await db.table("item_price_records").bulkPut([
+			{
+				name: "IP-FRESH-1",
+				price_list: "USD Buying",
+				item_code: "ITEM-FRESH-FLOOR",
+				uom: "Nos",
+				currency: "USD",
+				price_list_rate: 10,
+				buying: 1,
+				selling: 0,
+				valid_from: "2025-01-01",
+				modified: "2025-04-01T10:00:00",
+			},
+		]);
+		// Note: currency_rate_records is intentionally EMPTY (fresh till before currency sync).
+		saveItemDetailsCache("POS-FRESH-TILL", "USD Selling", [
+			{
+				item_code: "ITEM-FRESH-FLOOR",
+				stock_uom: "Nos",
+				rate: 10.5,
+				price_list_rate: 10.5,
+				company_currency: "UGX",
+				buying_price_list: "USD Buying",
+				buying_price_currency: "USD",
+				buying_exchange_rate: 4050,
+				base_buying_rate: 40500,
+				_buying_prices_by_uom: {
+					Nos: {
+						price_list_rate: 10,
+						base_price_list_rate: 40500,
+						currency: "USD",
+						price_list: "USD Buying",
+						price_not_uom_dependent: 0,
+					},
+				},
+			},
+		]);
+
+		const fresh = await getCachedItemDetails(
+			"POS-FRESH-TILL",
+			"USD Selling",
+			["ITEM-FRESH-FLOOR"],
+		);
+		expect(fresh.cached).toHaveLength(1);
+		expect(
+			fresh.cached[0]._buying_prices_by_uom.Nos.base_price_list_rate,
+		).toBeCloseTo(40500);
+		expect(
+			fresh.cached[0]._buying_prices_by_uom.Nos.unresolved_fx,
+		).toBeUndefined();
+		expect(fresh.cached[0].buying_exchange_rate).toBe(4050);
+
+		// If offline item_price_records changes the buying price (10 -> 12) while currency rates are absent,
+		// fail closed rather than reusing the stale 40,500 server floor for the new USD 12 price.
+		await db.table("item_price_records").put({
+			name: "IP-FRESH-1",
+			price_list: "USD Buying",
+			item_code: "ITEM-FRESH-FLOOR",
+			uom: "Nos",
+			currency: "USD",
+			price_list_rate: 12,
+			buying: 1,
+			selling: 0,
+			valid_from: "2025-01-01",
+			modified: "2025-04-02T10:00:00",
+		});
+		const changedPrice = await getCachedItemDetails(
+			"POS-FRESH-TILL",
+			"USD Selling",
+			["ITEM-FRESH-FLOOR"],
+		);
+		expect(
+			changedPrice.cached[0]._buying_prices_by_uom.Nos.unresolved_fx,
+		).toBe(true);
+	});
+
+	it("resolves offline buying floors via ERPNext inverse FX fallback using opposite purpose (for_selling) and rejects wrong-purpose or stale inverse", async () => {
+		const profile = {
+			name: "POS-INVERSE-FX",
+			company: "Test Co",
+			currency: "USD",
+			company_currency: "UGX",
+			selling_price_list: "USD Selling",
+			buying_price_list: "USD Buying",
+		};
+		await setProfileBuyingPriceList(profile, "USD Buying");
+		await db.table("settings").put({
+			key: "currency_exchange_settings",
+			value: { allow_stale: 0, stale_days: 30 },
+		});
+		await db.table("items").put({
+			item_code: "ITEM-INV-FX",
+			item_name: "Inverse FX Item",
+			stock_uom: "Nos",
+			valuation_rate: 100,
+		});
+		await db.table("item_price_records").bulkPut([
+			{
+				name: "IP-INV-1",
+				price_list: "USD Buying",
+				item_code: "ITEM-INV-FX",
+				uom: "Nos",
+				currency: "USD",
+				price_list_rate: 10,
+				buying: 1,
+				selling: 0,
+				valid_from: "2025-01-01",
+				modified: "2025-04-01T10:00:00",
+			},
+		]);
+		const today = new Date().toISOString().slice(0, 10);
+		// No direct USD->UGX row; only reverse UGX->USD with for_selling=1 (ERPNext setup/utils.py:128-134).
+		await db.table("currency_rate_records").bulkPut([
+			{
+				name: "FX-UGX-USD-SELL",
+				profile_name: "POS-INVERSE-FX",
+				company: "Test Co",
+				from_currency: "UGX",
+				to_currency: "USD",
+				exchange_rate: 1 / 4050,
+				date: today,
+				for_buying: 0,
+				for_selling: 1,
+				modified: `${today}T10:00:00`,
+			},
+		]);
+		saveItemDetailsCache("POS-INVERSE-FX", "USD Selling", [
+			{
+				item_code: "ITEM-INV-FX",
+				stock_uom: "Nos",
+				rate: 10.5,
+				price_list_rate: 10.5,
+				company_currency: "UGX",
+			},
+		]);
+
+		const resolved = await getCachedItemDetails(
+			"POS-INVERSE-FX",
+			"USD Selling",
+			["ITEM-INV-FX"],
+		);
+		expect(
+			resolved.cached[0]._buying_prices_by_uom.Nos.base_price_list_rate,
+		).toBeCloseTo(40500, 2);
+
+		// Reverse UGX->USD with wrong purpose (for_buying=1, for_selling=0) must fail closed.
+		await db.table("currency_rate_records").clear();
+		await db.table("currency_rate_records").put({
+			name: "FX-UGX-USD-WRONG",
+			profile_name: "POS-INVERSE-FX",
+			company: "Test Co",
+			from_currency: "UGX",
+			to_currency: "USD",
+			exchange_rate: 1 / 4050,
+			date: today,
+			for_buying: 1,
+			for_selling: 0,
+			modified: `${today}T10:00:00`,
+		});
+		const wrongPurpose = await getCachedItemDetails(
+			"POS-INVERSE-FX",
+			"USD Selling",
+			["ITEM-INV-FX"],
+		);
+		expect(
+			wrongPurpose.cached[0]._buying_prices_by_uom.Nos.unresolved_fx,
+		).toBe(true);
+		expect(
+			getItemCostFloor({
+				...wrongPurpose.cached[0],
+				qty: 1,
+				rate: 10.5,
+				uom: "Nos",
+				currency: "USD",
+				company_currency: "UGX",
+				conversion_rate: 3700,
+				valuation_rate: 100,
+			}),
+		).toBeNull();
+
+		// Stale reverse UGX->USD (for_selling=1, Jan 2025 under allow_stale=0, stale_days=30) must fail closed.
+		await db.table("currency_rate_records").clear();
+		await db.table("currency_rate_records").put({
+			name: "FX-UGX-USD-STALE",
+			profile_name: "POS-INVERSE-FX",
+			company: "Test Co",
+			from_currency: "UGX",
+			to_currency: "USD",
+			exchange_rate: 1 / 4050,
+			date: "2025-01-15",
+			for_buying: 0,
+			for_selling: 1,
+			modified: "2025-01-15T10:00:00",
+		});
+		const staleInverse = await getCachedItemDetails(
+			"POS-INVERSE-FX",
+			"USD Selling",
+			["ITEM-INV-FX"],
+		);
+		expect(
+			staleInverse.cached[0]._buying_prices_by_uom.Nos.unresolved_fx,
+		).toBe(true);
 	});
 });

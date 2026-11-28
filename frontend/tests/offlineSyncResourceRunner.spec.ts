@@ -60,6 +60,7 @@ import {
 	filterSupportedOfflineSyncStates,
 	runSupportedOfflineSyncResource,
 } from "../src/offline/sync/resourceRunner";
+import { db } from "../src/offline/db";
 
 describe("offline sync resource runner", () => {
 	beforeEach(() => {
@@ -316,6 +317,78 @@ describe("offline sync resource runner", () => {
 			expect.objectContaining({
 				watermark: null,
 				schemaVersion: "2026-04-09",
+			}),
+		);
+	});
+
+	it("passes discovered direct and inverse currency pairs when running currency_matrix sync for foreign buying/till profiles", async () => {
+		if (!db.isOpen()) {
+			await db.open();
+		}
+		await db.table("pos_profiles").clear();
+		await db.table("item_price_records").clear();
+		await db.table("pos_profiles").put({
+			name: "POS-USD-UGX",
+			company: "Uganda Co",
+			currency: "USD",
+			company_currency: "UGX",
+			selling_price_list: "USD Selling",
+			buying_price_list: "EUR Buying",
+		});
+		await db.table("item_price_records").put({
+			name: "IP-EUR-1",
+			price_list: "EUR Buying",
+			item_code: "ITEM-1",
+			uom: "Nos",
+			currency: "EUR",
+			price_list_rate: 8,
+			buying: 1,
+			selling: 0,
+		});
+
+		const callOfflineSyncMethod = vi.fn(async () => ({
+			changes: [],
+			deleted: [],
+			has_more: false,
+		}));
+
+		await runSupportedOfflineSyncResource({
+			resource: { id: "currency_matrix" } as any,
+			posProfile: {
+				name: "POS-USD-UGX",
+				company: "Uganda Co",
+				currency: "USD",
+				selling_price_list: "USD Selling",
+			},
+			schemaVersion: "2026-04-09",
+			getPersistedState: vi.fn(async () => null),
+			callOfflineSyncMethod,
+		});
+
+		const syncCall = adapterMocks.syncCurrencyMatrixResource.mock.calls[0]?.[0];
+		expect(syncCall?.currencyPairs).toEqual(
+			expect.arrayContaining([
+				{ from_currency: "USD", to_currency: "UGX" },
+				{ from_currency: "UGX", to_currency: "USD" },
+				{ from_currency: "EUR", to_currency: "UGX" },
+				{ from_currency: "UGX", to_currency: "EUR" },
+			]),
+		);
+
+		await syncCall.fetcher({
+			posProfile: { name: "POS-USD-UGX", company: "Uganda Co" },
+			currencyPairs: syncCall.currencyPairs,
+			watermark: null,
+			offset: 0,
+			schemaVersion: "2026-04-09",
+		});
+		expect(callOfflineSyncMethod).toHaveBeenCalledWith(
+			"posawesome.posawesome.api.offline_sync.currencies.sync_currency_scope",
+			expect.objectContaining({
+				currency_pairs: expect.arrayContaining([
+					{ from_currency: "USD", to_currency: "UGX" },
+					{ from_currency: "UGX", to_currency: "USD" },
+				]),
 			}),
 		);
 	});

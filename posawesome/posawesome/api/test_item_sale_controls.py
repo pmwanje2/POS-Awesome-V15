@@ -4932,8 +4932,161 @@ class TestItemSaleControls(unittest.TestCase):
                 )
                 self.assertEqual(len(forged_errors), 1)
                 self.assertEqual(forged_errors[0]["item_code"], "ITEM-RW-FORGED")
+
+                # Accounts Settings.round_row_wise_tax=1 must NOT be overridden by a falsy 0 on invoice_doc.
+                invoice_with_zero = PrecisionDoc(
+                    company="Test Co",
+                    currency="USD",
+                    conversion_rate=3700.0,
+                    round_row_wise_tax=0,
+                    taxes=invoice["taxes"],
+                    precision_value=2,
+                )
+                self.assertEqual(
+                    self.controls.collect_below_buying_price_errors(
+                        rows, invoice_doc=invoice_with_zero
+                    ),
+                    [],
+                )
+
+                # Accounts Settings.round_row_wise_tax=0 must NOT be bypassed by a forged 1 on invoice_doc.
+                self.frappe.db.get_single_value = lambda doctype, fieldname: (
+                    0 if doctype == "Accounts Settings" and fieldname == "round_row_wise_tax" else None
+                )
+                invoice_with_forged_one = PrecisionDoc(
+                    company="Test Co",
+                    currency="USD",
+                    conversion_rate=3700.0,
+                    round_row_wise_tax=1,
+                    taxes=invoice["taxes"],
+                    precision_value=2,
+                )
+                self.assertEqual(
+                    len(
+                        self.controls.collect_below_buying_price_errors(
+                            rows, invoice_doc=invoice_with_forged_one
+                        )
+                    ),
+                    2,
+                )
             finally:
                 self.frappe.db.get_single_value = orig_get_single_value
+
+    def test_fractional_qty_inclusive_tax_rounds_gross_amount_before_extracting_net_matching_erpnext(
+        self,
+    ):
+        erpnext_pkg = types.ModuleType("erpnext")
+        erpnext_setup = types.ModuleType("erpnext.setup")
+        erpnext_utils = types.ModuleType("erpnext.setup.utils")
+        erpnext_utils.get_exchange_rate = (
+            lambda from_curr, to_curr, *_args, **_kwargs: 3700.0
+            if (from_curr, to_curr) == ("USD", "UGX")
+            else 1.0
+        )
+
+        def fake_get_all(doctype, **kwargs):
+            if doctype == "Item":
+                return [
+                    {"name": "ITEM-FRAC", "stock_uom": "Kg", "is_stock_item": 1, "valuation_rate": 0},
+                    {"name": "ITEM-FRAC-120", "stock_uom": "Kg", "is_stock_item": 1, "valuation_rate": 0},
+                ]
+            if doctype == "Bin":
+                return [
+                    {"item_code": "ITEM-FRAC", "warehouse": "Shop Floor - JBS", "valuation_rate": 100.0},
+                    {"item_code": "ITEM-FRAC-120", "warehouse": "Shop Floor - JBS", "valuation_rate": 120.0},
+                ]
+            return []
+
+        self.frappe.get_all = fake_get_all
+        self.frappe.db.get_value = lambda doctype, name, fieldname=None: (
+            "UGX" if doctype == "Company" and fieldname == "default_currency" else None
+        )
+
+        # ERPNext taxes_and_totals.py:287 & :439:
+        # qty=0.6, rate=0.03 -> amount=flt(0.018, 2)=0.02, net_amount=flt(0.02/1.18, 2)=0.02,
+        # net_rate=flt(0.02/0.6, 2)=0.03 -> base_net_rate=111.0 >= 100.0 floor.
+        valid_row = PrecisionDoc(
+            item_code="ITEM-FRAC",
+            item_name="Fractional VAT Item",
+            qty=0.6,
+            rate=0.03,
+            amount=0.02,
+            net_amount=0.02,
+            net_rate=0.03,
+            base_net_amount=74.0,
+            base_net_rate=111.0,
+            uom="Kg",
+            warehouse="Shop Floor - JBS",
+            precision_value=2,
+        )
+        invoice = PrecisionDoc(
+            company="Test Co",
+            currency="USD",
+            conversion_rate=3700.0,
+            taxes=[
+                {
+                    "charge_type": "On Net Total",
+                    "account_head": "VAT 18% - CO",
+                    "rate": 18,
+                    "included_in_print_rate": 1,
+                }
+            ],
+            precision_value=2,
+        )
+
+        with patch.dict(
+            sys.modules,
+            {
+                "erpnext": erpnext_pkg,
+                "erpnext.setup": erpnext_setup,
+                "erpnext.setup.utils": erpnext_utils,
+            },
+        ):
+            self.assertEqual(
+                self.controls.collect_below_buying_price_errors([valid_row], invoice_doc=invoice),
+                [],
+            )
+
+            # Forged net_amount=0.03 (above rounded gross 0.02) must still block.
+            forged_amount = PrecisionDoc(
+                item_code="ITEM-FRAC",
+                item_name="Fractional Forged Amount",
+                qty=0.6,
+                rate=0.03,
+                amount=0.02,
+                net_amount=0.03,
+                net_rate=0.05,
+                base_net_amount=111.0,
+                base_net_rate=185.0,
+                uom="Kg",
+                warehouse="Shop Floor - JBS",
+                precision_value=2,
+            )
+            self.assertEqual(
+                len(self.controls.collect_below_buying_price_errors([forged_amount], invoice_doc=invoice)),
+                1,
+            )
+
+            # Forged net_rate=0.04 on net_amount=0.02 against UGX 120 floor must block
+            # (ERPNext's real net_rate is flt(0.02/0.6, 2)=0.03 -> UGX 111 < 120).
+            forged_rate = PrecisionDoc(
+                item_code="ITEM-FRAC-120",
+                item_name="Fractional Forged Rate",
+                qty=0.6,
+                rate=0.03,
+                amount=0.02,
+                net_amount=0.02,
+                net_rate=0.04,
+                base_net_amount=74.0,
+                base_net_rate=148.0,
+                uom="Kg",
+                warehouse="Shop Floor - JBS",
+                precision_value=2,
+            )
+            self.assertEqual(
+                len(self.controls.collect_below_buying_price_errors([forged_rate], invoice_doc=invoice)),
+                1,
+            )
 
 
 if __name__ == "__main__":
