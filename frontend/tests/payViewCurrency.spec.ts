@@ -500,4 +500,134 @@ describe("PayView.vue company currency & selling FX resolution", () => {
 			expect(p).toBe("for_buying");
 		}
 	});
+
+	it("cancels stale in-flight for_selling FX lookup when switching to Supplier Pay (for_buying)", async () => {
+		const fetchExchangeBody = extractBlock(
+			payViewSource,
+			/\bconst fetchExchangeRate\s*=\s*async\s*\(\)\s*=>\s*\{/,
+			"fetchExchangeRate",
+		);
+		const purposeExpr = extractExpression(
+			payViewSource,
+			/\bconst exchangeRatePurpose\s*=\s*computed\(\s*/,
+			"exchangeRatePurpose",
+		);
+
+		const paymentEntryType = ref("Receive");
+		const partyType = ref("Customer");
+		const exchangeRatePurpose = new Function(
+			"computed",
+			"paymentEntryType",
+			"partyType",
+			`return computed(${purposeExpr});`,
+		)(computed, paymentEntryType, partyType);
+
+		const pos_profile = ref<any>({
+			name: "POS-RACE",
+			company: "Uganda Co",
+			currency: "USD",
+			company_currency: "UGX",
+		});
+		const company = ref("Uganda Co");
+		const companyCurrencyLocal = computed(() => "UGX");
+		const invoiceTotalCurrency = computed(() => "USD");
+		const requiresExchangeRate = computed(() => true);
+		const exchangeRate = ref<number | null>(null);
+		const exchangeRateLoading = ref(false);
+		const exchangeRateError = ref<string | null>(null);
+		const postingDate = ref("2026-11-28");
+
+		let releaseSellingLookup!: () => void;
+		const sellingPromise = new Promise<any>((resolve) => {
+			releaseSellingLookup = () =>
+				resolve({
+					found: true,
+					fromCurrency: "USD",
+					toCurrency: "UGX",
+					rate: 3700,
+					effectiveDate: "2026-11-28",
+					rateDate: "2026-11-28",
+					source: "currency_exchange",
+				});
+		});
+
+		const resolveExchangeRate = vi.fn(({ fromCurrency, toCurrency, purpose }) => {
+			if (purpose === "for_selling") {
+				return sellingPromise;
+			}
+			return Promise.resolve({
+				found: true,
+				fromCurrency,
+				toCurrency,
+				rate: 4050,
+				effectiveDate: "2026-11-28",
+				rateDate: "2026-11-28",
+				source: "currency_exchange",
+			});
+		});
+
+		const fetchExchangeRate = new Function(
+			"exchangeRateLoading",
+			"requiresExchangeRate",
+			"exchangeRate",
+			"invoiceTotalCurrency",
+			"companyCurrencyLocal",
+			"exchangeRateError",
+			"resolveExchangeRate",
+			"pos_profile",
+			"company",
+			"postingDate",
+			"getTodayDate",
+			"__",
+			"exchangeRatePurpose",
+			`return async () => { ${fetchExchangeBody} };`,
+		)(
+			exchangeRateLoading,
+			requiresExchangeRate,
+			exchangeRate,
+			invoiceTotalCurrency,
+			companyCurrencyLocal,
+			exchangeRateError,
+			resolveExchangeRate,
+			pos_profile,
+			company,
+			postingDate,
+			() => "2026-11-28",
+			(s: string) => s,
+			exchangeRatePurpose,
+		);
+
+		// Kick off slow Customer Receive (for_selling) lookup.
+		const sellingCall = fetchExchangeRate();
+		expect(exchangeRateLoading.value).toBe(true);
+
+		// While in flight, switch to Supplier Pay (for_buying) and trigger fetchExchangeRate.
+		paymentEntryType.value = "Pay";
+		partyType.value = "Supplier";
+		expect(exchangeRatePurpose.value).toBe("for_buying");
+		await fetchExchangeRate();
+
+		// Release the stale for_selling response late — must NOT overwrite 4050 with 3700.
+		releaseSellingLookup();
+		await sellingCall;
+
+		expect(resolveExchangeRate.mock.calls.map(([arg]) => arg.purpose)).toEqual([
+			"for_selling",
+			"for_buying",
+		]);
+		expect(exchangeRate.value).toBe(4050);
+		expect(exchangeRateLoading.value).toBe(false);
+	});
+
+	it("binds resolved companyCurrencyLocal to PayTotalsSidebar and returns it from setup", () => {
+		const sidebarMatch = /<PayTotalsSidebar[\s\S]*?\/>/.exec(payViewSource);
+		expect(sidebarMatch).not.toBeNull();
+		expect(sidebarMatch?.[0]).toContain(':company-currency="companyCurrencyLocal"');
+
+		const setupReturnMatch = /\breturn\s*\{[\s\S]*?\};\s*\}\s*,\s*\}\s*;\s*<\/script>/.exec(
+			payViewSource,
+		);
+		expect(setupReturnMatch).not.toBeNull();
+		expect(setupReturnMatch?.[0]).toMatch(/\bcompanyCurrencyLocal\b/);
+	});
 });

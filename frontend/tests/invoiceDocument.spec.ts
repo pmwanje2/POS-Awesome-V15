@@ -10,7 +10,10 @@ vi.mock("../src/posapp/components/pos/invoice_utils/currency", () => ({
 	_getPlcConversionRate: vi.fn(() => 1),
 }));
 
-import { get_invoice_doc } from "../src/posapp/components/pos/invoice_utils/document";
+import {
+	get_invoice_doc,
+	get_invoice_items,
+} from "../src/posapp/components/pos/invoice_utils/document";
 
 describe("get_invoice_doc", () => {
 	beforeEach(() => {
@@ -316,5 +319,101 @@ describe("get_invoice_doc", () => {
 		expect(doc.payments[0].base_amount).toBe(37000);
 		expect(doc.items[0].base_rate).toBe(37000);
 		expect(doc.items[0].base_amount).toBe(37000);
+	});
+
+	it("preserves conversion_rate and base amounts when context is a Vue 3-like Proxy whose ownKeys omits setup bindings from object spread", () => {
+		const backing: Record<string, any> = {
+			invoiceType: "Invoice",
+			pos_profile: {
+				company: "Uganda Co",
+				name: "POS-USD",
+				currency: "USD",
+				payments: [
+					{ mode_of_payment: "Cash", account: "Cash USD", type: "Cash", default: 1 },
+				],
+			},
+			selected_currency: "USD",
+			conversion_rate: 3700,
+			exchange_rate: 1,
+			company: null,
+			price_list_currency: "USD",
+			currency_precision: 2,
+			float_precision: 2,
+			get_price_list: () => "USD Selling",
+			customer_info: {
+				customer: "CUST-001",
+				customer_name: "Walk-in Customer",
+			},
+			customer: "CUST-001",
+			isReturnInvoice: false,
+			items: [
+				{
+					item_code: "ITEM-USD-PROXY",
+					item_name: "Imported Item",
+					qty: 1,
+					rate: 10,
+					price_list_rate: 10,
+					discount_amount: 0,
+					discount_percentage: 0,
+					uom: "Nos",
+					conversion_factor: 1,
+					company_currency: "UGX",
+				},
+			],
+			packed_items: [],
+			Total: 10,
+			subtotal: 10,
+			additional_discount: 0,
+			additional_discount_percentage: 0,
+			roundAmount: (value: number) => value,
+			pos_opening_shift: { name: "SHIFT-USD-1" },
+			posa_offers: [],
+			posa_coupons: [],
+			selected_delivery_charge: null,
+			delivery_charges_rate: 0,
+			posting_date_display: "2026-11-28",
+			formatDateForBackend: (value: string) => value,
+			invoice_doc: {
+				company_currency: "UGX",
+				payments: [{ mode_of_payment: "Cash", amount: 10 }],
+				taxes: [],
+			},
+		};
+
+		// Mirror Vue 3 public component instance Proxy: direct property access returns
+		// setup bindings (conversion_rate === 3700), while Object.keys / `{ ...ctx }` omits them.
+		const vueLikeContext: any = new Proxy(
+			{},
+			{
+				get(_target, prop) {
+					return typeof prop === "string" ? backing[prop] : undefined;
+				},
+				has(_target, prop) {
+					return typeof prop === "string" && prop in backing;
+				},
+				ownKeys() {
+					return [];
+				},
+				getOwnPropertyDescriptor() {
+					return undefined;
+				},
+			},
+		);
+
+		expect(({ ...vueLikeContext } as any).conversion_rate).toBeUndefined();
+		expect(vueLikeContext.conversion_rate).toBe(3700);
+
+		const doc = get_invoice_doc(vueLikeContext);
+		const items = get_invoice_items(vueLikeContext);
+
+		expect(doc.base_total).toBe(37000);
+		expect(doc.base_net_total).toBe(37000);
+		expect(doc.base_grand_total).toBe(37000);
+		expect(doc.base_rounded_total).toBe(37000);
+		expect(doc.payments[0].base_amount).toBe(37000);
+		expect(doc.items[0].base_rate).toBe(37000);
+		expect(doc.items[0].base_amount).toBe(37000);
+		expect(items[0].base_rate).toBe(37000);
+		expect(items[0].base_amount).toBe(37000);
 	});
 });

@@ -623,6 +623,97 @@ class TestGiftCardApi(unittest.TestCase):
             erpnext_utils.get_exchange_rate = orig_get_exchange_rate
             frappe_mod.utils = orig_utils
 
+    def test_create_gift_card_je_preserves_valid_selling_rate_of_one_through_erpnext_set_exchange_rate(
+        self,
+    ):
+        class FlagsDict(dict):
+            def __getattr__(self, key):
+                return self.get(key)
+
+            def __setattr__(self, key, value):
+                self[key] = value
+
+        class PinnedERPNextJournalEntry(FakeJournalEntry):
+            """Mirror pinned ERPNext v16.60.0 JournalEntry.set_exchange_rate (lines 1030-1062)."""
+
+            def __init__(self, payload=None):
+                super().__init__(payload)
+                self.company_currency = "EUR"
+                self.flags = FlagsDict(ignore_permissions=False)
+
+            def get(self, key, default=None):
+                return getattr(self, key, default)
+
+            def set_exchange_rate(self):
+                for d in self.accounts:
+                    if d.get("account_currency") == self.company_currency:
+                        d["exchange_rate"] = 1
+                    elif not d.get("exchange_rate") or d.get("exchange_rate") == 1:
+                        ignore_exchange_rate = False
+                        if self.get("flags") and self.flags.get("ignore_exchange_rate"):
+                            ignore_exchange_rate = True
+                        if not ignore_exchange_rate:
+                            # ERPNext journal_entry.py:1796 unqualified lookup picks buying-only 1.05
+                            d["exchange_rate"] = 1.05
+
+            def save(self, ignore_permissions=False):
+                self.set_exchange_rate()
+                return super().save(ignore_permissions=ignore_permissions)
+
+        frappe_mod = sys.modules["frappe"]
+        erpnext_utils = sys.modules["erpnext.setup.utils"]
+        orig_get_cached_value = frappe_mod.get_cached_value
+        orig_get_exchange_rate = erpnext_utils.get_exchange_rate
+        orig_get_doc = frappe_mod.get_doc
+        orig_utils = frappe_mod.utils
+        created_jes = []
+
+        try:
+            frappe_mod.utils = types.SimpleNamespace(
+                now_datetime=lambda: "2026-11-28 12:00:00",
+                flt=lambda value, *_args, **_kwargs: float(value or 0),
+            )
+            frappe_mod.get_cached_value = lambda doctype, name, fieldname: (
+                "EUR"
+                if doctype == "Company" and fieldname == "default_currency"
+                else "USD"
+                if doctype == "Account" and fieldname == "account_currency"
+                else None
+            )
+            # Valid 1:1 selling parity (1.00), whereas ERPNext unqualified lookup would return 1.05.
+            erpnext_utils.get_exchange_rate = lambda from_c, to_c, tx_date, args=None: (
+                1.0 if args == "for_selling" else 1.05
+            )
+
+            def fake_get_doc(doctype, name=None):
+                if isinstance(doctype, dict) and doctype.get("doctype") == "Journal Entry":
+                    je = PinnedERPNextJournalEntry(doctype)
+                    created_jes.append(je)
+                    return je
+                return orig_get_doc(doctype, name)
+
+            frappe_mod.get_doc = fake_get_doc
+
+            je = self.module._create_gift_card_journal_entry(
+                "Test Company",
+                "2026-11-28",
+                "Parity gift card JE",
+                [
+                    {"account": "1110 - Cash USD - TC", "debit_in_account_currency": 50},
+                    {"account": "2190 - Gift Card USD - TC", "credit_in_account_currency": 50},
+                ],
+            )
+
+            self.assertEqual(len(created_jes), 1)
+            self.assertEqual(je.accounts[0]["exchange_rate"], 1.0)
+            self.assertEqual(je.accounts[1]["exchange_rate"], 1.0)
+            self.assertTrue(je.flags.get("ignore_exchange_rate"))
+        finally:
+            frappe_mod.get_cached_value = orig_get_cached_value
+            erpnext_utils.get_exchange_rate = orig_get_exchange_rate
+            frappe_mod.get_doc = orig_get_doc
+            frappe_mod.utils = orig_utils
+
 
 if __name__ == "__main__":
     unittest.main()

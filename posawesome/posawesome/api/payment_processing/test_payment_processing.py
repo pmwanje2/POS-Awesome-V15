@@ -2104,6 +2104,103 @@ class TestPosPaymentProcessing(unittest.TestCase):
         mock_get_exchange_rate.assert_called_once_with("EUR", "USD", "2026-11-28", "for_selling")
         self.assertAlmostEqual(rows[0]["outstanding_amount_in_invoice_currency"], 11.0, places=2)
 
+    @patch("posawesome.posawesome.api.payment_processing.data.frappe")
+    def test_get_outstanding_invoices_returns_company_currency_on_each_row(
+        self,
+        mock_frappe,
+    ):
+        mock_frappe._dict.side_effect = lambda value: AttrDict(value)
+        mock_frappe.get_precision.return_value = 2
+
+        def fake_get_cached_value(doctype, name, fieldname):
+            if doctype == "Company" and fieldname == "default_currency":
+                return "UGX"
+            if doctype == "Customer" and fieldname == "customer_name":
+                return "USD Customer"
+            return None
+
+        mock_frappe.get_cached_value.side_effect = fake_get_cached_value
+        mock_frappe.get_list.return_value = [
+            AttrDict(
+                {
+                    "name": "SINV-USD-CO-UGX",
+                    "posting_date": "2026-11-28",
+                    "due_date": "2026-12-05",
+                    "outstanding_amount": 10.0,
+                    "conversion_rate": 3700.0,
+                    "rounded_total": 10.0,
+                    "grand_total": 10.0,
+                    "currency": "USD",
+                    "party_account_currency": "USD",
+                    "pos_profile": "POS-USD",
+                    "customer_name": "USD Customer",
+                }
+            )
+        ]
+
+        rows = self.data.get_outstanding_invoices(
+            customer="CUST-USD",
+            company="Uganda Co",
+            currency="USD",
+            pos_profile="POS-USD",
+            include_all_currencies=False,
+        )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].get("company_currency"), "UGX")
+
+    @patch("posawesome.posawesome.api.payment_processing.data.get_exchange_rate")
+    @patch("posawesome.posawesome.api.payment_processing.data.frappe")
+    def test_get_outstanding_invoices_refuses_unrelated_conversion_rate_on_missing_third_currency_quote(
+        self,
+        mock_frappe,
+        mock_get_exchange_rate,
+    ):
+        mock_frappe._dict.side_effect = lambda value: AttrDict(value)
+        mock_frappe.get_precision.return_value = 2
+
+        def fake_get_cached_value(doctype, name, fieldname):
+            if doctype == "Company" and fieldname == "default_currency":
+                return "UGX"
+            if doctype == "Customer" and fieldname == "customer_name":
+                return "Euro Debtor"
+            return None
+
+        mock_frappe.get_cached_value.side_effect = fake_get_cached_value
+        mock_frappe.get_list.return_value = [
+            AttrDict(
+                {
+                    "name": "SINV-3CCY-NOQUOTE",
+                    "posting_date": "2026-11-28",
+                    "due_date": "2026-12-05",
+                    "outstanding_amount": 10.0,
+                    "conversion_rate": 3700.0,
+                    "rounded_total": 11.0,
+                    "grand_total": 11.0,
+                    "currency": "USD",
+                    "party_account_currency": "EUR",
+                    "pos_profile": "POS-USD",
+                    "customer_name": "Euro Debtor",
+                }
+            )
+        ]
+        # Missing EUR->USD selling quote must NOT divide 10 by unrelated USD->UGX rate 3700.
+        mock_get_exchange_rate.return_value = 0
+
+        rows = self.data.get_outstanding_invoices(
+            customer="CUST-EUR",
+            company="Uganda Co",
+            currency="USD",
+            pos_profile="POS-USD",
+            include_all_currencies=True,
+        )
+
+        self.assertEqual(len(rows), 1)
+        self.assertIsNone(rows[0].get("outstanding_amount_in_invoice_currency"))
+        self.assertTrue(rows[0].get("outstanding_conversion_unavailable"))
+        self.assertEqual(rows[0].get("outstanding_amount"), 10.0)
+        self.assertEqual(rows[0].get("party_account_currency"), "EUR")
+
 
 if __name__ == "__main__":
     unittest.main()
