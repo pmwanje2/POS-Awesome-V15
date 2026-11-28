@@ -62,7 +62,10 @@ import { memory, persist, db, checkDbHealth } from "./db";
 import { emitBootstrapSnapshotUpdated } from "../posapp/utils/bootstrapRuntimeEvents";
 import { finishStartupPhase, startStartupPhase } from "../utils/startupTrace";
 import { itemPriceRepository } from "./repositories";
-import { selectCurrencyRateRecord } from "./repositories/CurrencyRateRepository";
+import {
+	currencyRateRepository,
+	selectCurrencyRateRecord,
+} from "./repositories/CurrencyRateRepository";
 
 const normalizeScope = (scope: unknown): string => String(scope || "");
 const hasScope = (scope: unknown): boolean => normalizeScope(scope).length > 0;
@@ -697,6 +700,7 @@ type ExchangeRateCacheEntry = {
 	toCurrency?: string;
 	rateDate?: string;
 	date?: string;
+	purpose?: string | null;
 	exchange_rate?: number;
 	[key: string]: unknown;
 };
@@ -1296,19 +1300,25 @@ async function attachOfflineBuyingFloors(profileName: string, items: any[]) {
 	if (!priceRows.length) return items;
 
 	const profileCompanyCurrency = String(profile?.company_currency || "").trim();
-	const profileFallbackCurrency = String(profile?.currency || "").trim();
+	const openingCompanyCurrency = String(
+		memory.pos_opening_storage?.company?.default_currency || "",
+	).trim();
 	const profileNotUomDependent =
 		profile?.buying_price_not_uom_dependent !== undefined &&
 		profile?.buying_price_not_uom_dependent !== null
 			? isTruthyFlag(profile.buying_price_not_uom_dependent)
+			: null;
+	const exchangeSettings =
+		typeof currencyRateRepository?.getExchangeSettings === "function"
+			? await currencyRateRepository.getExchangeSettings()
 			: null;
 	const currencyRates = new Map<string, number>();
 	const toCompanyRate = async (
 		currency: string,
 		companyCurrency: string,
 	) => {
-		if (!currency || !companyCurrency || currency === companyCurrency)
-			return 1;
+		if (!currency || !companyCurrency) return 0;
+		if (currency === companyCurrency) return 1;
 		const cacheKey = `${currency}::${companyCurrency}`;
 		if (currencyRates.has(cacheKey))
 			return currencyRates.get(cacheKey) || 0;
@@ -1322,9 +1332,14 @@ async function attachOfflineBuyingFloors(profileName: string, items: any[]) {
 				companyCurrency,
 			])
 			.toArray();
-		// Mirror ERPNext setup/utils.py:66-98: buying floors must resolve via for_buying FX
-		// (never overwritten by newer selling-only rates) and tie-break by name desc.
-		const selected = selectCurrencyRateRecord(rows, today, "for_buying");
+		// Mirror ERPNext setup/utils.py:66-125: buying floors must resolve via for_buying FX,
+		// enforce Accounts Settings stale_days when allow_stale=0, and tie-break by name desc.
+		const selected = selectCurrencyRateRecord(
+			rows,
+			today,
+			"for_buying",
+			exchangeSettings,
+		);
 		const rate = Number(selected?.exchange_rate || 0);
 		currencyRates.set(cacheKey, Number.isFinite(rate) ? rate : 0);
 		return currencyRates.get(cacheKey) || 0;
@@ -1345,15 +1360,30 @@ async function attachOfflineBuyingFloors(profileName: string, items: any[]) {
 				String(left?.valid_from || left?.modified || ""),
 			),
 		);
+		// Never default company_currency to profile.currency (fixed foreign-currency tills
+		// can have profile.currency = USD in a UGX company).
 		const companyCurrency =
 			profileCompanyCurrency ||
 			String(item?.company_currency || "").trim() ||
-			profileFallbackCurrency;
+			openingCompanyCurrency;
 		const existingBuyingMap =
 			item?._buying_prices_by_uom &&
 			typeof item._buying_prices_by_uom === "object"
 				? item._buying_prices_by_uom
 				: null;
+		const hasExistingVerifiedFloor = Boolean(
+			(existingBuyingMap &&
+				Object.values(existingBuyingMap).some(
+					(entry: any) =>
+						Number(entry?.base_price_list_rate || entry?.base_rate || 0) > 0,
+				)) ||
+				Number(item?.base_buying_rate || 0) > 0,
+		);
+		if (!companyCurrency && hasExistingVerifiedFloor) {
+			// Without an authoritative company_currency, preserve any verified cached floor
+			// instead of fabricating a 1:1 floor from profile.currency.
+			continue;
+		}
 		const existingAnyNotUomDependent = existingBuyingMap
 			? Object.values(existingBuyingMap).some(
 					(entry: any) =>
@@ -1363,24 +1393,22 @@ async function attachOfflineBuyingFloors(profileName: string, items: any[]) {
 				)
 			: false;
 		const pricesByUom: Record<string, any> = {};
+		let unresolvedBuyingCurrency = "";
 		for (const row of buyingRows) {
 			const uom = String(row?.uom || "");
 			if (pricesByUom[uom]) continue;
 			const rate = Number(row?.price_list_rate || 0);
-			const exchangeRate = await toCompanyRate(
-				String(row?.currency || ""),
-				companyCurrency,
-			);
-			if (!Number.isFinite(rate) || rate <= 0 || exchangeRate <= 0)
-				continue;
+			if (!Number.isFinite(rate) || rate <= 0) continue;
+			const rowCurrency = String(row?.currency || "").trim();
+			// Authoritative Price List flag synced on profile takes precedence over stale per-row flags.
 			let priceNotUomDependent = false;
-			if (
+			if (profileNotUomDependent !== null) {
+				priceNotUomDependent = profileNotUomDependent;
+			} else if (
 				row?.price_not_uom_dependent !== undefined &&
 				row?.price_not_uom_dependent !== null
 			) {
 				priceNotUomDependent = isTruthyFlag(row.price_not_uom_dependent);
-			} else if (profileNotUomDependent !== null) {
-				priceNotUomDependent = profileNotUomDependent;
 			} else if (
 				existingBuyingMap?.[uom]?.price_not_uom_dependent !==
 					undefined &&
@@ -1392,10 +1420,28 @@ async function attachOfflineBuyingFloors(profileName: string, items: any[]) {
 			} else {
 				priceNotUomDependent = existingAnyNotUomDependent;
 			}
+			const exchangeRate = await toCompanyRate(
+				rowCurrency || companyCurrency,
+				companyCurrency,
+			);
+			if (exchangeRate <= 0) {
+				// Preserve the unresolved buying-price row so getItemCostFloor fails closed
+				// rather than falling through to warehouse valuation.
+				unresolvedBuyingCurrency = unresolvedBuyingCurrency || rowCurrency;
+				pricesByUom[uom] = {
+					price_list_rate: rate,
+					base_price_list_rate: null,
+					currency: rowCurrency,
+					price_list: buyingPriceList,
+					price_not_uom_dependent: priceNotUomDependent ? 1 : 0,
+					unresolved_fx: true,
+				};
+				continue;
+			}
 			pricesByUom[uom] = {
 				price_list_rate: rate,
 				base_price_list_rate: rate * exchangeRate,
-				currency: row?.currency || companyCurrency,
+				currency: rowCurrency || companyCurrency,
 				price_list: buyingPriceList,
 				price_not_uom_dependent: priceNotUomDependent ? 1 : 0,
 			};
@@ -1403,6 +1449,12 @@ async function attachOfflineBuyingFloors(profileName: string, items: any[]) {
 		if (Object.keys(pricesByUom).length) {
 			item._buying_prices_by_uom = pricesByUom;
 			item.buying_price_list = buyingPriceList;
+			if (unresolvedBuyingCurrency) {
+				item.buying_price_currency = unresolvedBuyingCurrency;
+				item.buying_exchange_rate = 0;
+				item.base_buying_rate = null;
+				delete item._company_buying_price;
+			}
 		}
 	}
 	return items;
@@ -1418,12 +1470,36 @@ export async function setProfileBuyingPriceList(
 	if (!db.isOpen()) await db.open();
 	const current =
 		(await db.table("pos_profiles").get(profile.name)) || profile;
+	const companyCurrency =
+		String(
+			profile?.company_currency ||
+				current?.company_currency ||
+				memory.pos_opening_storage?.company?.default_currency ||
+				"",
+		).trim() || undefined;
 	await db.table("pos_profiles").put({
 		...current,
 		buying_price_list: buyingPriceList,
+		...(companyCurrency ? { company_currency: companyCurrency } : {}),
 		...(priceNotUomDependent !== undefined && priceNotUomDependent !== null
 			? { buying_price_not_uom_dependent: isTruthyFlag(priceNotUomDependent) ? 1 : 0 }
 			: {}),
+	});
+}
+
+export async function setProfileCompanyCurrency(
+	profile: any,
+	companyCurrency: string | null | undefined,
+) {
+	const normalized = String(companyCurrency || "").trim();
+	if (!profile?.name || !normalized) return;
+	await checkDbHealth();
+	if (!db.isOpen()) await db.open();
+	const current =
+		(await db.table("pos_profiles").get(profile.name)) || profile;
+	await db.table("pos_profiles").put({
+		...current,
+		company_currency: normalized,
 	});
 }
 
@@ -1688,7 +1764,21 @@ async function persistOpeningEntities(data: any) {
 
 		const profile = data?.pos_profile;
 		if (profile?.name) {
-			await db.table("pos_profiles").put(profile);
+			const existingProfile = await db
+				.table("pos_profiles")
+				.get(profile.name);
+			const companyCurrency =
+				String(
+					profile?.company_currency ||
+						data?.company?.default_currency ||
+						existingProfile?.company_currency ||
+						"",
+				).trim() || undefined;
+			await db.table("pos_profiles").put({
+				...(existingProfile || {}),
+				...profile,
+				...(companyCurrency ? { company_currency: companyCurrency } : {}),
+			});
 		}
 
 		const openingShift = data?.pos_opening_shift;
@@ -2121,13 +2211,23 @@ export function getCachedCurrencyOptions(
 
 export function saveExchangeRateCache(entry: ExchangeRateCacheEntry = {}) {
 	try {
-		const key = buildScopedCacheKey(
-			entry.profileName,
-			entry.company,
-			entry.fromCurrency,
-			entry.toCurrency,
-			entry.rateDate || entry.date,
-		);
+		const purpose = String(entry.purpose || "").trim();
+		const key = purpose
+			? buildScopedCacheKey(
+					entry.profileName,
+					entry.company,
+					entry.fromCurrency,
+					entry.toCurrency,
+					entry.rateDate || entry.date,
+					purpose,
+				)
+			: buildScopedCacheKey(
+					entry.profileName,
+					entry.company,
+					entry.fromCurrency,
+					entry.toCurrency,
+					entry.rateDate || entry.date,
+				);
 		if (!key || !entry.fromCurrency || !entry.toCurrency) {
 			return;
 		}
@@ -2152,15 +2252,28 @@ export function getCachedExchangeRate(
 	ttlMs = DEFAULT_CACHE_TTL_MS,
 ) {
 	try {
-		const key = buildScopedCacheKey(
-			entry.profileName,
-			entry.company,
-			entry.fromCurrency,
-			entry.toCurrency,
-			entry.rateDate || entry.date,
-		);
+		const purpose = String(entry.purpose || "").trim();
+		const key = purpose
+			? buildScopedCacheKey(
+					entry.profileName,
+					entry.company,
+					entry.fromCurrency,
+					entry.toCurrency,
+					entry.rateDate || entry.date,
+					purpose,
+				)
+			: buildScopedCacheKey(
+					entry.profileName,
+					entry.company,
+					entry.fromCurrency,
+					entry.toCurrency,
+					entry.rateDate || entry.date,
+				);
 		const cachedEntry = (memory.exchange_rate_cache || {})[key];
 		if (!isFreshCacheEntry(cachedEntry, ttlMs)) {
+			return null;
+		}
+		if (purpose && String(cachedEntry.data?.purpose || "").trim() !== purpose) {
 			return null;
 		}
 		return cloneCachePayload(cachedEntry.data) || null;

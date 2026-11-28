@@ -148,6 +148,40 @@ def _normalize_pairs(currency_pairs, profile, enabled_currencies):
     return [], False
 
 
+def _get_currency_exchange_settings():
+    """Read ``Accounts Settings`` stale-rate policy with safe fallback defaults."""
+
+    raw_allow_stale = None
+    raw_stale_days = None
+    get_cached_doc = getattr(frappe, "get_cached_doc", None)
+    if callable(get_cached_doc):
+        try:
+            settings = get_cached_doc("Accounts Settings")
+            if settings and hasattr(settings, "get"):
+                raw_allow_stale = settings.get("allow_stale")
+                raw_stale_days = settings.get("stale_days")
+        except Exception:
+            pass
+    db = getattr(frappe, "db", None)
+    if raw_allow_stale is None and db and callable(getattr(db, "get_single_value", None)):
+        try:
+            raw_allow_stale = db.get_single_value("Accounts Settings", "allow_stale")
+        except Exception:
+            pass
+    if raw_stale_days is None and db and callable(getattr(db, "get_single_value", None)):
+        try:
+            raw_stale_days = db.get_single_value("Accounts Settings", "stale_days")
+        except Exception:
+            pass
+
+    allow_stale = 1 if raw_allow_stale is None else (1 if raw_allow_stale in (1, True, "1") else 0)
+    try:
+        stale_days = max(0, int(raw_stale_days)) if raw_stale_days is not None else 1
+    except (TypeError, ValueError):
+        stale_days = 1
+    return {"allow_stale": allow_stale, "stale_days": stale_days}
+
+
 def _get_exchange_rows(resolved_pairs):
     if not resolved_pairs:
         return {}
@@ -320,4 +354,5 @@ def sync_currency_scope(
         has_more=has_more,
     )
     response["next_offset"] = resolved_offset + len(changes) if has_more else None
+    response["currency_settings"] = _get_currency_exchange_settings()
     return response

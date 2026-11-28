@@ -30,6 +30,7 @@ export type LossPreventionOptions = {
 	taxes?: Array<Record<string, unknown>>;
 	currencyPrecision?: number;
 	reconciledNativeNet?: boolean;
+	roundRowWiseTax?: boolean;
 };
 
 const COST_CANDIDATES: Array<{
@@ -517,6 +518,12 @@ export function getItemCostFloor(
 	const companyCurrency = String(item.company_currency || "").trim();
 	const effectiveInvoiceCurrency = invoiceCurrency || companyCurrency;
 	const rawBuyingExchangeRate = toFiniteNumber(item.buying_exchange_rate);
+	const hasExplicitInvalidBuyingFx = Boolean(
+		Object.prototype.hasOwnProperty.call(item, "buying_exchange_rate") &&
+			item.buying_exchange_rate !== undefined &&
+			item.buying_exchange_rate !== null &&
+			(rawBuyingExchangeRate === null || rawBuyingExchangeRate <= 0),
+	);
 
 	const pricesByUom = item._buying_prices_by_uom;
 	let selectedTableRate: number | null = null;
@@ -548,7 +555,10 @@ export function getItemCostFloor(
 			selected?.price_not_uom_dependent === "1";
 		const conversionFactor =
 			exact || priceNotUomDependent ? 1 : uomConversionFactor;
-		if (baseRate !== null && baseRate > 0) {
+		if (selected?.unresolved_fx === true) {
+			hasUnresolvedCrossCurrencyCost = true;
+			hasNormalizedBuyingPrice = true;
+		} else if (baseRate !== null && baseRate > 0) {
 			selectedTableRate = baseRate * conversionFactor;
 			hasNormalizedBuyingPrice = true;
 		} else if (rawTableRate !== null && rawTableRate > 0) {
@@ -568,8 +578,7 @@ export function getItemCostFloor(
 			} else if (
 				buyingPriceCurrency &&
 				selectedTableCurrency === buyingPriceCurrency &&
-				rawBuyingExchangeRate !== null &&
-				rawBuyingExchangeRate <= 0
+				hasExplicitInvalidBuyingFx
 			) {
 				hasUnresolvedCrossCurrencyCost = true;
 			} else if (
@@ -671,8 +680,16 @@ export function getItemCostFloor(
 			// Mirror ERPNext setup/utils.py:77 & backend _resolve_floor_rates: even when
 			// sourceCurrency === invoiceCurrency !== companyCurrency, a raw buying scalar with
 			// buying_exchange_rate converts via for_buying FX (and fails closed if <= 0).
-			if (isForeignBuyingScalar && rawBuyingExchangeRate !== null) {
-				if (rawBuyingExchangeRate <= 0 || invoiceToCompanyRate === null) {
+			if (
+				isForeignBuyingScalar &&
+				(hasExplicitInvalidBuyingFx || rawBuyingExchangeRate !== null)
+			) {
+				if (
+					hasExplicitInvalidBuyingFx ||
+					rawBuyingExchangeRate === null ||
+					rawBuyingExchangeRate <= 0 ||
+					invoiceToCompanyRate === null
+				) {
 					hasUnresolvedCrossCurrencyCost = true;
 				} else {
 					resolvedCandidates.push({
@@ -748,8 +765,16 @@ export function getItemCostFloor(
 					effectiveInvoiceCurrency &&
 					sourceCurrency !== effectiveInvoiceCurrency,
 			);
-			if (isForeignSource && rawBuyingExchangeRate !== null) {
-				if (rawBuyingExchangeRate <= 0 || invoiceToCompanyRate === null) {
+			if (
+				isForeignSource &&
+				(hasExplicitInvalidBuyingFx || rawBuyingExchangeRate !== null)
+			) {
+				if (
+					hasExplicitInvalidBuyingFx ||
+					rawBuyingExchangeRate === null ||
+					rawBuyingExchangeRate <= 0 ||
+					invoiceToCompanyRate === null
+				) {
 					hasUnresolvedCrossCurrencyCost = true;
 				} else {
 					resolvedCandidates.push({
@@ -942,6 +967,15 @@ function resolveNativeUnitNetRate(
 	return netFromAmount;
 }
 
+function resolveRoundRowWiseTax(options: LossPreventionOptions): boolean {
+	if (options.roundRowWiseTax !== undefined) {
+		return Boolean(options.roundRowWiseTax);
+	}
+	const sysVal = (globalThis as any)?.frappe?.boot?.sysdefaults
+		?.round_row_wise_tax;
+	return sysVal === 1 || sysVal === true || sysVal === "1";
+}
+
 function areNativeNetAmountsReconciled(
 	items: Array<Record<string, unknown>>,
 	options: LossPreventionOptions,
@@ -962,12 +996,14 @@ function areNativeNetAmountsReconciled(
 	const precision =
 		rawPrecision !== null && rawPrecision >= 0 ? Math.trunc(rawPrecision) : 2;
 	const ulp = 10 ** -precision;
+	const roundRowWiseTax = resolveRoundRowWiseTax(options);
 
 	let eligibleCount = 0;
 	let nativeSum = 0;
 	let expectedSum = 0;
 	let preDiscountSum = 0;
 	let hasZeroAboveHalfUlp = false;
+	let allRowsMatchRowWise = true;
 	const taxGroupTotals = new Map<
 		string,
 		{ nativeSum: number; preSum: number }
@@ -997,12 +1033,24 @@ function areNativeNetAmountsReconciled(
 				return false;
 			}
 		}
+		// ERPNext taxes_and_totals.py:446-455 can legitimately carry rounding onto an
+		// inclusive-tax row with preAmount <= 1 ULP, yielding net_amount = 0 even with
+		// discount === 0. Only require an invoice discount when a zero row cannot come
+		// from carried inclusive-tax rounding.
 		if (
 			nativeAmount === 0 &&
 			grossRate > 0 &&
-			computedAmount > 0.5 * ulp + 1e-9
+			computedAmount > 0.5 * ulp + 1e-9 &&
+			(!hasInclusiveTax || computedAmount > ulp + 1e-9)
 		) {
 			hasZeroAboveHalfUlp = true;
+		}
+		const rowWiseExpected = Math.min(
+			grossRate * qty,
+			roundToPrecision(preAmount, precision),
+		);
+		if (Math.abs(nativeAmount - rowWiseExpected) > 1e-9) {
+			allRowsMatchRowWise = false;
 		}
 		// ERPNext taxes_and_totals.py:438-462 carries inclusive-tax rounding across rows
 		// within the same tax group, permitting up to +1 ULP on an individual inclusive row
@@ -1048,10 +1096,14 @@ function areNativeNetAmountsReconciled(
 			Math.abs(nativeSum - expectedSum) <= 0.5 * ulp + 1e-9
 		);
 	}
-	// When undiscounted, ERPNext carries rounding strictly within each tax group
+	// When undiscounted, ERPNext either rounds each row independently (round_row_wise_tax=1,
+	// taxes_and_totals.py:442) or carries rounding strictly within each tax group
 	// (taxes_and_totals.py:446-455). When discounted, taxes_and_totals.py:1105-1116
 	// carries rounding across the whole invoice so sum(item.net_amount) stays within 0.5 ULP.
 	if (Math.abs(expectedSum - preDiscountSum) <= 1e-9) {
+		if (roundRowWiseTax) {
+			return allRowsMatchRowWise;
+		}
 		for (const group of taxGroupTotals.values()) {
 			if (Math.abs(group.nativeSum - group.preSum) > 0.5 * ulp + 1e-9) {
 				return false;
@@ -1119,10 +1171,16 @@ export function getItemLossRisk(
 		precision,
 		allowZeroNativeNet,
 	);
-	const maxPreDiscountNetRate = Math.min(
-		grossSellingRate,
-		Math.max(preDiscountNetRate, roundToPrecision(preDiscountNetRate, precision)),
-	);
+	const maxUnreconciledNetRate =
+		options.reconciledNativeNet === false
+			? preDiscountNetRate
+			: Math.min(
+					grossSellingRate,
+					Math.max(
+						preDiscountNetRate,
+						roundToPrecision(preDiscountNetRate, precision),
+					),
+				);
 	let effectiveSellingRate: number;
 	if (options.reconciledNativeNet && nativeUnitNetRate !== null) {
 		effectiveSellingRate = nativeUnitNetRate;
@@ -1132,7 +1190,10 @@ export function getItemLossRisk(
 			isCashDiscount ||
 			invoiceDiscountPercentage <= 0)
 	) {
-		effectiveSellingRate = Math.min(nativeUnitNetRate, maxPreDiscountNetRate);
+		effectiveSellingRate = Math.min(
+			nativeUnitNetRate,
+			maxUnreconciledNetRate,
+		);
 	} else {
 		effectiveSellingRate =
 			preDiscountNetRate * (1 - invoiceDiscountPercentage / 100);

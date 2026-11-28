@@ -76,13 +76,21 @@ def sync_bootstrap_config(
     changes = []
 
     if _should_include(profile_modified, watermark):
+        company = profile.get("company")
+        db = getattr(frappe, "db", None)
+        company_currency = (
+            db.get_value("Company", company, "default_currency")
+            if company and db and callable(getattr(db, "get_value", None))
+            else None
+        )
         changes.append(
             {
                 "key": "bootstrap_config",
                 "modified": profile_modified,
                 "data": {
                     "profile_name": profile_name,
-                    "company": profile.get("company"),
+                    "company": company,
+                    "company_currency": company_currency,
                     "tax_inclusive": get_pos_profile_tax_inclusive(profile_name),
                     "profile_modified": profile_modified,
                 },

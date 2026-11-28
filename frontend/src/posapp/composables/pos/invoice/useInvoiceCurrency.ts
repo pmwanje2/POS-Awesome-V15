@@ -359,6 +359,18 @@ export function useInvoiceCurrency() {
 			item._source_buying_currency = scalarCurrency;
 		}
 
+		const hasExplicitBuyingExchangeRate =
+			Object.prototype.hasOwnProperty.call(item, "buying_exchange_rate") &&
+			item.buying_exchange_rate !== undefined;
+		const rawBuyingExchangeRate = parseFinite(item?.buying_exchange_rate);
+		if (
+			buyingPriceCurrency &&
+			scalarCurrency === buyingPriceCurrency &&
+			hasExplicitBuyingExchangeRate &&
+			(rawBuyingExchangeRate === null || rawBuyingExchangeRate <= 0)
+		) {
+			return null;
+		}
 		const buyingExchangeRate = parsePositiveFinite(
 			item?.buying_exchange_rate,
 		);

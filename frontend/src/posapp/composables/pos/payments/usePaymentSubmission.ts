@@ -935,6 +935,9 @@ export function usePaymentSubmission(options: PaymentSubmissionOptions) {
 			isCashOrNonTradeDiscount,
 			taxes: Array.isArray(doc?.taxes) ? doc.taxes : [],
 			currencyPrecision: prec,
+			...(doc?.round_row_wise_tax !== undefined
+				? { roundRowWiseTax: Boolean(doc.round_row_wise_tax) }
+				: {}),
 		};
 		const lossRiskItems = saleFloorPolicy.enabled
 			? findLossRiskItems(effectiveItems, lossOptions)

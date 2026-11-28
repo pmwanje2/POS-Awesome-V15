@@ -122,6 +122,14 @@ export async function syncCurrencyMatrixResource(
 			.map((key) => key.slice("currency_rate::".length))
 			.filter(Boolean);
 		await currencyRateRepository.deleteByNames(deletedRateNames);
+		if (
+			response?.currency_settings &&
+			typeof currencyRateRepository.saveExchangeSettings === "function"
+		) {
+			await currencyRateRepository.saveExchangeSettings(
+				response.currency_settings,
+			);
+		}
 
 		if (!response?.has_more) {
 			break;

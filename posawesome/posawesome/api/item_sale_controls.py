@@ -1421,6 +1421,36 @@ def _invoice_actual_tax_total(invoice_doc):
     return total_actual_tax
 
 
+def _is_round_row_wise_tax_enabled(invoice_doc=None):
+    """Return whether ERPNext's ``Accounts Settings.round_row_wise_tax`` is active."""
+
+    if invoice_doc and hasattr(invoice_doc, "get"):
+        explicit = invoice_doc.get("round_row_wise_tax")
+        if explicit is not None:
+            return explicit in (1, True, "1")
+    flags = getattr(frappe, "flags", None)
+    flag_val = getattr(flags, "round_row_wise_tax", None) if flags is not None else None
+    if flag_val is not None:
+        return flag_val in (1, True, "1")
+    get_single_value = getattr(frappe, "get_single_value", None)
+    if callable(get_single_value):
+        try:
+            val = get_single_value("Accounts Settings", "round_row_wise_tax")
+            if val is not None:
+                return val in (1, True, "1")
+        except Exception:
+            pass
+    db = getattr(frappe, "db", None)
+    if db and callable(getattr(db, "get_single_value", None)):
+        try:
+            val = db.get_single_value("Accounts Settings", "round_row_wise_tax")
+            if val is not None:
+                return val in (1, True, "1")
+        except Exception:
+            pass
+    return False
+
+
 def _has_populated_net_field(row, fieldname, gross_rate, allow_zero=True):
     """Return whether ``fieldname`` on ``row`` carries a meaningful net rate (including 0.0)."""
 
@@ -1557,6 +1587,7 @@ def collect_below_buying_price_errors(
     # multi-qty lines whose rounded ``net_rate * qty`` differs from ``net_amount``
     # still preserve ERPNext's exact allocation.
     reconciled_native_nets = False
+    round_row_wise_tax = _is_round_row_wise_tax_enabled(invoice_doc)
     if eligible_indexes:
         native_sum = 0.0
         expected_sum = 0.0
@@ -1564,6 +1595,7 @@ def collect_below_buying_price_errors(
         invoice_ulp = 1e-9
         tax_group_totals = {}
         all_rows_reconciled = True
+        all_rows_match_row_wise = True
         for idx in eligible_indexes:
             el_row = item_rows[idx]
             el_gross = abs(flt(el_row.get("rate")))
@@ -1589,6 +1621,14 @@ def collect_below_buying_price_errors(
             # ERPNext taxes_and_totals.py:438-462 carries inclusive-tax rounding across rows
             # within the same tax group, permitting up to +1 ULP on an individual inclusive row
             # (strictly capped at gross line amount) while keeping the tax-group total within 0.5 ULP.
+            # When round_row_wise_tax is enabled, each row rounds independently to flt(pre_amount, prec).
+            el_row_wise_expected = (
+                min(el_gross * el_qty, flt(el_pre_amount, el_prec))
+                if el_prec is not None
+                else el_pre_amount
+            )
+            if abs(el_native_amount - el_row_wise_expected) > 1e-9:
+                all_rows_match_row_wise = False
             el_max_pre_amount = (
                 min(el_gross * el_qty, el_pre_amount + row_ulp)
                 if has_inclusive_tax and el_prec is not None
@@ -1617,15 +1657,19 @@ def collect_below_buying_price_errors(
             expected_sum < pre_discount_sum - 0.5 * invoice_ulp - 1e-9
             and native_sum >= pre_discount_sum - 1e-9
         )
-        # When undiscounted, ERPNext carries rounding strictly within each tax group
+        # When undiscounted, ERPNext either rounds each row independently (round_row_wise_tax=1,
+        # taxes_and_totals.py:442) or carries rounding strictly within each tax group
         # (taxes_and_totals.py:446-455). When discounted, taxes_and_totals.py:1105-1116
         # carries rounding across the whole invoice so sum(item.net_amount) stays within 0.5 ULP.
         if all_rows_reconciled and not has_unapplied_discount:
             if abs(expected_sum - pre_discount_sum) <= 1e-9:
-                reconciled_native_nets = all(
-                    abs(group["native"] - group["pre"]) <= 0.5 * group["ulp"] + 1e-9
-                    for group in tax_group_totals.values()
-                )
+                if round_row_wise_tax:
+                    reconciled_native_nets = all_rows_match_row_wise
+                else:
+                    reconciled_native_nets = all(
+                        abs(group["native"] - group["pre"]) <= 0.5 * group["ulp"] + 1e-9
+                        for group in tax_group_totals.values()
+                    )
             else:
                 reconciled_native_nets = (
                     abs(native_sum - expected_sum) <= 0.5 * invoice_ulp + 1e-9

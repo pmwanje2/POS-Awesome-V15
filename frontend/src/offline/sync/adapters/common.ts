@@ -28,6 +28,10 @@ export type SyncResponse<T = any> = {
 	has_more?: boolean;
 	next_offset?: number | null;
 	scope?: Record<string, any> | null;
+	currency_settings?: {
+		allow_stale?: number | boolean | null;
+		stale_days?: number | null;
+	} | null;
 	schema_version?: string | null;
 	full_resync_required?: boolean;
 };

@@ -113,8 +113,15 @@ const resolveUncached = async (
 		fromCurrency: args.fromCurrency,
 		toCurrency: args.toCurrency,
 		rateDate: args.effectiveDate,
+		...(args.purpose ? { purpose: args.purpose } : {}),
 	});
-	const legacyRate = positiveFinite(legacyCached?.exchange_rate);
+	// Never let an unqualified/mismatched legacy warm-cache entry override an explicit
+	// purpose lookup (e.g. for_buying vs for_selling).
+	const legacyMatchesPurpose =
+		!args.purpose || legacyCached?.purpose === args.purpose;
+	const legacyRate = legacyMatchesPurpose
+		? positiveFinite(legacyCached?.exchange_rate)
+		: null;
 	if (legacyRate) {
 		return {
 			found: true,
@@ -187,6 +194,7 @@ const resolveUncached = async (
 			toCurrency: args.toCurrency,
 			rateDate: args.effectiveDate,
 			date: result.rateDate || args.effectiveDate,
+			...(args.purpose ? { purpose: args.purpose } : {}),
 			exchange_rate: rate,
 		});
 		return result;
