@@ -60,7 +60,11 @@ export function useChangeCurrencies(options: Options) {
 	const normalizeRow = async (row: any) => {
 		const doc = unref(options.invoiceDoc) || {};
 		const profile = unref(options.posProfile) || {};
-		const companyCurrency = profile.company_currency || profile.currency || doc.currency;
+		const companyCurrency =
+			profile.company_currency ||
+			doc.company_currency ||
+			profile.currency ||
+			doc.currency;
 		const effectiveDate = doc.posting_date || window.frappe?.datetime?.nowdate?.();
 		const invoiceRate = await resolveExchangeRate({
 			profileName: profile.name,
@@ -68,6 +72,7 @@ export function useChangeCurrencies(options: Options) {
 			fromCurrency: row.currency,
 			toCurrency: doc.currency,
 			effectiveDate,
+			purpose: "for_selling",
 		});
 		const companyRate = await resolveExchangeRate({
 			profileName: profile.name,
@@ -75,6 +80,7 @@ export function useChangeCurrencies(options: Options) {
 			fromCurrency: row.currency,
 			toCurrency: companyCurrency,
 			effectiveDate,
+			purpose: "for_selling",
 		});
 		if (!invoiceRate.found || !invoiceRate.rate || !companyRate.found || !companyRate.rate) {
 			row._posa_rate_error = true;

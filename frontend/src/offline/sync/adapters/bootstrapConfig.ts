@@ -1,5 +1,6 @@
 import {
 	savePriceListMetaCache,
+	setProfileCompanyCurrency,
 	setTaxInclusiveSetting,
 } from "../../cache";
 import type { SyncLifecycleState } from "../types";
@@ -69,6 +70,15 @@ export async function syncBootstrapConfigResource(
 		const taxInclusive = bootstrapChange.data.tax_inclusive;
 		if (taxInclusive !== null && typeof taxInclusive !== "undefined") {
 			setTaxInclusiveSetting(Boolean(taxInclusive));
+		}
+		if (
+			bootstrapChange.data.company_currency &&
+			typeof setProfileCompanyCurrency === "function"
+		) {
+			await setProfileCompanyCurrency(
+				args.posProfile,
+				String(bootstrapChange.data.company_currency),
+			);
 		}
 		refreshSnapshotFromSync({
 			posProfile: {

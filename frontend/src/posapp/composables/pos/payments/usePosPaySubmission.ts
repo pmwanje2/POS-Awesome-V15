@@ -1,6 +1,12 @@
 import { ref, type Ref } from "vue";
 import { isOffline, saveOfflinePayment } from "../../../../offline/index";
 import { ensurePaymentClientRequestId } from "../../../../offline/idempotency";
+import {
+	calculateEligibleSelectedInvoicesTotal,
+	getSelectedInvoiceCurrencies,
+	isInvoiceOutstandingConversionUnavailable,
+	resolveInvoiceCurrency,
+} from "./usePosPaySelection";
 
 declare const frappe: any;
 declare const __: (_text: string, _args?: any[]) => string;
@@ -12,10 +18,16 @@ type PosPaySubmissionArgs = {
 	partyType?: Ref<string>;
 	paymentType?: Ref<string>;
 	company: Ref<any>;
+	companyCurrency?: Ref<string | null> | Ref<string>;
 	posProfile: Ref<any>;
 	posOpeningShift: Ref<any>;
 	postingDate?: Ref<string | null>;
-	exchangeRate: Ref<number>;
+	currencyFilter?: Ref<string>;
+	exchangeRate: Ref<number | null> | Ref<number>;
+	requiresExchangeRate?: Ref<boolean>;
+	exchangeRateLoading?: Ref<boolean>;
+	exchangeRateError?: Ref<string | null> | Ref<string>;
+	exchangeRateRequestKey?: Ref<string>;
 	invoiceTotalCurrency: Ref<string>;
 	referenceNo: Ref<string>;
 	referenceDate: Ref<string>;
@@ -47,10 +59,16 @@ export function usePosPaySubmission({
 	partyType,
 	paymentType,
 	company,
+	companyCurrency,
 	posProfile,
 	posOpeningShift,
 	postingDate,
+	currencyFilter,
 	exchangeRate,
+	requiresExchangeRate,
+	exchangeRateLoading,
+	exchangeRateError,
+	exchangeRateRequestKey,
 	invoiceTotalCurrency,
 	referenceNo,
 	referenceDate,
@@ -106,12 +124,235 @@ export function usePosPaySubmission({
 			if (!party) {
 				frappe.throw(__("Please select a party"));
 			}
+			const selectedInvoiceCurrencies = getSelectedInvoiceCurrencies(
+				selected_invoices.value,
+				posProfile.value?.currency,
+			);
+			if (selectedInvoiceCurrencies.length > 1) {
+				const message = __(
+					"Cannot submit payment for invoices in multiple currencies. Select invoices in a single currency.",
+				);
+				eventBus?.emit?.("show_message", {
+					title: message,
+					color: "error",
+				});
+				frappe.throw(message);
+			}
+			const normalizedSubmissionCurrency = String(
+				invoiceTotalCurrency.value || "",
+			).trim();
+			const normalizedCurrencyFilter = String(currencyFilter?.value || "").trim();
+			const activeCurrencyFilter =
+				normalizedCurrencyFilter && normalizedCurrencyFilter !== "ALL"
+					? normalizedCurrencyFilter
+					: "";
+			const hasCurrencyMismatch = selected_invoices.value.some((invoice: any) => {
+				const invoiceCurrency = resolveInvoiceCurrency(
+					invoice,
+					posProfile.value?.currency,
+				);
+				if (activeCurrencyFilter && invoiceCurrency !== activeCurrencyFilter) {
+					return true;
+				}
+				if (
+					normalizedSubmissionCurrency &&
+					invoiceCurrency &&
+					invoiceCurrency !== normalizedSubmissionCurrency
+				) {
+					return true;
+				}
+				if (!normalizedSubmissionCurrency && invoiceCurrency) {
+					return true;
+				}
+				return false;
+			});
+			if (hasCurrencyMismatch) {
+				const message = __(
+					"Selected invoice currency does not match the active payment currency filter.",
+				);
+				eventBus?.emit?.("show_message", {
+					title: message,
+					color: "error",
+				});
+				frappe.throw(message);
+			}
 			if (
-				payment_methods.value.some((row: any) => flt(row.amount) > 0 && row._rate_error) ||
-				selected_payments.value.some((row: any) => row._rate_error) ||
-				selected_mpesa_payments.value.some((row: any) => row._rate_error)
+				selected_invoices.value.some((invoice: any) =>
+					isInvoiceOutstandingConversionUnavailable(invoice),
+				)
 			) {
-				frappe.throw(__("Resolve all exchange rates before submitting the payment."));
+				const message = __(
+					"Cannot submit payment for an invoice whose currency conversion rate is unavailable.",
+				);
+				eventBus?.emit?.("show_message", {
+					title: message,
+					color: "error",
+				});
+				frappe.throw(message);
+			}
+
+			const resolvedPurpose =
+				resolvedPaymentType === "Pay" || resolvedPartyType === "Supplier"
+					? "for_buying"
+					: "for_selling";
+			const resolvedCompanyCurrency = String(
+				companyCurrency?.value || posProfile.value?.company_currency || "",
+			).trim();
+			const isMainFxRequired =
+				requiresExchangeRate !== undefined
+					? Boolean(requiresExchangeRate.value)
+					: Boolean(
+							normalizedSubmissionCurrency &&
+								resolvedCompanyCurrency &&
+								normalizedSubmissionCurrency !== resolvedCompanyCurrency,
+						);
+			const expectedMainFxKey =
+				resolvedPostingDate &&
+				normalizedSubmissionCurrency &&
+				resolvedCompanyCurrency
+					? `${normalizedSubmissionCurrency}|${resolvedCompanyCurrency}|${resolvedPurpose}|${resolvedPostingDate}`
+					: "";
+
+			if (
+				exchangeRateLoading?.value &&
+				(requiresExchangeRate === undefined || requiresExchangeRate.value)
+			) {
+				const message = __(
+					"Exchange rate lookup is still in progress. Please wait and try again.",
+				);
+				eventBus?.emit?.("show_message", {
+					title: message,
+					color: "error",
+				});
+				frappe.throw(message);
+			}
+			if (
+				(isMainFxRequired &&
+					(Boolean(exchangeRateError?.value) ||
+						!(flt(exchangeRate.value) > 0))) ||
+				(requiresExchangeRate === undefined && Boolean(exchangeRateError?.value))
+			) {
+				const message = __(
+					"Resolve all exchange rates before submitting the payment.",
+				);
+				eventBus?.emit?.("show_message", {
+					title: message,
+					color: "error",
+				});
+				frappe.throw(message);
+			}
+			if (
+				isMainFxRequired &&
+				exchangeRateRequestKey?.value &&
+				expectedMainFxKey &&
+				exchangeRateRequestKey.value !== expectedMainFxKey
+			) {
+				const message = __(
+					"Exchange rate is out of date for the selected posting date or currency. Please wait for the rate to refresh.",
+				);
+				eventBus?.emit?.("show_message", {
+					title: message,
+					color: "error",
+				});
+				frappe.throw(message);
+			}
+
+			const isRowFxPendingOrStale = (
+				row: any,
+				kind: "method" | "selected",
+			): { loading: boolean; error: boolean; stale: boolean } => {
+				const loading = Boolean(row?._rate_loading);
+				const error = Boolean(row?._rate_error);
+				if (loading || error) {
+					return { loading, error, stale: false };
+				}
+				if (row?._fx_request_key === null) {
+					return { loading: false, error: false, stale: true };
+				}
+				if (
+					typeof row?._fx_request_key === "string" &&
+					row._fx_request_key &&
+					resolvedPostingDate &&
+					normalizedSubmissionCurrency
+				) {
+					const expectedPrefix = `${resolvedPostingDate}|${resolvedPurpose}|${normalizedSubmissionCurrency}`;
+					if (kind === "method") {
+						const rowPaymentCurrency = String(
+							row?.payment_currency || "",
+						).trim();
+						if (rowPaymentCurrency && resolvedCompanyCurrency) {
+							const expectedFull = `${expectedPrefix}|${rowPaymentCurrency}|${resolvedCompanyCurrency}`;
+							if (row._fx_request_key !== expectedFull) {
+								return { loading: false, error: false, stale: true };
+							}
+						} else if (rowPaymentCurrency) {
+							if (
+								!row._fx_request_key.startsWith(
+									`${expectedPrefix}|${rowPaymentCurrency}|`,
+								)
+							) {
+								return { loading: false, error: false, stale: true };
+							}
+						} else if (!row._fx_request_key.startsWith(`${expectedPrefix}|`)) {
+							return { loading: false, error: false, stale: true };
+						}
+					} else {
+						const rowCurrency = String(
+							row?.currency || posProfile.value?.currency || "",
+						).trim();
+						if (rowCurrency) {
+							const expectedFull = `${expectedPrefix}|${rowCurrency}`;
+							if (row._fx_request_key !== expectedFull) {
+								return { loading: false, error: false, stale: true };
+							}
+						} else if (!row._fx_request_key.startsWith(`${expectedPrefix}|`)) {
+							return { loading: false, error: false, stale: true };
+						}
+					}
+				}
+				return { loading: false, error: false, stale: false };
+			};
+
+			const allRowFxStates = [
+				...payment_methods.value
+					.filter((row: any) => flt(row?.amount) > 0)
+					.map((row: any) => isRowFxPendingOrStale(row, "method")),
+				...selected_payments.value.map((row: any) =>
+					isRowFxPendingOrStale(row, "selected"),
+				),
+				...selected_mpesa_payments.value.map((row: any) =>
+					isRowFxPendingOrStale(row, "selected"),
+				),
+			];
+			if (allRowFxStates.some((state) => state.loading)) {
+				const message = __(
+					"Exchange rate lookup is still in progress. Please wait and try again.",
+				);
+				eventBus?.emit?.("show_message", {
+					title: message,
+					color: "error",
+				});
+				frappe.throw(message);
+			}
+			if (allRowFxStates.some((state) => state.stale)) {
+				const message = __(
+					"Exchange rate is out of date for the selected posting date or currency. Please wait for the rate to refresh.",
+				);
+				eventBus?.emit?.("show_message", {
+					title: message,
+					color: "error",
+				});
+				frappe.throw(message);
+			}
+			if (allRowFxStates.some((state) => state.error)) {
+				const message = __(
+					"Resolve all exchange rates before submitting the payment.",
+				);
+				eventBus?.emit?.("show_message", {
+					title: message,
+					color: "error",
+				});
+				frappe.throw(message);
 			}
 
 			const total_payments =
@@ -140,12 +381,14 @@ export function usePosPaySubmission({
 				(invoice: any) => ({ ...invoice }),
 			);
 
-			const totalSelectedInvoicesAmount =
-				selectedInvoicesForPayload.reduce(
-					(acc: number, invoice: any) =>
-						acc + flt(invoice?.outstanding_amount || 0),
-					0,
-				);
+			const totalSelectedInvoicesAmount = calculateEligibleSelectedInvoicesTotal(
+				selectedInvoicesForPayload,
+				{
+					currencyFilter: activeCurrencyFilter || "ALL",
+					fallbackCurrency: posProfile.value?.currency,
+					fltFn: flt,
+				},
+			);
 
 		const payload = {
 			customer: party,

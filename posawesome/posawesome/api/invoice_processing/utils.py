@@ -121,71 +121,163 @@ def get_latest_rate(
     purpose=None,
     allow_external=True,
     silent=False,
+    return_source=False,
 ):
     """Return the latest ERPNext-valid rate on or before ``transaction_date``.
 
     ``purpose`` may be ``for_buying`` or ``for_selling``. Optional POS lookups
     use ``silent=True`` so ERPNext's external-rate fallback cannot add repeated
-    desk messages when a rate is unavailable.
+    desk messages when a rate is unavailable. When ``return_source=True``,
+    returns ``(rate, rate_date, source)`` where ``source`` distinguishes
+    ``"same_currency"``, ``"currency_exchange"``, and ``"derived_inverse"``.
     """
     transaction_date = getdate(transaction_date or nowdate())
     if from_currency == to_currency:
-        result = 1.0, transaction_date
-        if cache is not None:
+        result = (1.0, transaction_date, "same_currency") if return_source else (1.0, transaction_date)
+        if cache is not None and not return_source:
             cache[(from_currency, to_currency, str(transaction_date), purpose)] = result
         return result
 
-    if cache is not None:
-        key = (from_currency, to_currency, str(transaction_date), purpose)
+    key = (from_currency, to_currency, str(transaction_date), purpose)
+    if cache is not None and not return_source:
         if key in cache:
             return cache[key]
 
-    filters = {
-        "from_currency": from_currency,
-        "to_currency": to_currency,
-        "date": ["<=", transaction_date],
-    }
+    # Mirror ERPNext erpnext/setup/utils.py:72-88: strict lower bound `date > cutoff`
+    # with inclusive upper bound `date <= transaction_date` when stale rates are disallowed.
+    filters = [
+        ["from_currency", "=", from_currency],
+        ["to_currency", "=", to_currency],
+        ["date", "<=", transaction_date],
+    ]
     if purpose in {"for_buying", "for_selling"}:
-        filters[purpose] = 1
+        filters.append([purpose, "=", 1])
 
     try:
         accounts_settings = frappe.get_cached_doc("Accounts Settings")
     except Exception:
         accounts_settings = None
+    checkpoint_date = None
     if accounts_settings and not cint(accounts_settings.get("allow_stale")):
         stale_days = cint(accounts_settings.get("stale_days"))
-        filters["date"] = ["between", [add_days(transaction_date, -stale_days), transaction_date]]
+        checkpoint_date = getdate(add_days(transaction_date, -stale_days))
+        filters.append(["date", ">", checkpoint_date])
+
+    # Mirror ERPNext erpnext/setup/utils.py:66-98 so same-day purpose-specific
+    # rates outrank dual-purpose entries and ties always break by `name desc`.
+    order_by = "date desc"
+    if purpose == "for_selling":
+        order_by += ", for_buying asc"
+    elif purpose == "for_buying":
+        order_by += ", for_selling asc"
+    order_by += ", name desc"
 
     rate_doc = frappe.get_all(
         "Currency Exchange",
         filters=filters,
         fields=["exchange_rate", "date"],
-        order_by="date desc, creation desc",
+        order_by=order_by,
         limit=1,
     )
-    if rate_doc:
-        result = flt(rate_doc[0].exchange_rate), rate_doc[0].date
-    elif allow_external:
-        message_log = getattr(frappe, "message_log", None)
-        message_count = len(message_log) if isinstance(message_log, list) else None
-        flags = getattr(frappe, "flags", None)
-        old_mute = getattr(flags, "mute_messages", False)
-        try:
-            if silent and flags is not None:
-                flags.mute_messages = True
-            rate = get_exchange_rate(from_currency, to_currency, transaction_date, purpose)
-        finally:
-            if flags is not None:
-                flags.mute_messages = old_mute
-            if silent and message_count is not None:
-                del message_log[message_count:]
-        result = (flt(rate), transaction_date) if flt(rate) > 0 else (None, None)
+    direct_row = rate_doc[0] if rate_doc else None
+    direct_rate = (
+        flt(
+            direct_row.get("exchange_rate")
+            if isinstance(direct_row, dict)
+            else getattr(direct_row, "exchange_rate", None)
+        )
+        if direct_row
+        else 0.0
+    )
+    rate_source = None
+    if direct_row and direct_rate > 0:
+        row_date = (
+            direct_row.get("date")
+            if isinstance(direct_row, dict)
+            else getattr(direct_row, "date", None)
+        )
+        result = direct_rate, row_date
+        rate_source = "currency_exchange"
     else:
-        result = None, None
+        # Mirror ERPNext erpnext/setup/utils.py:124-134: when no direct Currency Exchange
+        # record exists, check stored inverse rows with the opposite purpose so we preserve
+        # the actual stored `Currency Exchange.date` (essential for stale_days enforcement).
+        reverse_purpose = (
+            "for_buying"
+            if purpose == "for_selling"
+            else "for_selling"
+            if purpose == "for_buying"
+            else None
+        )
+        reverse_filters = [
+            ["from_currency", "=", to_currency],
+            ["to_currency", "=", from_currency],
+            ["date", "<=", transaction_date],
+        ]
+        if reverse_purpose:
+            reverse_filters.append([reverse_purpose, "=", 1])
+        if checkpoint_date is not None:
+            reverse_filters.append(["date", ">", checkpoint_date])
 
-    if cache is not None:
+        reverse_order_by = "date desc"
+        if reverse_purpose == "for_selling":
+            reverse_order_by += ", for_buying asc"
+        elif reverse_purpose == "for_buying":
+            reverse_order_by += ", for_selling asc"
+        reverse_order_by += ", name desc"
+
+        reverse_doc = frappe.get_all(
+            "Currency Exchange",
+            filters=reverse_filters,
+            fields=["exchange_rate", "date"],
+            order_by=reverse_order_by,
+            limit=1,
+        )
+        reverse_row = reverse_doc[0] if reverse_doc else None
+        reverse_rate = (
+            flt(
+                reverse_row.get("exchange_rate")
+                if isinstance(reverse_row, dict)
+                else getattr(reverse_row, "exchange_rate", None)
+            )
+            if reverse_row
+            else 0.0
+        )
+        if reverse_row and reverse_rate > 0:
+            reverse_date = (
+                reverse_row.get("date")
+                if isinstance(reverse_row, dict)
+                else getattr(reverse_row, "date", None)
+            )
+            result = flt(1.0 / reverse_rate), reverse_date
+            rate_source = "derived_inverse"
+        elif allow_external:
+            message_log = getattr(frappe, "message_log", None)
+            message_count = len(message_log) if isinstance(message_log, list) else None
+            flags = getattr(frappe, "flags", None)
+            old_mute = getattr(flags, "mute_messages", False)
+            try:
+                if silent and flags is not None:
+                    flags.mute_messages = True
+                rate = get_exchange_rate(from_currency, to_currency, transaction_date, purpose)
+            finally:
+                if flags is not None:
+                    flags.mute_messages = old_mute
+                if silent and message_count is not None:
+                    del message_log[message_count:]
+            if flt(rate) > 0:
+                result = flt(rate), transaction_date
+                rate_source = "currency_exchange"
+            else:
+                result = None, None
+        else:
+            result = None, None
+
+    if cache is not None and not return_source:
         cache[key] = result
 
+    if return_source:
+        return result[0], result[1], rate_source
     return result
 
 
@@ -200,7 +292,8 @@ def resolve_erpnext_currency_rates(
 
     invoice_currency = invoice_currency or company_currency
     price_list_currency = price_list_currency or company_currency
-    exchange_rate_date = posting_date or nowdate()
+    transaction_date = posting_date or nowdate()
+    exchange_rate_date = transaction_date
 
     conversion_rate = 1.0
     if invoice_currency != company_currency:
@@ -208,7 +301,8 @@ def resolve_erpnext_currency_rates(
             invoice_currency,
             company_currency,
             cache=cache,
-            transaction_date=exchange_rate_date,
+            transaction_date=transaction_date,
+            purpose="for_selling",
         )
 
     plc_conversion_rate = 1.0
@@ -217,7 +311,8 @@ def resolve_erpnext_currency_rates(
             price_list_currency,
             company_currency,
             cache=cache,
-            transaction_date=exchange_rate_date,
+            transaction_date=transaction_date,
+            purpose="for_selling",
         )
 
     return {

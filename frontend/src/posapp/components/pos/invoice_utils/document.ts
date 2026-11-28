@@ -144,6 +144,24 @@ function clearStalePartyFieldsForCustomerChange(
  * - context.formatDateForBackend (method)
  */
 
+function buildCurrencyContext(
+	context: any,
+	companyCurrency: string | null | undefined,
+) {
+	return {
+		company_currency: companyCurrency || context.company_currency || null,
+		company: context.company || context.company_doc,
+		pos_profile: context.pos_profile,
+		invoice_doc: context.invoice_doc,
+		currency: context.currency,
+		selected_currency: context.selected_currency,
+		price_list_currency: context.price_list_currency,
+		exchange_rate: context.exchange_rate,
+		conversion_rate: context.conversion_rate,
+		plc_conversion_rate: context.plc_conversion_rate,
+	};
+}
+
 export function get_invoice_doc(context: any) {
 	let doc: any = {};
 	const sourceDoc = context.invoice_doc || {};
@@ -472,15 +490,20 @@ export function get_invoice_doc(context: any) {
 
 	// Calculate base amounts using the exchange rate
 	const companyCurrency =
+		context.company_currency ||
 		(context.company && context.company.default_currency) ||
+		(context.company_doc && context.company_doc.default_currency) ||
+		context.pos_profile?.company_currency ||
+		context.invoice_doc?.company_currency ||
 		context.pos_profile?.currency ||
 		null;
+	const currencyContext = buildCurrencyContext(context, companyCurrency);
 	if (context.selected_currency !== companyCurrency) {
-		doc.base_total = toCompanyCurrency(context, total);
-		doc.base_net_total = toCompanyCurrency(context, total);
-		doc.base_discount_amount = toCompanyCurrency(context, discountAmount);
-		doc.base_grand_total = toCompanyCurrency(context, grandTotal);
-		doc.base_rounded_total = toCompanyCurrency(context, doc.rounded_total);
+		doc.base_total = toCompanyCurrency(currencyContext, total);
+		doc.base_net_total = toCompanyCurrency(currencyContext, total);
+		doc.base_discount_amount = toCompanyCurrency(currencyContext, discountAmount);
+		doc.base_grand_total = toCompanyCurrency(currencyContext, grandTotal);
+		doc.base_rounded_total = toCompanyCurrency(currencyContext, doc.rounded_total);
 	} else {
 		doc.base_total = total;
 		doc.base_net_total = total;
@@ -499,7 +522,7 @@ export function get_invoice_doc(context: any) {
 				);
 			} else if (context.selected_currency !== companyCurrency) {
 				// Convert payment amount to base currency
-				payment.base_amount = toCompanyCurrency(context, payment.amount);
+				payment.base_amount = toCompanyCurrency(currencyContext, payment.amount);
 			} else {
 				payment.base_amount = payment.amount;
 			}
@@ -600,7 +623,15 @@ export function get_invoice_items(context: any) {
 		}
 
 		// Handle currency conversion for rates and amounts
-		const companyCurrency = context.pos_profile.currency;
+		const companyCurrency =
+			context.company_currency ||
+			(context.company && context.company.default_currency) ||
+			(context.company_doc && context.company_doc.default_currency) ||
+			context.pos_profile?.company_currency ||
+			context.invoice_doc?.company_currency ||
+			item?.company_currency ||
+			context.pos_profile?.currency;
+		const itemCurrencyContext = buildCurrencyContext(context, companyCurrency);
 		if (context.selected_currency !== companyCurrency) {
 			// item.rate is in SC and base_rate should be in CC.
 			new_item.rate = flt(item.rate); // Keep rate in USD
@@ -608,23 +639,23 @@ export function get_invoice_items(context: any) {
 			// Use pre-stored base_rate if available, otherwise calculate
 			new_item.base_rate =
 				item.base_rate ||
-				toCompanyCurrency(context, item.rate);
+				toCompanyCurrency(itemCurrencyContext, item.rate);
 
 			new_item.price_list_rate = flt(item.price_list_rate); // Keep price list rate in USD
 			new_item.base_price_list_rate =
 				item.base_price_list_rate ??
-				toCompanyCurrency(context, item.price_list_rate);
+				toCompanyCurrency(itemCurrencyContext, item.price_list_rate);
 
 			// Calculate amounts
 			new_item.amount = flt(item.qty) * new_item.rate; // Amount in USD
 			new_item.base_amount =
-				toCompanyCurrency(context, new_item.amount);
+				toCompanyCurrency(itemCurrencyContext, new_item.amount);
 
 			// Handle discount amount
 			new_item.discount_amount = flt(item.discount_amount); // Keep discount in USD
 			new_item.base_discount_amount =
 				item.base_discount_amount ||
-				toCompanyCurrency(context, item.discount_amount);
+				toCompanyCurrency(itemCurrencyContext, item.discount_amount);
 		} else {
 			// Same currency (base currency), make sure we use base rates if available
 			new_item.rate = flt(item.rate);

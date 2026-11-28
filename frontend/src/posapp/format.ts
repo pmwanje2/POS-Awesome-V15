@@ -219,7 +219,9 @@ export function useFormat() {
 			uiStore.posProfile?.posa_decimal_precision as any,
 		);
 		return isNaN(prec)
-			? frappe.defaults.get_default("float_precision") || 2
+			? (typeof frappe !== "undefined"
+					? frappe?.defaults?.get_default?.("float_precision")
+					: null) || 2
 			: prec;
 	});
 
@@ -228,7 +230,9 @@ export function useFormat() {
 			uiStore.posProfile?.posa_decimal_precision as any,
 		);
 		return isNaN(prec)
-			? frappe.defaults.get_default("currency_precision") || 2
+			? (typeof frappe !== "undefined"
+					? frappe?.defaults?.get_default?.("currency_precision")
+					: null) || 2
 			: prec;
 	});
 

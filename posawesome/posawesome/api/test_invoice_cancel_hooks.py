@@ -19,6 +19,7 @@ def _install_invoice_api_stubs():
     frappe_mapper_module = types.ModuleType("frappe.model.mapper")
     utilities_module = types.ModuleType("posawesome.posawesome.api.utilities")
     payments_module = types.ModuleType("posawesome.posawesome.api.payments")
+    payment_currency_module = types.ModuleType("posawesome.posawesome.api.payment_currency")
     delivery_charges_module = types.ModuleType(
         "posawesome.posawesome.doctype.delivery_charges.delivery_charges"
     )
@@ -52,13 +53,17 @@ def _install_invoice_api_stubs():
     )
 
     frappe_utils_module.add_days = lambda date, days: date
+    frappe_utils_module.cint = lambda value: int(value or 0)
+    frappe_utils_module.cstr = lambda value: str(value or "")
     frappe_utils_module.flt = lambda value, precision=None: float(value or 0)
+    frappe_utils_module.nowdate = lambda: "2026-11-28"
     frappe_utils_module.get_url_to_form = lambda doctype, name: f"/app/{doctype}/{name}"
     frappe_module.utils = frappe_utils_module
 
     frappe_mapper_module.get_mapped_doc = lambda *args, **kwargs: None
     utilities_module.get_company_domain = lambda company: None
     payments_module.get_posawesome_credit_redeem_remark = lambda invoice_name: f"redeem {invoice_name}"
+    payment_currency_module.preserve_multi_currency_payment_amounts = lambda *args, **kwargs: None
     delivery_charges_module.get_applicable_delivery_charges = lambda *args, **kwargs: []
     pos_coupon_module.update_coupon_code_count = lambda *args, **kwargs: None
 
@@ -68,6 +73,7 @@ def _install_invoice_api_stubs():
     sys.modules["frappe.model.mapper"] = frappe_mapper_module
     sys.modules["posawesome.posawesome.api.utilities"] = utilities_module
     sys.modules["posawesome.posawesome.api.payments"] = payments_module
+    sys.modules["posawesome.posawesome.api.payment_currency"] = payment_currency_module
     sys.modules[
         "posawesome.posawesome.doctype.delivery_charges.delivery_charges"
     ] = delivery_charges_module
@@ -154,6 +160,27 @@ class TestInvoiceCancelHooks(unittest.TestCase):
         self.assertIn(
             "delete_invoice_submission_ledger_entries_for_invoice(doctype, invoice)",
             source,
+        )
+
+    def test_validate_hook_applies_tax_inclusive_before_sale_controls(self):
+        _install_invoice_api_stubs()
+        invoice_api = _load_invoice_api_module()
+        call_order = []
+
+        invoice_api.validate_shift = lambda doc: call_order.append("validate_shift")
+        invoice_api.set_patient = lambda doc: call_order.append("set_patient")
+        invoice_api.auto_set_delivery_charges = lambda doc: call_order.append("auto_set_delivery_charges")
+        invoice_api.calc_delivery_charges = lambda doc: call_order.append("calc_delivery_charges")
+        invoice_api.apply_tax_inclusive = lambda doc: call_order.append("apply_tax_inclusive")
+        invoice_api.validate_pos_invoice_item_sale_controls = lambda doc: call_order.append(
+            "validate_pos_invoice_item_sale_controls"
+        )
+
+        invoice_api.validate(SimpleNamespace(doctype="Sales Invoice", name="SINV-TAX-0001"), None)
+
+        self.assertLess(
+            call_order.index("apply_tax_inclusive"),
+            call_order.index("validate_pos_invoice_item_sale_controls"),
         )
 
 

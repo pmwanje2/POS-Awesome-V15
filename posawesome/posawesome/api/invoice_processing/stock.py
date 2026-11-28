@@ -268,22 +268,95 @@ def _apply_item_name_overrides(invoice_doc, overrides=None):
             item.name_overridden = 0
 
 
-def _merge_duplicate_taxes(invoice_doc):
-    """Remove duplicate tax rows with same account and rate.
+def _tax_row_field(tax, fieldname, default=None):
+    if hasattr(tax, "get"):
+        return tax.get(fieldname, default)
+    return getattr(tax, fieldname, default)
 
-    If duplicates are found, keep the first occurrence and recalculate totals.
+
+def _set_tax_row_field(tax, fieldname, value):
+    if isinstance(tax, dict):
+        tax[fieldname] = value
+    elif hasattr(tax, "set") and callable(tax.set):
+        tax.set(fieldname, value)
+    else:
+        setattr(tax, fieldname, value)
+
+
+def _merge_duplicate_taxes(invoice_doc, recalculate=True):
+    """Remove identical duplicate tax rows while preserving distinct chained rows.
+
+    Preserves distinct ``row_id``, ``included_in_print_rate``, ``Actual`` tax
+    amounts, ``cost_center``, ``add_deduct_tax``, and ``category`` entries so
+    chained taxes referencing different rows are never collapsed, and remaps
+    downstream ``row_id`` references when earlier duplicates are dropped.
     """
-    seen = set()
+    taxes = invoice_doc.get("taxes", [])
+    seen_key_to_new_idx = {}
+    amount_idx_map = {}
+    total_idx_map = {}
     unique = []
-    for tax in invoice_doc.get("taxes", []):
-        key = (tax.account_head, flt(tax.rate), cstr(tax.charge_type))
-        if key in seen:
+    for pos, tax in enumerate(taxes):
+        orig_pos = pos + 1
+        orig_explicit_idx = cint(_tax_row_field(tax, "idx"))
+        account_head = cstr(_tax_row_field(tax, "account_head")).strip()
+        tax_rate = flt(_tax_row_field(tax, "rate"))
+        charge_type = cstr(_tax_row_field(tax, "charge_type")).strip()
+        raw_row_id = cstr(_tax_row_field(tax, "row_id")).strip()
+        effective_row_id = raw_row_id
+        if charge_type == "On Previous Row Amount" and raw_row_id:
+            ref_idx = cint(raw_row_id)
+            if ref_idx > 0 and ref_idx in amount_idx_map:
+                effective_row_id = str(amount_idx_map[ref_idx])
+        elif charge_type == "On Previous Row Total" and raw_row_id:
+            ref_idx = cint(raw_row_id)
+            if ref_idx > 0 and ref_idx in total_idx_map:
+                effective_row_id = str(total_idx_map[ref_idx])
+        included_in_print_rate = cint(_tax_row_field(tax, "included_in_print_rate"))
+        actual_amount = flt(_tax_row_field(tax, "tax_amount")) if charge_type == "Actual" else 0.0
+        cost_center = cstr(_tax_row_field(tax, "cost_center")).strip()
+        add_deduct_tax = cstr(_tax_row_field(tax, "add_deduct_tax") or "Add").strip()
+        category = cstr(_tax_row_field(tax, "category") or "Total").strip()
+        key = (
+            account_head,
+            tax_rate,
+            charge_type,
+            effective_row_id,
+            included_in_print_rate,
+            actual_amount,
+            cost_center,
+            add_deduct_tax,
+            category,
+        )
+        if key in seen_key_to_new_idx:
+            surviving_idx = seen_key_to_new_idx[key]
+            # For On Previous Row Amount, reference the surviving duplicate row.
+            # For On Previous Row Total, reference the last surviving row prior to
+            # this position so the cumulative running total (taxes_and_totals.py:765)
+            # preserves all unique rows accumulated before the dropped duplicate.
+            last_prior_surviving_idx = len(unique)
+            amount_idx_map[orig_pos] = surviving_idx
+            total_idx_map[orig_pos] = last_prior_surviving_idx
+            if orig_explicit_idx > 0:
+                amount_idx_map[orig_explicit_idx] = surviving_idx
+                total_idx_map[orig_explicit_idx] = last_prior_surviving_idx
             continue
-        seen.add(key)
+        new_idx = len(unique) + 1
+        seen_key_to_new_idx[key] = new_idx
+        amount_idx_map[orig_pos] = new_idx
+        total_idx_map[orig_pos] = new_idx
+        if orig_explicit_idx > 0:
+            amount_idx_map[orig_explicit_idx] = new_idx
+            total_idx_map[orig_explicit_idx] = new_idx
+        if effective_row_id != raw_row_id:
+            _set_tax_row_field(tax, "row_id", effective_row_id)
         unique.append(tax)
-    if len(unique) != len(invoice_doc.get("taxes", [])):
+    if len(unique) != len(taxes):
+        for new_idx, tax in enumerate(unique, start=1):
+            _set_tax_row_field(tax, "idx", new_idx)
         invoice_doc.set("taxes", unique)
-        invoice_doc.calculate_taxes_and_totals()
+        if recalculate:
+            invoice_doc.calculate_taxes_and_totals()
 
 
 def _deduplicate_free_items(invoice_doc):
@@ -353,9 +426,12 @@ def _deduplicate_free_items(invoice_doc):
 
 
 def _strip_client_freebies_from_payload(payload):
-    """Remove auto-applied POS freebies from inbound payloads before saving."""
+    """Remove auto-applied POS freebies and unverified client free/rule flags from inbound payloads."""
 
     if not payload or not isinstance(payload, dict):
+        return
+
+    if cint(payload.get("is_return")):
         return
 
     items = payload.get("items")
@@ -381,6 +457,15 @@ def _strip_client_freebies_from_payload(payload):
         if auto_marker or (is_free and pricing_rule_marker):
             modified = True
             continue
+
+        if is_free:
+            row["is_free_item"] = 0
+            modified = True
+
+        for marker_field in ("pricing_rules", "pricing_rule", "source_rule"):
+            if row.get(marker_field):
+                row[marker_field] = None
+                modified = True
 
         cleaned.append(row)
 

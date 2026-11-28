@@ -1020,15 +1020,37 @@ export default {
 		},
 
 		sync_exchange_rate() {
-			if (!this.exchange_rate || this.exchange_rate <= 0) {
-				this.exchange_rate = 1;
+			const companyCurrency =
+				(this.company && this.company.default_currency) ||
+				this.pos_profile?.company_currency ||
+				this.pos_profile?.currency ||
+				"";
+			const selectedCurrency =
+				this.selected_currency || this.pos_profile?.currency || "";
+			const priceListCurrency =
+				this.price_list_currency || companyCurrency;
+
+			const rawExchange = Number(this.exchange_rate);
+			if (!Number.isFinite(rawExchange) || rawExchange <= 0) {
+				this.exchange_rate =
+					priceListCurrency &&
+					selectedCurrency &&
+					priceListCurrency !== selectedCurrency
+						? 0
+						: 1;
 			}
-			if (!this.conversion_rate || this.conversion_rate <= 0) {
-				this.conversion_rate = 1;
+			const rawConversion = Number(this.conversion_rate);
+			if (!Number.isFinite(rawConversion) || rawConversion <= 0) {
+				this.conversion_rate =
+					companyCurrency &&
+					selectedCurrency &&
+					selectedCurrency !== companyCurrency
+						? 0
+						: 1;
 			}
 
 			this.eventBus.emit("update_currency", {
-				currency: this.selected_currency || this.pos_profile.currency,
+				currency: selectedCurrency,
 				exchange_rate: this.exchange_rate,
 				conversion_rate: this.conversion_rate,
 			});

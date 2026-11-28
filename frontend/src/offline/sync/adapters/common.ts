@@ -28,6 +28,14 @@ export type SyncResponse<T = any> = {
 	has_more?: boolean;
 	next_offset?: number | null;
 	scope?: Record<string, any> | null;
+	currency_settings?: {
+		allow_stale?: number | boolean | null;
+		stale_days?: number | null;
+	} | null;
+	synced_pairs?: Array<{
+		from_currency: string;
+		to_currency: string;
+	}> | null;
 	schema_version?: string | null;
 	full_resync_required?: boolean;
 };
@@ -39,6 +47,7 @@ type PersistSyncStateArgs = {
 	response: SyncResponse;
 	watermark?: string | null;
 	error?: string | null;
+	syncedCurrencyPairs?: string[] | null;
 };
 
 type RefreshSnapshotArgs = {
@@ -51,6 +60,8 @@ export type ResourceSyncResult = {
 	status: SyncLifecycleState;
 	watermark: string | null;
 	schemaVersion: string | null;
+	scopeSignature?: string | null;
+	syncedCurrencyPairs?: string[] | null;
 	response: SyncResponse;
 };
 
@@ -79,6 +90,7 @@ export async function persistResourceSyncState({
 	response,
 	watermark,
 	error = null,
+	syncedCurrencyPairs,
 }: PersistSyncStateArgs) {
 	await setSyncResourceState({
 		resourceId,
@@ -90,6 +102,7 @@ export async function persistResourceSyncState({
 		consecutiveFailures: status === "error" ? 1 : 0,
 		scopeSignature: buildScopeSignature(posProfile),
 		schemaVersion: response?.schema_version || null,
+		...(syncedCurrencyPairs !== undefined ? { syncedCurrencyPairs } : {}),
 	});
 }
 
@@ -122,12 +135,22 @@ export function buildResourceSyncResult(
 	status: SyncLifecycleState,
 	response: SyncResponse,
 	watermark?: string | null,
+	extra?: {
+		scopeSignature?: string | null;
+		syncedCurrencyPairs?: string[] | null;
+	},
 ): ResourceSyncResult {
 	return {
 		resourceId,
 		status,
 		watermark: resolveWatermark(response, watermark),
 		schemaVersion: response?.schema_version || null,
+		...(extra?.scopeSignature !== undefined
+			? { scopeSignature: extra.scopeSignature }
+			: {}),
+		...(extra?.syncedCurrencyPairs !== undefined
+			? { syncedCurrencyPairs: extra.syncedCurrencyPairs }
+			: {}),
 		response,
 	};
 }

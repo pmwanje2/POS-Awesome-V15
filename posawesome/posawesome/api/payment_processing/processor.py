@@ -992,14 +992,20 @@ def process_pos_payment(payload):
                     or currency
                 )
 
+                rate_purpose = "for_buying" if payment_type == "Pay" else "for_selling"
+
                 # Convert bank amount to party currency ONCE
                 if bank_currency == party_account_currency:
                     remaining_party = flt(bank_amount, precision)
                 elif bank_currency == company_currency:
-                    comp_to_party = flt(get_exchange_rate(company_currency, party_account_currency, posting_date))
+                    comp_to_party = flt(
+                        get_exchange_rate(company_currency, party_account_currency, posting_date, rate_purpose)
+                    )
                     remaining_party = flt(bank_amount * comp_to_party, precision)
                 else:
-                    bank_to_party = flt(get_exchange_rate(bank_currency, party_account_currency, posting_date))
+                    bank_to_party = flt(
+                        get_exchange_rate(bank_currency, party_account_currency, posting_date, rate_purpose)
+                    )
                     remaining_party = flt(bank_amount * bank_to_party, precision)
 
                 total_allocated = 0
@@ -1037,13 +1043,15 @@ def process_pos_payment(payload):
                         exchange_rate = 1
                     else:
                         # Party account in third currency (different from both invoice and company)
-                        inv_to_party = flt(get_exchange_rate(inv_currency, party_account_currency, posting_date))
+                        inv_to_party = flt(
+                            get_exchange_rate(inv_currency, party_account_currency, posting_date, rate_purpose)
+                        )
                         total_amount = flt((inv_doc.rounded_total or inv_doc.grand_total) * inv_to_party, precision)
                         outstanding_amount = flt(inv_doc.outstanding_amount * inv_to_party, precision)
-                        exchange_rate = flt(get_exchange_rate(party_account_currency, company_currency, posting_date))
+                        exchange_rate = flt(
+                            get_exchange_rate(party_account_currency, company_currency, posting_date, rate_purpose)
+                        )
                     inv_outstanding_party = outstanding_amount
-
-                    inv_total_party = total_amount
 
                     if inv_outstanding_party <= 0:
                         continue

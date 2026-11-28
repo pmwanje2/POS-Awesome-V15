@@ -1,6 +1,7 @@
 import { ref } from "vue";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+import { useItemCurrency } from "../src/posapp/composables/pos/items/useItemCurrency";
 import { usePaymentSubmission } from "../src/posapp/composables/pos/payments/usePaymentSubmission";
 import { ApiEnvelopeError } from "../src/posapp/services/api";
 
@@ -283,6 +284,1528 @@ describe("usePaymentSubmission", () => {
 
 		await expect(validateSubmission(true)).resolves.toBe(true);
 		expect(requestBelowCostOverride).not.toHaveBeenCalled();
+	});
+
+	it("routes unresolved cross-currency FX through missing-cost policy without 1:1 floor comparison", async () => {
+		const buildInvoice = () =>
+			ref<any>({
+				is_return: 0,
+				currency: "USD",
+				items: [
+					{
+						item_code: "FX-MISSING",
+						item_name: "Missing FX Item",
+						qty: 1,
+						rate: 15,
+						currency: "USD",
+						company_currency: "UGX",
+						conversion_rate: 0,
+						buying_price_currency: "UGX",
+						trade_price: 37000,
+						_buying_prices_by_uom: {
+							Nos: {
+								price_list_rate: 37000,
+								base_price_list_rate: 37000,
+								currency: "UGX",
+							},
+						},
+					},
+				],
+				payments: [{ mode_of_payment: "Cash", amount: 15, type: "Cash" }],
+				rounded_total: 15,
+				grand_total: 15,
+			});
+
+		const blockSubmit = usePaymentSubmission({
+			invoiceDoc: buildInvoice(),
+			posProfile: ref({ posa_missing_cost_action: "Block" }),
+			stockSettings: ref({}),
+			invoiceType: ref("Invoice"),
+			formatFloat: (value) => Number(value || 0),
+			stores: { toastStore: { show: vi.fn() } },
+			diff_payment: ref(0) as any,
+			isCashback: ref(true),
+		});
+		await expect(blockSubmit.validateSubmission(true)).rejects.toThrow(
+			/no valid buying floor is available for Missing FX Item/i,
+		);
+
+		const allowSubmit = usePaymentSubmission({
+			invoiceDoc: buildInvoice(),
+			posProfile: ref({ posa_missing_cost_action: "Allow" }),
+			stockSettings: ref({}),
+			invoiceType: ref("Invoice"),
+			formatFloat: (value) => Number(value || 0),
+			stores: { toastStore: { show: vi.fn() } },
+			diff_payment: ref(0) as any,
+			isCashback: ref(true),
+		});
+		await expect(allowSubmit.validateSubmission(true)).resolves.toBe(true);
+	});
+
+	it("matches ERPNext Grand Total discount distribution during checkout validation", async () => {
+		const buildTaxedInvoice = (floor: number, includeNativeNet: boolean) =>
+			ref<any>({
+				is_return: 0,
+				apply_discount_on: "Grand Total",
+				discount_amount: 11,
+				total_taxes_and_charges: 9,
+				grand_total: 99,
+				rounded_total: 99,
+				taxes: [
+					{
+						charge_type: "On Net Total",
+						account_head: "VAT 10% - CO",
+						rate: 10,
+						included_in_print_rate: 0,
+						tax_amount: 9,
+					},
+				],
+				items: [
+					{
+						item_code: "TAXED-100",
+						item_name: "Taxed Item",
+						qty: 1,
+						rate: 100,
+						...(includeNativeNet ? { net_rate: 90 } : {}),
+						trade_price: floor,
+					},
+				],
+				payments: [{ mode_of_payment: "Cash", amount: 99, type: "Cash" }],
+			});
+
+		for (const includeNativeNet of [true, false]) {
+			const acceptSubmit = usePaymentSubmission({
+				invoiceDoc: buildTaxedInvoice(89.5, includeNativeNet),
+				posProfile: ref({}),
+				stockSettings: ref({}),
+				invoiceType: ref("Invoice"),
+				formatFloat: (value) => Number(value || 0),
+				stores: { toastStore: { show: vi.fn() } },
+				diff_payment: ref(0) as any,
+				isCashback: ref(true),
+			});
+			await expect(acceptSubmit.validateSubmission(true)).resolves.toBe(true);
+
+			const blockSubmit = usePaymentSubmission({
+				invoiceDoc: buildTaxedInvoice(90.5, includeNativeNet),
+				posProfile: ref({}),
+				stockSettings: ref({}),
+				invoiceType: ref("Invoice"),
+				formatFloat: (value) => Number(value || 0),
+				stores: { toastStore: { show: vi.fn() } },
+				diff_payment: ref(0) as any,
+				isCashback: ref(true),
+			});
+			await expect(blockSubmit.validateSubmission(true)).rejects.toThrow(
+				/Taxed Item is selling at 90, below Trade Price 90\.5/i,
+			);
+		}
+	});
+
+	it("blocks checkout when company-currency valuation is unconvertible even if lower invoice-currency trade_price exists", async () => {
+		const invoiceDoc = ref<any>({
+			is_return: 0,
+			currency: "USD",
+			items: [
+				{
+					item_code: "HIDDEN-VAL",
+					item_name: "Hidden Valuation Item",
+					qty: 1,
+					rate: 15,
+					currency: "USD",
+					company_currency: "UGX",
+					conversion_rate: 0,
+					buying_rate_currency: "USD",
+					trade_price: 9,
+					valuation_rate: 74000,
+				},
+			],
+			payments: [{ mode_of_payment: "Cash", amount: 15, type: "Cash" }],
+			rounded_total: 15,
+			grand_total: 15,
+		});
+
+		const blockSubmit = usePaymentSubmission({
+			invoiceDoc,
+			posProfile: ref({ posa_missing_cost_action: "Block" }),
+			stockSettings: ref({}),
+			invoiceType: ref("Invoice"),
+			formatFloat: (value) => Number(value || 0),
+			stores: { toastStore: { show: vi.fn() } },
+			diff_payment: ref(0) as any,
+			isCashback: ref(true),
+		});
+		await expect(blockSubmit.validateSubmission(true)).rejects.toThrow(
+			/no valid buying floor is available for Hidden Valuation Item/i,
+		);
+	});
+
+	it("blocks below-cost VND sale at 0.00004 USD/VND under both Block and Allow missing-cost policies", async () => {
+		const buildVndInvoice = () =>
+			ref<any>({
+				is_return: 0,
+				currency: "VND",
+				items: [
+					{
+						item_code: "VND-SMALL-FX",
+						item_name: "VND Item",
+						qty: 1,
+						rate: 20000,
+						currency: "VND",
+						company_currency: "USD",
+						conversion_rate: 0.00004,
+						valuation_rate: 1,
+					},
+				],
+				payments: [{ mode_of_payment: "Cash", amount: 20000, type: "Cash" }],
+				rounded_total: 20000,
+				grand_total: 20000,
+			});
+
+		for (const missingCostAction of ["Block", "Allow"] as const) {
+			const submission = usePaymentSubmission({
+				invoiceDoc: buildVndInvoice(),
+				posProfile: ref({ posa_missing_cost_action: missingCostAction }),
+				stockSettings: ref({}),
+				invoiceType: ref("Invoice"),
+				formatFloat: (value) => Number(value || 0),
+				stores: { toastStore: { show: vi.fn() } },
+				diff_payment: ref(0) as any,
+				isCashback: ref(true),
+			});
+			await expect(submission.validateSubmission(true)).rejects.toThrow(
+				/VND Item is selling at 20000, below Warehouse Valuation 25000/i,
+			);
+		}
+	});
+
+	it("accepts middle line with native net_rate == gross rate when 3x 1.00 lines share 0.02 discount", async () => {
+		const invoiceDoc = ref<any>({
+			is_return: 0,
+			currency: "USD",
+			apply_discount_on: "Net Total",
+			discount_amount: 0.02,
+			items: [
+				{
+					item_code: "ITEM-1",
+					item_name: "Line 1",
+					qty: 1,
+					rate: 1.0,
+					net_rate: 0.99,
+					net_amount: 0.99,
+					trade_price: 0.99,
+				},
+				{
+					item_code: "ITEM-2",
+					item_name: "Line 2",
+					qty: 1,
+					rate: 1.0,
+					net_rate: 1.0,
+					net_amount: 1.0,
+					trade_price: 1.0,
+				},
+				{
+					item_code: "ITEM-3",
+					item_name: "Line 3",
+					qty: 1,
+					rate: 1.0,
+					net_rate: 0.99,
+					net_amount: 0.99,
+					trade_price: 0.99,
+				},
+			],
+			payments: [{ mode_of_payment: "Cash", amount: 2.98, type: "Cash" }],
+			rounded_total: 2.98,
+			grand_total: 2.98,
+		});
+
+		const submission = usePaymentSubmission({
+			invoiceDoc,
+			posProfile: ref({ posa_below_cost_action: "Block" }),
+			stockSettings: ref({}),
+			invoiceType: ref("Invoice"),
+			formatFloat: (value) => Number(value || 0),
+			stores: { toastStore: { show: vi.fn() } },
+			diff_payment: ref(0) as any,
+			isCashback: ref(true),
+		});
+
+		await expect(submission.validateSubmission(true)).resolves.toBe(true);
+	});
+
+	it("blocks below-cost Grand Total discount on On Item Quantity tax without net_rate", async () => {
+		const invoiceDoc = ref<any>({
+			is_return: 0,
+			currency: "USD",
+			apply_discount_on: "Grand Total",
+			discount_amount: 12,
+			grand_total: 108,
+			total_taxes_and_charges: 20,
+			taxes: [
+				{
+					charge_type: "On Item Quantity",
+					account_head: "Levy - CO",
+					rate: 20,
+					included_in_print_rate: 0,
+				},
+			],
+			items: [
+				{
+					item_code: "QTY-TAX-ITEM",
+					item_name: "Qty Tax Item",
+					qty: 1,
+					rate: 100,
+					trade_price: 89,
+				},
+			],
+			payments: [{ mode_of_payment: "Cash", amount: 108, type: "Cash" }],
+			rounded_total: 108,
+		});
+
+		const submission = usePaymentSubmission({
+			invoiceDoc,
+			posProfile: ref({ posa_below_cost_action: "Block" }),
+			stockSettings: ref({}),
+			invoiceType: ref("Invoice"),
+			formatFloat: (value) => Number(value || 0),
+			stores: { toastStore: { show: vi.fn() } },
+			diff_payment: ref(0) as any,
+			isCashback: ref(true),
+		});
+
+		await expect(submission.validateSubmission(true)).rejects.toThrow(
+			/Qty Tax Item is selling at 88, below Trade Price 89/i,
+		);
+	});
+
+	it("blocks checkout under Block missing-cost policy when foreign buying price lacks FX even if lower valuation_rate exists", async () => {
+		const invoiceDoc = ref<any>({
+			is_return: 0,
+			currency: "USD",
+			items: [
+				{
+					item_code: "EUR-BUY-NO-FX",
+					item_name: "EUR Cost Item",
+					qty: 1,
+					rate: 8,
+					currency: "USD",
+					company_currency: "USD",
+					conversion_rate: 1,
+					buying_price_currency: "EUR",
+					buying_rate_currency: "EUR",
+					trade_price: 10,
+					buying_rate: 10,
+					valuation_rate: 5,
+				},
+			],
+			payments: [{ mode_of_payment: "Cash", amount: 8, type: "Cash" }],
+			rounded_total: 8,
+			grand_total: 8,
+		});
+
+		const submission = usePaymentSubmission({
+			invoiceDoc,
+			posProfile: ref({ posa_missing_cost_action: "Block" }),
+			stockSettings: ref({}),
+			invoiceType: ref("Invoice"),
+			formatFloat: (value) => Number(value || 0),
+			stores: { toastStore: { show: vi.fn() } },
+			diff_payment: ref(0) as any,
+			isCashback: ref(true),
+		});
+
+		await expect(submission.validateSubmission(true)).rejects.toThrow(
+			/no valid buying floor is available for EUR Cost Item/i,
+		);
+	});
+
+	it("allows checkout when item_tax_rate N/A exempts item from 20% inclusive VAT template", async () => {
+		const invoiceDoc = ref<any>({
+			is_return: 0,
+			currency: "USD",
+			taxes: [
+				{
+					charge_type: "On Net Total",
+					account_head: "VAT",
+					rate: 20,
+					included_in_print_rate: 1,
+				},
+			],
+			items: [
+				{
+					item_code: "NA-TAX-ITEM",
+					item_name: "NA Tax Item",
+					qty: 1,
+					rate: 100,
+					trade_price: 95,
+					item_tax_rate: JSON.stringify({ VAT: "N/A" }),
+				},
+			],
+			payments: [{ mode_of_payment: "Cash", amount: 100, type: "Cash" }],
+			rounded_total: 100,
+			grand_total: 100,
+		});
+
+		const submission = usePaymentSubmission({
+			invoiceDoc,
+			posProfile: ref({ posa_below_cost_action: "Block" }),
+			stockSettings: ref({}),
+			invoiceType: ref("Invoice"),
+			formatFloat: (value) => Number(value || 0),
+			stores: { toastStore: { show: vi.fn() } },
+			diff_payment: ref(0) as any,
+			isCashback: ref(true),
+		});
+
+		await expect(submission.validateSubmission(true)).resolves.toBe(true);
+	});
+
+	it("blocks checkout under Block policy on merge_item_row output with unresolved foreign _buying_prices_by_uom despite lower USD valuation", async () => {
+		const invoiceDoc = ref<any>({
+			is_return: 0,
+			currency: "USD",
+			items: [
+				{
+					item_code: "EUR-MERGE-ROW",
+					item_name: "EUR Cost Merged Item",
+					qty: 1,
+					rate: 8,
+					price_list_rate: 8,
+					currency: "USD",
+					price_list_currency: "USD",
+					conversion_rate: 1,
+					plc_conversion_rate: 1,
+					uom: "Nos",
+					stock_uom: "Nos",
+					conversion_factor: 1,
+					base_buying_rate: null,
+					trade_price: null,
+					buying_rate: null,
+					buying_rate_currency: null,
+					buying_price_currency: "EUR",
+					buying_exchange_rate: null,
+					valuation_rate: 5,
+					_buying_prices_by_uom: {
+						Nos: {
+							price_list_rate: 10,
+							base_price_list_rate: null,
+							currency: "EUR",
+							price_list: "Standard Buying",
+						},
+					},
+				},
+			],
+			payments: [{ mode_of_payment: "Cash", amount: 8, type: "Cash" }],
+			rounded_total: 8,
+			grand_total: 8,
+		});
+
+		const submission = usePaymentSubmission({
+			invoiceDoc,
+			posProfile: ref({ posa_missing_cost_action: "Block" }),
+			stockSettings: ref({}),
+			invoiceType: ref("Invoice"),
+			formatFloat: (value) => Number(value || 0),
+			stores: { toastStore: { show: vi.fn() } },
+			diff_payment: ref(0) as any,
+			isCashback: ref(true),
+		});
+
+		await expect(submission.validateSubmission(true)).rejects.toThrow(
+			/no valid buying floor is available for EUR Cost Merged Item/i,
+		);
+	});
+
+	it("does not overturn reconciled invoiceDoc.items when invoiceStore cart rows lack calculated net fields", async () => {
+		const invoiceDoc = ref<any>({
+			is_return: 0,
+			currency: "USD",
+			apply_discount_on: "Net Total",
+			discount_amount: 0.02,
+			items: [
+				{
+					item_code: "ITEM-1",
+					item_name: "Line 1",
+					qty: 1,
+					rate: 1.0,
+					net_rate: 0.99,
+					net_amount: 0.99,
+					trade_price: 0.99,
+				},
+				{
+					item_code: "ITEM-2",
+					item_name: "Line 2",
+					qty: 1,
+					rate: 1.0,
+					net_rate: 1.0,
+					net_amount: 1.0,
+					trade_price: 1.0,
+				},
+				{
+					item_code: "ITEM-3",
+					item_name: "Line 3",
+					qty: 1,
+					rate: 1.0,
+					net_rate: 0.99,
+					net_amount: 0.99,
+					trade_price: 0.99,
+				},
+			],
+			payments: [{ mode_of_payment: "Cash", amount: 2.98, type: "Cash" }],
+			rounded_total: 2.98,
+			grand_total: 2.98,
+		});
+
+		const cartItems = ref([
+			{
+				item_code: "ITEM-1",
+				item_name: "Line 1",
+				qty: 1,
+				rate: 1.0,
+				trade_price: 0.99,
+			},
+			{
+				item_code: "ITEM-2",
+				item_name: "Line 2",
+				qty: 1,
+				rate: 1.0,
+				trade_price: 1.0,
+			},
+			{
+				item_code: "ITEM-3",
+				item_name: "Line 3",
+				qty: 1,
+				rate: 1.0,
+				trade_price: 0.99,
+			},
+		]);
+
+		const submission = usePaymentSubmission({
+			invoiceDoc,
+			posProfile: ref({ posa_below_cost_action: "Block" }),
+			stockSettings: ref({}),
+			invoiceType: ref("Invoice"),
+			formatFloat: (value) => Number(value || 0),
+			stores: {
+				toastStore: { show: vi.fn() },
+				invoiceStore: {
+					invoiceDoc: invoiceDoc.value,
+					items: cartItems,
+				},
+			},
+			diff_payment: ref(0) as any,
+			isCashback: ref(true),
+		});
+
+		await expect(submission.validateSubmission(true)).resolves.toBe(true);
+	});
+
+	it("accepts reconciled 3-unit line at 1.00 with 0.01 discount and native net_rate 1.00", async () => {
+		const invoiceDoc = ref<any>({
+			is_return: 0,
+			currency: "USD",
+			apply_discount_on: "Net Total",
+			discount_amount: 0.01,
+			items: [
+				{
+					item_code: "MULTI-3",
+					item_name: "Three Unit Item",
+					qty: 3,
+					rate: 1.0,
+					net_amount: 2.99,
+					net_rate: 1.0,
+					base_net_rate: 1.0,
+					trade_price: 1.0,
+				},
+			],
+			payments: [{ mode_of_payment: "Cash", amount: 2.99, type: "Cash" }],
+			rounded_total: 2.99,
+			grand_total: 2.99,
+		});
+
+		const submission = usePaymentSubmission({
+			invoiceDoc,
+			posProfile: ref({ posa_below_cost_action: "Block" }),
+			stockSettings: ref({}),
+			invoiceType: ref("Invoice"),
+			formatFloat: (value) => Number(value || 0),
+			stores: { toastStore: { show: vi.fn() } },
+			currencyPrecision: ref(2),
+			diff_payment: ref(0) as any,
+			isCashback: ref(true),
+		});
+
+		await expect(submission.validateSubmission(true)).resolves.toBe(true);
+	});
+
+	it("preserves configured currencyPrecision 0 for zero-decimal UGX rounding reconciliation", async () => {
+		const invoiceDoc = ref<any>({
+			is_return: 0,
+			currency: "UGX",
+			apply_discount_on: "Net Total",
+			discount_amount: 2,
+			items: [
+				{
+					item_code: "UGX-1",
+					item_name: "UGX Line 1",
+					qty: 1,
+					rate: 100,
+					net_rate: 99,
+					net_amount: 99,
+					trade_price: 99,
+				},
+				{
+					item_code: "UGX-2",
+					item_name: "UGX Line 2",
+					qty: 1,
+					rate: 100,
+					net_rate: 100,
+					net_amount: 100,
+					trade_price: 100,
+				},
+				{
+					item_code: "UGX-3",
+					item_name: "UGX Line 3",
+					qty: 1,
+					rate: 100,
+					net_rate: 99,
+					net_amount: 99,
+					trade_price: 99,
+				},
+			],
+			payments: [{ mode_of_payment: "Cash", amount: 298, type: "Cash" }],
+			rounded_total: 298,
+			grand_total: 298,
+		});
+
+		const submission = usePaymentSubmission({
+			invoiceDoc,
+			posProfile: ref({ posa_below_cost_action: "Block" }),
+			stockSettings: ref({}),
+			invoiceType: ref("Invoice"),
+			formatFloat: (value) => Number(value || 0),
+			stores: { toastStore: { show: vi.fn() } },
+			currencyPrecision: ref(0),
+			diff_payment: ref(0) as any,
+			isCashback: ref(true),
+		});
+
+		await expect(submission.validateSubmission(true)).resolves.toBe(true);
+	});
+
+	it("copies missing currency and FX metadata from cart when enriching doc items so USD 15 passes UGX 37000 floor at 3700", async () => {
+		const invoiceDoc = ref<any>({
+			is_return: 0,
+			currency: "USD",
+			conversion_rate: 3700,
+			items: [
+				{
+					item_code: "FX-ENRICH-1",
+					item_name: "USD Item",
+					qty: 1,
+					rate: 15,
+					net_rate: 15,
+					net_amount: 15,
+				},
+			],
+			payments: [{ mode_of_payment: "Cash", amount: 15, type: "Cash" }],
+			rounded_total: 15,
+			grand_total: 15,
+		});
+
+		const cartItems = ref([
+			{
+				item_code: "FX-ENRICH-1",
+				item_name: "USD Item",
+				qty: 1,
+				rate: 15,
+				currency: "USD",
+				company_currency: "UGX",
+				conversion_rate: 3700,
+				plc_conversion_rate: 3700,
+				_company_buying_price: 37000,
+			},
+		]);
+
+		const submission = usePaymentSubmission({
+			invoiceDoc,
+			posProfile: ref({ posa_below_cost_action: "Block" }),
+			stockSettings: ref({}),
+			invoiceType: ref("Invoice"),
+			formatFloat: (value) => Number(value || 0),
+			stores: {
+				toastStore: { show: vi.fn() },
+				invoiceStore: {
+					invoiceDoc: invoiceDoc.value,
+					items: cartItems,
+				},
+			},
+			diff_payment: ref(0) as any,
+			isCashback: ref(true),
+		});
+
+		await expect(submission.validateSubmission(true)).resolves.toBe(true);
+	});
+
+	it("enriches missing higher buying_rate from cart even when invoiceDoc already has lower valuation_rate", async () => {
+		const invoiceDoc = ref<any>({
+			is_return: 0,
+			currency: "USD",
+			items: [
+				{
+					item_code: "COST-MERGE-1",
+					item_name: "Partial Cost Item",
+					qty: 1,
+					rate: 8,
+					valuation_rate: 5,
+				},
+			],
+			payments: [{ mode_of_payment: "Cash", amount: 8, type: "Cash" }],
+			rounded_total: 8,
+			grand_total: 8,
+		});
+
+		const cartItems = ref([
+			{
+				item_code: "COST-MERGE-1",
+				item_name: "Partial Cost Item",
+				qty: 1,
+				rate: 8,
+				buying_rate: 10,
+				valuation_rate: 5,
+			},
+		]);
+
+		const submission = usePaymentSubmission({
+			invoiceDoc,
+			posProfile: ref({ posa_below_cost_action: "Block" }),
+			stockSettings: ref({}),
+			invoiceType: ref("Invoice"),
+			formatFloat: (value) => Number(value || 0),
+			stores: {
+				toastStore: { show: vi.fn() },
+				invoiceStore: {
+					invoiceDoc: invoiceDoc.value,
+					items: cartItems,
+				},
+			},
+			diff_payment: ref(0) as any,
+			isCashback: ref(true),
+		});
+
+		await expect(submission.validateSubmission(true)).rejects.toThrow(
+			/Partial Cost Item is selling at 8, below Buying Rate 10/i,
+		);
+	});
+
+	it("uses enriched cart cost in missing-cost Block check when invoiceDoc line has no cost fields", async () => {
+		const invoiceDoc = ref<any>({
+			is_return: 0,
+			currency: "USD",
+			items: [
+				{
+					item_code: "ENRICH-BLOCK-1",
+					item_name: "Server Stripped Cost Item",
+					qty: 1,
+					rate: 12,
+				},
+			],
+			payments: [{ mode_of_payment: "Cash", amount: 12, type: "Cash" }],
+			rounded_total: 12,
+			grand_total: 12,
+		});
+
+		const cartItems = ref([
+			{
+				item_code: "ENRICH-BLOCK-1",
+				item_name: "Server Stripped Cost Item",
+				qty: 1,
+				rate: 12,
+				trade_price: 10,
+			},
+		]);
+
+		const submission = usePaymentSubmission({
+			invoiceDoc,
+			posProfile: ref({
+				posa_below_cost_action: "Block",
+				posa_missing_cost_action: "Block",
+			}),
+			stockSettings: ref({}),
+			invoiceType: ref("Invoice"),
+			formatFloat: (value) => Number(value || 0),
+			stores: {
+				toastStore: { show: vi.fn() },
+				invoiceStore: {
+					invoiceDoc: invoiceDoc.value,
+					items: cartItems,
+				},
+			},
+			diff_payment: ref(0) as any,
+			isCashback: ref(true),
+		});
+
+		await expect(submission.validateSubmission(true)).resolves.toBe(true);
+	});
+
+	it("matches cart rows by posa_row_id before index fallback when duplicate SKU rows are reordered", async () => {
+		const invoiceDoc = ref<any>({
+			is_return: 0,
+			currency: "USD",
+			items: [
+				{
+					item_code: "DUP-SKU",
+					item_name: "Duplicate SKU High",
+					posa_row_id: "row-high",
+					qty: 1,
+					rate: 20,
+				},
+				{
+					item_code: "DUP-SKU",
+					item_name: "Duplicate SKU Low",
+					posa_row_id: "row-low",
+					qty: 1,
+					rate: 7,
+				},
+			],
+			payments: [{ mode_of_payment: "Cash", amount: 27, type: "Cash" }],
+			rounded_total: 27,
+			grand_total: 27,
+		});
+
+		const cartItems = ref([
+			{
+				item_code: "DUP-SKU",
+				item_name: "Duplicate SKU Low",
+				posa_row_id: "row-low",
+				qty: 1,
+				rate: 7,
+				trade_price: 6,
+			},
+			{
+				item_code: "DUP-SKU",
+				item_name: "Duplicate SKU High",
+				posa_row_id: "row-high",
+				qty: 1,
+				rate: 20,
+				trade_price: 18,
+			},
+		]);
+
+		const submission = usePaymentSubmission({
+			invoiceDoc,
+			posProfile: ref({ posa_below_cost_action: "Block" }),
+			stockSettings: ref({}),
+			invoiceType: ref("Invoice"),
+			formatFloat: (value) => Number(value || 0),
+			stores: {
+				toastStore: { show: vi.fn() },
+				invoiceStore: {
+					invoiceDoc: invoiceDoc.value,
+					items: cartItems,
+				},
+			},
+			diff_payment: ref(0) as any,
+			isCashback: ref(true),
+		});
+
+		await expect(submission.validateSubmission(true)).resolves.toBe(true);
+	});
+
+	it("blocks under missing-cost policy when foreign _buying_prices_by_uom has base_price_list_rate null without positive buying_exchange_rate", async () => {
+		const invoiceDoc = ref<any>({
+			is_return: 0,
+			currency: "USD",
+			conversion_rate: 3700,
+			items: [
+				{
+					item_code: "USD-UOM-NULL-BASE",
+					item_name: "USD Table Item",
+					qty: 1,
+					rate: 12,
+					currency: "USD",
+					company_currency: "UGX",
+					conversion_rate: 3700,
+					uom: "Nos",
+					stock_uom: "Nos",
+					_company_buying_price: 37000,
+					_buying_prices_by_uom: {
+						Nos: {
+							currency: "USD",
+							price_list_rate: 10,
+							base_price_list_rate: null,
+						},
+					},
+				},
+			],
+			payments: [{ mode_of_payment: "Cash", amount: 12, type: "Cash" }],
+			rounded_total: 12,
+			grand_total: 12,
+		});
+
+		const submission = usePaymentSubmission({
+			invoiceDoc,
+			posProfile: ref({
+				posa_below_cost_action: "Block",
+				posa_missing_cost_action: "Block",
+			}),
+			stockSettings: ref({}),
+			invoiceType: ref("Invoice"),
+			formatFloat: (value) => Number(value || 0),
+			stores: { toastStore: { show: vi.fn() } },
+			diff_payment: ref(0) as any,
+			isCashback: ref(true),
+		});
+
+		await expect(submission.validateSubmission(true)).rejects.toThrow(
+			/no valid buying floor/i,
+		);
+	});
+
+	it("blocks checkout when ERPNext rounds multi-unit net_rate to 0.00 against a UGX 10 valuation floor", async () => {
+		const invoiceDoc = ref<any>({
+			is_return: 0,
+			currency: "USD",
+			conversion_rate: 3700,
+			apply_discount_on: "Net Total",
+			discount_amount: 0.02,
+			items: [
+				{
+					item_code: "ZERO-NET-RATE",
+					item_name: "Rounded Zero Net Rate Item",
+					qty: 3,
+					rate: 0.01,
+					net_amount: 0.01,
+					net_rate: 0,
+					base_net_rate: 0,
+					currency: "USD",
+					company_currency: "UGX",
+					conversion_rate: 3700,
+					valuation_rate: 10,
+				},
+			],
+			payments: [{ mode_of_payment: "Cash", amount: 0.01, type: "Cash" }],
+			rounded_total: 0.01,
+			grand_total: 0.01,
+		});
+
+		const submission = usePaymentSubmission({
+			invoiceDoc,
+			posProfile: ref({ posa_below_cost_action: "Block" }),
+			stockSettings: ref({}),
+			invoiceType: ref("Invoice"),
+			formatFloat: (value) => Number(value || 0),
+			stores: { toastStore: { show: vi.fn() } },
+			currencyPrecision: ref(2),
+			diff_payment: ref(0) as any,
+			isCashback: ref(true),
+		});
+
+		await expect(submission.validateSubmission(true)).rejects.toThrow(
+			/Rounded Zero Net Rate Item is selling at 0/i,
+		);
+	});
+
+	it("blocks checkout under Block/Block when a EUR cart cost switches to USD without EUR FX", async () => {
+		const { applyCurrencyConversionToItem } = useItemCurrency();
+		const switchedItem: Record<string, any> = {
+			item_code: "EUR-UNRESOLVED",
+			item_name: "EUR Unresolved Item",
+			qty: 1,
+			rate: 12,
+			price_list_rate: 12,
+			currency: "EUR",
+			company_currency: "UGX",
+			trade_price: 10,
+		};
+		applyCurrencyConversionToItem(switchedItem, {
+			pos_profile: { currency: "UGX" },
+			price_list_currency: "USD",
+			selected_currency: "USD",
+			exchange_rate: 1,
+			conversion_rate: 3700,
+			currency_precision: 2,
+			flt: (value: unknown) => Number(value),
+		});
+		switchedItem.rate = 12;
+
+		const invoiceDoc = ref<any>({
+			is_return: 0,
+			currency: "USD",
+			conversion_rate: 3700,
+			items: [switchedItem],
+			payments: [{ mode_of_payment: "Cash", amount: 12, type: "Cash" }],
+			rounded_total: 12,
+			grand_total: 12,
+		});
+
+		const submission = usePaymentSubmission({
+			invoiceDoc,
+			posProfile: ref({
+				posa_below_cost_action: "Block",
+				posa_missing_cost_action: "Block",
+			}),
+			stockSettings: ref({}),
+			invoiceType: ref("Invoice"),
+			formatFloat: (value) => Number(value || 0),
+			stores: { toastStore: { show: vi.fn() } },
+			currencyPrecision: ref(2),
+			diff_payment: ref(0) as any,
+			isCashback: ref(true),
+		});
+
+		await expect(submission.validateSubmission(true)).rejects.toThrow(
+			/no valid buying floor is available for EUR Unresolved Item/i,
+		);
+	});
+
+	it("prefers authoritative invoice FX over stale UGX cart FX during cost fallback merge (Case A)", async () => {
+		const buildSubmission = (
+			sellingRate: number,
+			cartRow: Record<string, any>,
+		) => {
+			const invoiceDoc = ref<any>({
+				is_return: 0,
+				currency: "USD",
+				conversion_rate: 3700,
+				items: [
+					{
+						item_code: "FX-USD-ITEM",
+						item_name: "USD Stale Cart Item",
+						posa_row_id: "row-fx-1",
+						qty: 1,
+						rate: sellingRate,
+					},
+				],
+				payments: [
+					{ mode_of_payment: "Cash", amount: sellingRate, type: "Cash" },
+				],
+				rounded_total: sellingRate,
+				grand_total: sellingRate,
+			});
+
+			return usePaymentSubmission({
+				invoiceDoc,
+				posProfile: ref({
+					posa_below_cost_action: "Block",
+					posa_missing_cost_action: "Block",
+				}),
+				stockSettings: ref({}),
+				invoiceType: ref("Invoice"),
+				formatFloat: (value) => Number(value || 0),
+				stores: {
+					toastStore: { show: vi.fn() },
+					invoiceStore: {
+						invoiceDoc: invoiceDoc.value,
+						items: ref([cartRow]),
+					},
+				},
+				currencyPrecision: ref(2),
+				diff_payment: ref(0) as any,
+				isCashback: ref(true),
+			});
+		};
+
+		// Case A: matched cart row is still in UGX at conversion_rate 1 with UGX 37,000 cost.
+		const staleUgxCartRow = {
+			item_code: "FX-USD-ITEM",
+			item_name: "USD Stale Cart Item",
+			posa_row_id: "row-fx-1",
+			currency: "UGX",
+			company_currency: "UGX",
+			conversion_rate: 1,
+			_company_buying_price: 37000,
+		};
+		await expect(
+			buildSubmission(15, staleUgxCartRow).validateSubmission(true),
+		).resolves.toBe(true);
+		await expect(
+			buildSubmission(8, staleUgxCartRow).validateSubmission(true),
+		).rejects.toThrow(/USD Stale Cart Item is selling at 8, below Trade Price 10/i);
+
+		// Case A (scalar trade_price only on stale UGX cart row): must keep UGX semantics (USD 10 floor, not USD 37,000).
+		const staleUgxScalarCartRow = {
+			item_code: "FX-USD-ITEM",
+			item_name: "USD Stale Cart Item",
+			posa_row_id: "row-fx-1",
+			currency: "UGX",
+			company_currency: "UGX",
+			conversion_rate: 1,
+			trade_price: 37000,
+		};
+		await expect(
+			buildSubmission(15, staleUgxScalarCartRow).validateSubmission(true),
+		).resolves.toBe(true);
+		await expect(
+			buildSubmission(8, staleUgxScalarCartRow).validateSubmission(true),
+		).rejects.toThrow(/USD Stale Cart Item is selling at 8, below Trade Price 10/i);
+	});
+
+	it("prefers authoritative invoice FX over pending zero cart FX during cost fallback merge (Case B)", async () => {
+		const buildSubmission = (sellingRate: number) => {
+			const invoiceDoc = ref<any>({
+				is_return: 0,
+				currency: "USD",
+				conversion_rate: 3700,
+				items: [
+					{
+						item_code: "FX-USD-ITEM",
+						item_name: "USD Stale Cart Item",
+						posa_row_id: "row-fx-1",
+						qty: 1,
+						rate: sellingRate,
+					},
+				],
+				payments: [
+					{ mode_of_payment: "Cash", amount: sellingRate, type: "Cash" },
+				],
+				rounded_total: sellingRate,
+				grand_total: sellingRate,
+			});
+
+			const pendingZeroFxCartRow = {
+				item_code: "FX-USD-ITEM",
+				item_name: "USD Stale Cart Item",
+				posa_row_id: "row-fx-1",
+				currency: "USD",
+				company_currency: "UGX",
+				conversion_rate: 0,
+				_company_buying_price: 37000,
+			};
+
+			return usePaymentSubmission({
+				invoiceDoc,
+				posProfile: ref({
+					posa_below_cost_action: "Block",
+					posa_missing_cost_action: "Block",
+				}),
+				stockSettings: ref({}),
+				invoiceType: ref("Invoice"),
+				formatFloat: (value) => Number(value || 0),
+				stores: {
+					toastStore: { show: vi.fn() },
+					invoiceStore: {
+						invoiceDoc: invoiceDoc.value,
+						items: ref([pendingZeroFxCartRow]),
+					},
+				},
+				currencyPrecision: ref(2),
+				diff_payment: ref(0) as any,
+				isCashback: ref(true),
+			});
+		};
+
+		await expect(buildSubmission(15).validateSubmission(true)).resolves.toBe(
+			true,
+		);
+		await expect(buildSubmission(8).validateSubmission(true)).rejects.toThrow(
+			/USD Stale Cart Item is selling at 8, below Trade Price 10/i,
+		);
+	});
+
+	it("reserves exact posa_row_id cart matches before anonymous duplicate-SKU fallback rows", async () => {
+		const buildSubmission = (anonymousRate: number) => {
+			const invoiceDoc = ref<any>({
+				is_return: 0,
+				currency: "USD",
+				items: [
+					{
+						item_code: "DUP-SKU",
+						item_name: "Duplicate SKU Anonymous",
+						qty: 1,
+						rate: anonymousRate,
+					},
+					{
+						item_code: "DUP-SKU",
+						item_name: "Duplicate SKU High",
+						posa_row_id: "row-high",
+						qty: 1,
+						rate: 20,
+					},
+				],
+				payments: [
+					{
+						mode_of_payment: "Cash",
+						amount: anonymousRate + 20,
+						type: "Cash",
+					},
+				],
+				rounded_total: anonymousRate + 20,
+				grand_total: anonymousRate + 20,
+			});
+
+			const cartItems = ref([
+				{
+					item_code: "DUP-SKU",
+					item_name: "Duplicate SKU High",
+					posa_row_id: "row-high",
+					qty: 1,
+					rate: 20,
+					trade_price: 18,
+				},
+				{
+					item_code: "DUP-SKU",
+					item_name: "Duplicate SKU Anonymous",
+					qty: 1,
+					rate: 7,
+					trade_price: 6,
+				},
+			]);
+
+			return usePaymentSubmission({
+				invoiceDoc,
+				posProfile: ref({ posa_below_cost_action: "Block" }),
+				stockSettings: ref({}),
+				invoiceType: ref("Invoice"),
+				formatFloat: (value) => Number(value || 0),
+				stores: {
+					toastStore: { show: vi.fn() },
+					invoiceStore: {
+						invoiceDoc: invoiceDoc.value,
+						items: cartItems,
+					},
+				},
+				diff_payment: ref(0) as any,
+				isCashback: ref(true),
+			});
+		};
+
+		await expect(buildSubmission(7).validateSubmission(true)).resolves.toBe(
+			true,
+		);
+		await expect(buildSubmission(5).validateSubmission(true)).rejects.toThrow(
+			/Duplicate SKU Anonymous is selling at 5, below Trade Price 6/i,
+		);
+	});
+
+	it("blocks checkout when both net_amount and net_rate round to zero on a shared Net Total discount", async () => {
+		const invoiceDoc = ref<any>({
+			is_return: 0,
+			currency: "USD",
+			conversion_rate: 3700,
+			apply_discount_on: "Net Total",
+			discount_amount: 0.03,
+			items: [
+				{
+					item_code: "SMALL-ZERO-LINE",
+					item_name: "Small Rounded Zero Item",
+					qty: 1,
+					rate: 0.01,
+					net_amount: 0,
+					net_rate: 0,
+					base_net_rate: 0,
+					currency: "USD",
+					company_currency: "UGX",
+					conversion_rate: 3700,
+					valuation_rate: 10,
+				},
+				{
+					item_code: "SMALL-NONZERO-LINE",
+					item_name: "Small Nonzero Item",
+					qty: 1,
+					rate: 0.04,
+					net_amount: 0.02,
+					net_rate: 0.02,
+					base_net_rate: 74,
+					currency: "USD",
+					company_currency: "UGX",
+					conversion_rate: 3700,
+					valuation_rate: 10,
+				},
+			],
+			payments: [{ mode_of_payment: "Cash", amount: 0.02, type: "Cash" }],
+			rounded_total: 0.02,
+			grand_total: 0.02,
+		});
+
+		const submission = usePaymentSubmission({
+			invoiceDoc,
+			posProfile: ref({ posa_below_cost_action: "Block" }),
+			stockSettings: ref({}),
+			invoiceType: ref("Invoice"),
+			formatFloat: (value) => Number(value || 0),
+			stores: { toastStore: { show: vi.fn() } },
+			currencyPrecision: ref(2),
+			diff_payment: ref(0) as any,
+			isCashback: ref(true),
+		});
+
+		await expect(submission.validateSubmission(true)).rejects.toThrow(
+			/Small Rounded Zero Item is selling at 0/i,
+		);
+	});
+
+	it("overrides stale positive child-row conversion_rate with authoritative invoice header conversion_rate", async () => {
+		const buildSubmission = (sellingRate: number) => {
+			const invoiceDoc = ref<any>({
+				is_return: 0,
+				currency: "USD",
+				conversion_rate: 3700,
+				items: [
+					{
+						item_code: "STALE-CHILD-FX",
+						item_name: "Stale Child FX Item",
+						qty: 1,
+						rate: sellingRate,
+						currency: "USD",
+						company_currency: "UGX",
+						conversion_rate: 1,
+						valuation_rate: 37000,
+					},
+				],
+				payments: [
+					{ mode_of_payment: "Cash", amount: sellingRate, type: "Cash" },
+				],
+				rounded_total: sellingRate,
+				grand_total: sellingRate,
+			});
+
+			return usePaymentSubmission({
+				invoiceDoc,
+				posProfile: ref({
+					posa_below_cost_action: "Block",
+					posa_missing_cost_action: "Block",
+				}),
+				stockSettings: ref({}),
+				invoiceType: ref("Invoice"),
+				formatFloat: (value) => Number(value || 0),
+				stores: { toastStore: { show: vi.fn() } },
+				currencyPrecision: ref(2),
+				diff_payment: ref(0) as any,
+				isCashback: ref(true),
+			});
+		};
+
+		// Authoritative invoice header conversion_rate=3700 yields USD 10 floor (not USD 37,000 from stale child conversion_rate=1).
+		await expect(buildSubmission(15).validateSubmission(true)).resolves.toBe(
+			true,
+		);
+		await expect(buildSubmission(8).validateSubmission(true)).rejects.toThrow(
+			/Stale Child FX Item is selling at 8, below Warehouse Valuation 10/i,
+		);
+	});
+
+	it("allows uncalculated all-zero draft [0, 0, 0] on 3 x USD 0.01 with 0.02 discount while blocking ERPNext [0, 0.01, 0]", async () => {
+		const buildSubmission = (netValues: [number, number, number]) => {
+			const invoiceDoc = ref<any>({
+				is_return: 0,
+				currency: "USD",
+				conversion_rate: 3700,
+				apply_discount_on: "Net Total",
+				discount_amount: 0.02,
+				items: netValues.map((netVal, idx) => ({
+					item_code: `CENT-CHK-${idx + 1}`,
+					item_name: `Cent Checkout Item ${idx + 1}`,
+					qty: 1,
+					rate: 0.01,
+					net_amount: netVal,
+					net_rate: netVal,
+					base_net_rate: netVal * 3700,
+					currency: "USD",
+					company_currency: "UGX",
+					conversion_rate: 3700,
+					valuation_rate: 10,
+				})),
+				payments: [{ mode_of_payment: "Cash", amount: 0.01, type: "Cash" }],
+				rounded_total: 0.01,
+				grand_total: 0.01,
+			});
+
+			return usePaymentSubmission({
+				invoiceDoc,
+				posProfile: ref({ posa_below_cost_action: "Block" }),
+				stockSettings: ref({}),
+				invoiceType: ref("Invoice"),
+				formatFloat: (value) => Number(value || 0),
+				stores: { toastStore: { show: vi.fn() } },
+				currencyPrecision: ref(2),
+				diff_payment: ref(0) as any,
+				isCashback: ref(true),
+			});
+		};
+
+		await expect(
+			buildSubmission([0, 0, 0]).validateSubmission(true),
+		).resolves.toBe(true);
+		await expect(
+			buildSubmission([0, 0.01, 0]).validateSubmission(true),
+		).rejects.toThrow(/Cent Checkout Item 1 is selling at 0/i);
+	});
+
+	it("applies authoritative invoice header FX to cart-only checkout when invoiceDoc.items is empty", async () => {
+		const buildSubmission = (sellingRate: number) => {
+			const invoiceDoc = ref<any>({
+				is_return: 0,
+				currency: "USD",
+				conversion_rate: 3700,
+				items: [],
+				payments: [
+					{ mode_of_payment: "Cash", amount: sellingRate, type: "Cash" },
+				],
+				rounded_total: sellingRate,
+				grand_total: sellingRate,
+			});
+
+			const cartItems = ref([
+				{
+					item_code: "CART-ONLY-FX",
+					item_name: "Cart Only Stale FX Item",
+					qty: 1,
+					rate: sellingRate,
+					currency: "USD",
+					company_currency: "UGX",
+					conversion_rate: 1,
+					valuation_rate: 37000,
+				},
+			]);
+
+			return usePaymentSubmission({
+				invoiceDoc,
+				posProfile: ref({
+					posa_below_cost_action: "Block",
+					posa_missing_cost_action: "Block",
+				}),
+				stockSettings: ref({}),
+				invoiceType: ref("Invoice"),
+				formatFloat: (value) => Number(value || 0),
+				stores: {
+					toastStore: { show: vi.fn() },
+					invoiceStore: {
+						invoiceDoc: invoiceDoc.value,
+						items: cartItems,
+					},
+				},
+				currencyPrecision: ref(2),
+				diff_payment: ref(0) as any,
+				isCashback: ref(true),
+			});
+		};
+
+		await expect(buildSubmission(15).validateSubmission(true)).resolves.toBe(
+			true,
+		);
+		await expect(buildSubmission(8).validateSubmission(true)).rejects.toThrow(
+			/Cart Only Stale FX Item is selling at 8, below Warehouse Valuation 10/i,
+		);
+	});
+
+	it("matches reordered anonymous duplicate-SKU rows by UOM before positional/SKU fallback", async () => {
+		const buildSubmission = (eachRate: number) => {
+			const invoiceDoc = ref<any>({
+				is_return: 0,
+				currency: "USD",
+				items: [
+					{
+						item_code: "UOM-DUP-SKU",
+						item_name: "UOM Dup Each",
+						uom: "Each",
+						qty: 1,
+						rate: eachRate,
+					},
+					{
+						item_code: "UOM-DUP-SKU",
+						item_name: "UOM Dup Box",
+						uom: "Box",
+						qty: 1,
+						rate: 90,
+					},
+				],
+				payments: [
+					{
+						mode_of_payment: "Cash",
+						amount: eachRate + 90,
+						type: "Cash",
+					},
+				],
+				rounded_total: eachRate + 90,
+				grand_total: eachRate + 90,
+			});
+
+			const cartItems = ref([
+				{
+					item_code: "UOM-DUP-SKU",
+					item_name: "UOM Dup Box",
+					uom: "Box",
+					qty: 1,
+					rate: 90,
+					trade_price: 80,
+				},
+				{
+					item_code: "UOM-DUP-SKU",
+					item_name: "UOM Dup Each",
+					uom: "Each",
+					qty: 1,
+					rate: 10,
+					trade_price: 8,
+				},
+			]);
+
+			return usePaymentSubmission({
+				invoiceDoc,
+				posProfile: ref({ posa_below_cost_action: "Block" }),
+				stockSettings: ref({}),
+				invoiceType: ref("Invoice"),
+				formatFloat: (value) => Number(value || 0),
+				stores: {
+					toastStore: { show: vi.fn() },
+					invoiceStore: {
+						invoiceDoc: invoiceDoc.value,
+						items: cartItems,
+					},
+				},
+				currencyPrecision: ref(2),
+				diff_payment: ref(0) as any,
+				isCashback: ref(true),
+			});
+		};
+
+		await expect(buildSubmission(10).validateSubmission(true)).resolves.toBe(
+			true,
+		);
+		await expect(buildSubmission(6).validateSubmission(true)).rejects.toThrow(
+			/UOM Dup Each is selling at 6, below Trade Price 8/i,
+		);
+	});
+
+	it("accepts selling rate 10.00 against valuation 10.004 at 2-decimal currency precision", async () => {
+		const buildSubmission = (valuationRate: number) => {
+			const invoiceDoc = ref<any>({
+				is_return: 0,
+				currency: "USD",
+				items: [
+					{
+						item_code: "PREC-CHECKOUT",
+						item_name: "Precision Checkout Item",
+						qty: 1,
+						rate: 10.0,
+						valuation_rate: valuationRate,
+					},
+				],
+				payments: [{ mode_of_payment: "Cash", amount: 10, type: "Cash" }],
+				rounded_total: 10,
+				grand_total: 10,
+			});
+
+			return usePaymentSubmission({
+				invoiceDoc,
+				posProfile: ref({ posa_below_cost_action: "Block" }),
+				stockSettings: ref({}),
+				invoiceType: ref("Invoice"),
+				formatFloat: (value) => Number(value || 0),
+				stores: { toastStore: { show: vi.fn() } },
+				currencyPrecision: ref(2),
+				diff_payment: ref(0) as any,
+				isCashback: ref(true),
+			});
+		};
+
+		await expect(
+			buildSubmission(10.004).validateSubmission(true),
+		).resolves.toBe(true);
+		await expect(
+			buildSubmission(10.006).validateSubmission(true),
+		).rejects.toThrow(/Precision Checkout Item is selling at 10/i);
 	});
 
 	it("defers print and schedules background wait when invoice submission is queued", async () => {
@@ -2253,5 +3776,236 @@ describe("usePaymentSubmission", () => {
 			reason: "terminal_locked",
 		});
 		expect(invoiceService.submitInvoice).toHaveBeenCalledOnce();
+	});
+
+	it("blocks checkout under missing-cost Block when API emits buying_exchange_rate: null and base_price_list_rate: null on USD/UGX item", async () => {
+		const invoiceDoc = ref<any>({
+			is_return: 0,
+			currency: "USD",
+			company_currency: "UGX",
+			conversion_rate: 3700,
+			items: [
+				{
+					item_code: "USD-API-NULL-FX",
+					item_name: "API Null Buying FX Item",
+					qty: 1,
+					rate: 10.5,
+					currency: "USD",
+					company_currency: "UGX",
+					conversion_rate: 3700,
+					uom: "Nos",
+					stock_uom: "Nos",
+					valuation_rate: 100,
+					buying_price_list: "USD Buying",
+					buying_price_currency: "USD",
+					buying_exchange_rate: null,
+					base_buying_rate: null,
+					trade_price: null,
+					buying_rate: null,
+					_buying_prices_by_uom: {
+						Nos: {
+							currency: "USD",
+							price_list_rate: 10,
+							base_price_list_rate: null,
+							price_list: "USD Buying",
+						},
+					},
+				},
+			],
+			payments: [{ mode_of_payment: "Cash", amount: 10.5, type: "Cash" }],
+			rounded_total: 10.5,
+			grand_total: 10.5,
+		});
+
+		const submission = usePaymentSubmission({
+			invoiceDoc,
+			posProfile: ref({
+				posa_below_cost_action: "Block",
+				posa_missing_cost_action: "Block",
+			}),
+			stockSettings: ref({}),
+			invoiceType: ref("Invoice"),
+			formatFloat: (value) => Number(value || 0),
+			stores: { toastStore: { show: vi.fn() } },
+			diff_payment: ref(0) as any,
+			isCashback: ref(true),
+		});
+
+		await expect(submission.validateSubmission(true)).rejects.toThrow(
+			/no valid buying floor/i,
+		);
+	});
+
+	it("honors frappe.flags.round_row_wise_tax in validateSubmission without letting doc.round_row_wise_tax override it", async () => {
+		const makeDoc = (docFlag: number | undefined) =>
+			ref<any>({
+				is_return: 0,
+				currency: "USD",
+				company_currency: "UGX",
+				conversion_rate: 3700,
+				...(docFlag !== undefined ? { round_row_wise_tax: docFlag } : {}),
+				taxes: [
+					{
+						charge_type: "On Net Total",
+						account_head: "VAT 18% - CO",
+						rate: 18,
+						included_in_print_rate: 1,
+					},
+				],
+				items: [1, 2].map((idx) => ({
+					item_code: `SUB-RW-${idx}`,
+					item_name: `Row Wise ${idx}`,
+					qty: 1,
+					rate: 0.03,
+					amount: 0.03,
+					net_rate: 0.03,
+					net_amount: 0.03,
+					currency: "USD",
+					company_currency: "UGX",
+					conversion_rate: 3700,
+					valuation_rate: 100,
+				})),
+				payments: [{ mode_of_payment: "Cash", amount: 0.06, type: "Cash" }],
+				rounded_total: 0.06,
+				grand_total: 0.06,
+			});
+
+		const previousFlags = (globalThis as any).frappe?.flags;
+		(globalThis as any).frappe.flags = { round_row_wise_tax: 1 };
+		try {
+			// Flag enabled in browser -> passes even if doc carries round_row_wise_tax: 0.
+			const enabledSub = usePaymentSubmission({
+				invoiceDoc: makeDoc(0),
+				posProfile: ref({
+					posa_below_cost_action: "Block",
+					currency_precision: 2,
+				}),
+				stockSettings: ref({}),
+				invoiceType: ref("Invoice"),
+				formatFloat: (value) => Number(value || 0),
+				stores: { toastStore: { show: vi.fn() } },
+				diff_payment: ref(0) as any,
+				isCashback: ref(true),
+			});
+			await expect(enabledSub.validateSubmission(true)).resolves.toBe(true);
+
+			// Flag disabled -> forged doc.round_row_wise_tax: 1 must NOT bypass carried-group check.
+			(globalThis as any).frappe.flags = { round_row_wise_tax: 0 };
+			const disabledSub = usePaymentSubmission({
+				invoiceDoc: makeDoc(1),
+				posProfile: ref({
+					posa_below_cost_action: "Block",
+					currency_precision: 2,
+				}),
+				stockSettings: ref({}),
+				invoiceType: ref("Invoice"),
+				formatFloat: (value) => Number(value || 0),
+				stores: { toastStore: { show: vi.fn() } },
+				diff_payment: ref(0) as any,
+				isCashback: ref(true),
+			});
+			await expect(disabledSub.validateSubmission(true)).rejects.toThrow();
+		} finally {
+			(globalThis as any).frappe.flags = previousFlags;
+		}
+	});
+
+	it("accepts fractional-quantity inclusive-tax line (qty=0.6, rate=0.03, 18% VAT) in validateSubmission", async () => {
+		const invoiceDoc = ref<any>({
+			is_return: 0,
+			currency: "USD",
+			company_currency: "UGX",
+			conversion_rate: 3700,
+			taxes: [
+				{
+					charge_type: "On Net Total",
+					account_head: "VAT 18% - CO",
+					rate: 18,
+					included_in_print_rate: 1,
+				},
+			],
+			items: [
+				{
+					item_code: "SUB-FRAC-VAT",
+					item_name: "Fractional VAT Item",
+					qty: 0.6,
+					rate: 0.03,
+					amount: 0.02,
+					net_amount: 0.02,
+					net_rate: 0.03,
+					base_net_amount: 74,
+					base_net_rate: 111,
+					currency: "USD",
+					company_currency: "UGX",
+					conversion_rate: 3700,
+					valuation_rate: 100,
+				},
+			],
+			payments: [{ mode_of_payment: "Cash", amount: 0.02, type: "Cash" }],
+			rounded_total: 0.02,
+			grand_total: 0.02,
+		});
+
+		const submission = usePaymentSubmission({
+			invoiceDoc,
+			posProfile: ref({
+				posa_below_cost_action: "Block",
+				currency_precision: 2,
+			}),
+			stockSettings: ref({}),
+			invoiceType: ref("Invoice"),
+			formatFloat: (value) => Number(value || 0),
+			stores: { toastStore: { show: vi.fn() } },
+			diff_payment: ref(0) as any,
+			isCashback: ref(true),
+		});
+
+		await expect(submission.validateSubmission(true)).resolves.toBe(true);
+	});
+
+	it("accepts valid weighed sale (0.10 kg x $1.03/kg vs $1.02/kg floor) in validateSubmission", async () => {
+		const invoiceDoc = ref<any>({
+			is_return: 0,
+			currency: "USD",
+			company_currency: "USD",
+			conversion_rate: 1,
+			taxes: [],
+			items: [
+				{
+					item_code: "SUB-WEIGHED-OK",
+					item_name: "Weighed Item",
+					qty: 0.1,
+					rate: 1.03,
+					amount: 0.1,
+					net_amount: 0.1,
+					net_rate: 1.03,
+					base_net_amount: 0.1,
+					base_net_rate: 1.03,
+					currency: "USD",
+					company_currency: "USD",
+					conversion_rate: 1,
+					valuation_rate: 1.02,
+				},
+			],
+			payments: [{ mode_of_payment: "Cash", amount: 0.1, type: "Cash" }],
+			rounded_total: 0.1,
+			grand_total: 0.1,
+		});
+
+		const submission = usePaymentSubmission({
+			invoiceDoc,
+			posProfile: ref({
+				posa_below_cost_action: "Block",
+				currency_precision: 2,
+			}),
+			stockSettings: ref({}),
+			invoiceType: ref("Invoice"),
+			formatFloat: (value) => Number(value || 0),
+			stores: { toastStore: { show: vi.fn() } },
+			diff_payment: ref(0) as any,
+			isCashback: ref(true),
+		});
+
+		await expect(submission.validateSubmission(true)).resolves.toBe(true);
 	});
 });

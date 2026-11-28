@@ -129,12 +129,25 @@ def _enrich_je_accounts_with_currency(company, accounts, posting_date):
             continue
         multi_currency = 1
         if not row.get("exchange_rate"):
+            raw_rate = None
             try:
-                row["exchange_rate"] = frappe.utils.flt(
-                    get_exchange_rate(account_currency, company_currency, posting_date)
-                ) or 1
+                raw_rate = get_exchange_rate(
+                    account_currency, company_currency, posting_date, "for_selling"
+                )
             except Exception:
-                row["exchange_rate"] = 1
+                raw_rate = None
+            flt_fn = getattr(getattr(frappe, "utils", None), "flt", None)
+            try:
+                rate = flt_fn(raw_rate) if callable(flt_fn) else float(raw_rate or 0)
+            except Exception:
+                rate = 0.0
+            if rate <= 0:
+                frappe.throw(
+                    frappe._(
+                        "No selling exchange rate is available for {0} to {1} on {2}."
+                    ).format(account_currency, company_currency, posting_date)
+                )
+            row["exchange_rate"] = rate
     return multi_currency
 
 
@@ -157,6 +170,10 @@ def _create_gift_card_journal_entry(company, posting_date, remark, accounts):
 
     ensure_child_doctype(je_doc, "accounts", "Journal Entry Account")
     je_doc.flags.ignore_permissions = True
+    if je_doc.multi_currency:
+        # Preserve POS-validated selling rates (including exact 1.00 parity) so ERPNext
+        # JournalEntry.set_exchange_rate() does not replace them via an unqualified lookup.
+        je_doc.flags.ignore_exchange_rate = True
     frappe.flags.ignore_account_permission = True
     je_doc.user_remark = remark
     je_doc.set_missing_values()

@@ -139,13 +139,116 @@ def _discover_pairs(profile, enabled_currencies):
     return list(dict.fromkeys(pairs))
 
 
+def _discover_required_floor_pairs(profile):
+    """Discover direct and inverse FX pairs needed for foreign tills and buying floors."""
+
+    company = profile.get("company")
+    company_currency = ""
+    if company:
+        company_currency = str(
+            frappe.db.get_value("Company", company, "default_currency") or ""
+        ).strip()
+    if not company_currency:
+        return []
+
+    foreign_currencies = []
+
+    def _add_currency(value):
+        normalized = str(value or "").strip()
+        if normalized and normalized != company_currency and normalized not in foreign_currencies:
+            foreign_currencies.append(normalized)
+
+    _add_currency(profile.get("currency"))
+
+    selling_price_list = str(profile.get("selling_price_list") or "").strip()
+    if selling_price_list:
+        _add_currency(get_price_list_currency(selling_price_list))
+
+    buying_price_list = str(profile.get("buying_price_list") or "").strip()
+    if not buying_price_list:
+        try:
+            from posawesome.posawesome.api.item_sale_controls import (
+                _resolve_buying_price_list,
+            )
+
+            buying_price_list = str(
+                _resolve_buying_price_list(profile.get("name")) or ""
+            ).strip()
+        except Exception:
+            buying_price_list = ""
+
+    if buying_price_list:
+        _add_currency(get_price_list_currency(buying_price_list))
+        try:
+            _add_currency(
+                frappe.db.get_value("Price List", buying_price_list, "currency")
+            )
+        except Exception:
+            pass
+        try:
+            buying_rows = (
+                frappe.get_all(
+                    "Item Price",
+                    filters={"price_list": buying_price_list, "buying": 1},
+                    fields=["currency"],
+                )
+                or []
+            )
+            for row in buying_rows:
+                _add_currency(row.get("currency"))
+        except Exception:
+            pass
+
+    pairs = []
+    for foreign_currency in foreign_currencies:
+        pairs.append((foreign_currency, company_currency))
+        pairs.append((company_currency, foreign_currency))
+    return list(dict.fromkeys(pairs))
+
+
 def _normalize_pairs(currency_pairs, profile, enabled_currencies):
     explicit_pairs = _parse_pairs(currency_pairs)
-    if explicit_pairs:
-        return explicit_pairs, True
-    # Startup sync is metadata-only. Rates are requested lazily after a
-    # transaction actually selects a foreign currency.
+    floor_pairs = _discover_required_floor_pairs(profile)
+    combined = list(dict.fromkeys([*explicit_pairs, *floor_pairs]))
+    if combined:
+        return combined, True
+    # Startup sync on domestic-only profiles stays metadata-only until a
+    # transaction selects a foreign currency.
     return [], False
+
+
+def _get_currency_exchange_settings():
+    """Read ``Accounts Settings`` stale-rate policy with safe fallback defaults."""
+
+    raw_allow_stale = None
+    raw_stale_days = None
+    get_cached_doc = getattr(frappe, "get_cached_doc", None)
+    if callable(get_cached_doc):
+        try:
+            settings = get_cached_doc("Accounts Settings")
+            if settings and hasattr(settings, "get"):
+                raw_allow_stale = settings.get("allow_stale")
+                raw_stale_days = settings.get("stale_days")
+        except Exception:
+            pass
+    db = getattr(frappe, "db", None)
+    if raw_allow_stale is None and db and callable(getattr(db, "get_single_value", None)):
+        try:
+            raw_allow_stale = db.get_single_value("Accounts Settings", "allow_stale")
+        except Exception:
+            pass
+    if raw_stale_days is None and db and callable(getattr(db, "get_single_value", None)):
+        try:
+            raw_stale_days = db.get_single_value("Accounts Settings", "stale_days")
+        except Exception:
+            pass
+
+    allow_stale = 1 if raw_allow_stale is None else (1 if raw_allow_stale in (1, True, "1") else 0)
+    try:
+        stale_days = max(0, int(raw_stale_days)) if raw_stale_days is not None else 1
+    except (TypeError, ValueError):
+        stale_days = 1
+    return {"allow_stale": allow_stale, "stale_days": stale_days}
 
 
 def _get_exchange_rows(resolved_pairs):
@@ -165,6 +268,8 @@ def _get_exchange_rows(resolved_pairs):
                 "to_currency",
                 "exchange_rate",
                 "date",
+                "for_buying",
+                "for_selling",
                 "modified",
             ],
             order_by="date asc, modified asc, name asc",
@@ -185,6 +290,7 @@ def sync_currency_scope(
     pos_profile=None,
     watermark=None,
     currency_pairs=None,
+    backfill_pairs=None,
     offset=0,
     limit=200,
     schema_version=None,
@@ -230,19 +336,39 @@ def sync_currency_scope(
         for row in enabled_rows
         if str(row.get("name") or "").strip()
     ]
+    explicit_pair_set = set(_parse_pairs(currency_pairs))
     resolved_pairs, explicit_pairs = _normalize_pairs(
         currency_pairs,
         profile,
         enabled_currencies,
     )
+    parsed_backfill_pairs = _parse_pairs(backfill_pairs)
+    backfill_pair_set = set(parsed_backfill_pairs)
+    if parsed_backfill_pairs:
+        resolved_pairs = list(dict.fromkeys([*resolved_pairs, *parsed_backfill_pairs]))
+        explicit_pairs = True
     exchange_rows_by_pair = _get_exchange_rows(resolved_pairs)
     pair_modifications = []
+    synced_pairs = []
     for from_currency, to_currency in resolved_pairs:
+        is_backfill_pair = (from_currency, to_currency) in backfill_pair_set
+        if (
+            not watermark
+            or is_backfill_pair
+            or (from_currency, to_currency) in explicit_pair_set
+        ):
+            synced_pairs.append(
+                {"from_currency": from_currency, "to_currency": to_currency}
+            )
         exchange_rows = exchange_rows_by_pair.get((from_currency, to_currency), [])
         pair_modified = _max_timestamp([row.get("modified") for row in exchange_rows])
         pair_modifications.append(pair_modified)
         for row in exchange_rows:
-            if explicit_pairs and not _should_include(row.get("modified"), watermark):
+            if (
+                not is_backfill_pair
+                and explicit_pairs
+                and not _should_include(row.get("modified"), watermark)
+            ):
                 continue
             if not row.get("name"):
                 continue
@@ -253,11 +379,16 @@ def sync_currency_scope(
                     "data": dict(row),
                 }
             )
-        if explicit_pairs and not _should_include(pair_modified, watermark):
+        if (
+            not is_backfill_pair
+            and explicit_pairs
+            and not _should_include(pair_modified, watermark)
+        ):
             continue
         exchange_rate, rate_date = get_latest_rate(
             from_currency,
             to_currency,
+            purpose="for_selling",
             silent=True,
         )
         changes.append(
@@ -269,6 +400,7 @@ def sync_currency_scope(
                     "to_currency": to_currency,
                     "exchange_rate": exchange_rate,
                     "date": rate_date,
+                    "purpose": "for_selling",
                 },
             }
         )
@@ -306,6 +438,7 @@ def sync_currency_scope(
     next_watermark = None
     if not has_more:
         next_watermark = _max_timestamp(
+            watermark,
             enabled_modified,
             pair_modifications,
             [row.get("creation") for row in deleted_rate_rows],
@@ -317,4 +450,6 @@ def sync_currency_scope(
         has_more=has_more,
     )
     response["next_offset"] = resolved_offset + len(changes) if has_more else None
+    response["currency_settings"] = _get_currency_exchange_settings()
+    response["synced_pairs"] = synced_pairs
     return response

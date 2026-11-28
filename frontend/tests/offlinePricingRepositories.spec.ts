@@ -247,4 +247,283 @@ describe("offline pricing repositories", () => {
 			}),
 		);
 	});
+
+	it("filters Currency Exchange rows by purpose and breaks same-day ties by specificity then name desc", async () => {
+		await currencyRateRepository.upsertMany([
+			{
+				name: "FX-001",
+				profile_name: "POS-1",
+				company: "Test Co",
+				from_currency: "USD",
+				to_currency: "UGX",
+				exchange_rate: 4000,
+				date: "2026-05-10",
+				for_buying: 1,
+				for_selling: 1,
+			},
+			{
+				name: "FX-002",
+				profile_name: "POS-1",
+				company: "Test Co",
+				from_currency: "USD",
+				to_currency: "UGX",
+				exchange_rate: 4050,
+				date: "2026-05-10",
+				for_buying: 1,
+				for_selling: 0,
+			},
+			{
+				name: "FX-003",
+				profile_name: "POS-1",
+				company: "Test Co",
+				from_currency: "USD",
+				to_currency: "UGX",
+				exchange_rate: 4080,
+				date: "2026-05-10",
+				for_buying: 1,
+				for_selling: 0,
+			},
+			{
+				name: "FX-004",
+				profile_name: "POS-1",
+				company: "Test Co",
+				from_currency: "USD",
+				to_currency: "UGX",
+				exchange_rate: 3700,
+				date: "2026-05-15",
+				for_buying: 0,
+				for_selling: 1,
+			},
+		]);
+
+		const buyingRate = await currencyRateRepository.findLatestOnOrBefore({
+			profileName: "POS-1",
+			company: "Test Co",
+			fromCurrency: "USD",
+			toCurrency: "UGX",
+			date: "2026-05-20",
+			purpose: "for_buying",
+		});
+		expect(buyingRate?.name).toBe("FX-003");
+		expect(buyingRate?.exchange_rate).toBe(4080);
+
+		const sellingRate = await currencyRateRepository.findLatestOnOrBefore({
+			profileName: "POS-1",
+			company: "Test Co",
+			fromCurrency: "USD",
+			toCurrency: "UGX",
+			date: "2026-05-20",
+			purpose: "for_selling",
+		});
+		expect(sellingRate?.name).toBe("FX-004");
+		expect(sellingRate?.exchange_rate).toBe(3700);
+	});
+
+	it("enforces strict Accounts Settings stale_days cutoff when allow_stale is 0", async () => {
+		await currencyRateRepository.upsertMany([
+			{
+				name: "FX-STALE-BOUNDARY",
+				profile_name: "POS-1",
+				company: "Test Co",
+				from_currency: "USD",
+				to_currency: "UGX",
+				exchange_rate: 3900,
+				date: "2026-10-29",
+				for_buying: 1,
+				for_selling: 0,
+			},
+			{
+				name: "FX-JAN-2025",
+				profile_name: "POS-1",
+				company: "Test Co",
+				from_currency: "USD",
+				to_currency: "UGX",
+				exchange_rate: 3800,
+				date: "2025-01-15",
+				for_buying: 1,
+				for_selling: 0,
+			},
+		]);
+
+		// With allow_stale=0 and stale_days=30 on 2026-11-28, checkpoint is 2026-10-29:
+		// ERPNext setup/utils.py:87 requires strict date > checkpoint_date -> both 2026-10-29 and 2025-01-15 are rejected.
+		const rejected = await currencyRateRepository.findLatestOnOrBefore({
+			profileName: "POS-1",
+			company: "Test Co",
+			fromCurrency: "USD",
+			toCurrency: "UGX",
+			date: "2026-11-28",
+			purpose: "for_buying",
+			allowStale: 0,
+			staleDays: 30,
+		});
+		expect(rejected).toBeNull();
+
+		// A rate dated 2026-10-30 (> 2026-10-29) IS accepted.
+		await currencyRateRepository.upsertMany([
+			{
+				name: "FX-FRESH",
+				profile_name: "POS-1",
+				company: "Test Co",
+				from_currency: "USD",
+				to_currency: "UGX",
+				exchange_rate: 4050,
+				date: "2026-10-30",
+				for_buying: 1,
+				for_selling: 0,
+			},
+		]);
+		const accepted = await currencyRateRepository.findLatestOnOrBefore({
+			profileName: "POS-1",
+			company: "Test Co",
+			fromCurrency: "USD",
+			toCurrency: "UGX",
+			date: "2026-11-28",
+			purpose: "for_buying",
+			allowStale: 0,
+			staleDays: 30,
+		});
+		expect(accepted?.name).toBe("FX-FRESH");
+		expect(accepted?.exchange_rate).toBe(4050);
+
+		// With allow_stale=1, stale rates remain eligible.
+		const permissive = await currencyRateRepository.findLatestOnOrBefore({
+			profileName: "POS-1",
+			company: "Test Co",
+			fromCurrency: "USD",
+			toCurrency: "UGX",
+			date: "2026-10-29",
+			purpose: "for_buying",
+			allowStale: 1,
+			staleDays: 30,
+		});
+		expect(permissive?.name).toBe("FX-STALE-BOUNDARY");
+	});
+
+	it("strictly requires matching purpose flags for explicit purpose lookups and rejects legacy unqualified rows", async () => {
+		await currencyRateRepository.upsertMany([
+			{
+				name: "FX-BUY-VERIFIED",
+				profile_name: "POS-1",
+				company: "Test Co",
+				from_currency: "USD",
+				to_currency: "UGX",
+				exchange_rate: 4050,
+				date: "2026-05-10",
+				for_buying: 1,
+				for_selling: 0,
+			},
+			{
+				name: "FX-LEGACY-NEWER",
+				profile_name: "POS-1",
+				company: "Test Co",
+				from_currency: "USD",
+				to_currency: "UGX",
+				exchange_rate: 3700,
+				date: "2026-05-15",
+			},
+		]);
+
+		// Newer unqualified legacy row MUST NOT beat verified for_buying=1 row.
+		const buying = await currencyRateRepository.findLatestOnOrBefore({
+			profileName: "POS-1",
+			company: "Test Co",
+			fromCurrency: "USD",
+			toCurrency: "UGX",
+			date: "2026-05-20",
+			purpose: "for_buying",
+		});
+		expect(buying?.name).toBe("FX-BUY-VERIFIED");
+		expect(buying?.exchange_rate).toBe(4050);
+
+		// Explicit for_selling with only a legacy unqualified row + buying-only row MUST fail closed (null).
+		const selling = await currencyRateRepository.findLatestOnOrBefore({
+			profileName: "POS-1",
+			company: "Test Co",
+			fromCurrency: "USD",
+			toCurrency: "UGX",
+			date: "2026-05-20",
+			purpose: "for_selling",
+		});
+		expect(selling).toBeNull();
+
+		// When only unqualified legacy rows exist, explicit for_buying MUST return null,
+		// while unqualified lookup (no purpose) still returns the legacy row.
+		await currencyRateRepository.deleteByNames(["FX-BUY-VERIFIED"]);
+		expect(
+			await currencyRateRepository.findLatestOnOrBefore({
+				profileName: "POS-1",
+				company: "Test Co",
+				fromCurrency: "USD",
+				toCurrency: "UGX",
+				date: "2026-05-20",
+				purpose: "for_buying",
+			}),
+		).toBeNull();
+		expect(
+			(
+				await currencyRateRepository.findLatestOnOrBefore({
+					profileName: "POS-1",
+					company: "Test Co",
+					fromCurrency: "USD",
+					toCurrency: "UGX",
+					date: "2026-05-20",
+				})
+			)?.name,
+		).toBe("FX-LEGACY-NEWER");
+	});
+
+	it("supports ERPNext inverse Currency Exchange fallback with opposite purpose and stale-policy enforcement", async () => {
+		// Only reverse UGX -> USD exists with for_selling=1 (opposite of for_buying).
+		await currencyRateRepository.upsertMany([
+			{
+				name: "FX-REV-SELL",
+				profile_name: "POS-1",
+				company: "Test Co",
+				from_currency: "UGX",
+				to_currency: "USD",
+				exchange_rate: 1 / 4050,
+				date: "2026-11-20",
+				for_buying: 0,
+				for_selling: 1,
+			},
+			{
+				name: "FX-REV-WRONG",
+				profile_name: "POS-1",
+				company: "Test Co",
+				from_currency: "UGX",
+				to_currency: "USD",
+				exchange_rate: 1 / 3700,
+				date: "2026-11-25",
+				for_buying: 1,
+				for_selling: 0,
+			},
+		]);
+
+		const buyingInverse = await currencyRateRepository.findLatestOnOrBefore({
+			profileName: "POS-1",
+			company: "Test Co",
+			fromCurrency: "USD",
+			toCurrency: "UGX",
+			date: "2026-11-28",
+			purpose: "for_buying",
+			allowStale: 0,
+			staleDays: 30,
+		});
+		expect(buyingInverse).not.toBeNull();
+		expect(buyingInverse?.exchange_rate).toBeCloseTo(4050, 2);
+
+		// Stale inverse (Nov 20 on Dec 20 with allowStale=0, staleDays=30 -> boundary 2026-11-20 rejected).
+		const staleInverse = await currencyRateRepository.findLatestOnOrBefore({
+			profileName: "POS-1",
+			company: "Test Co",
+			fromCurrency: "USD",
+			toCurrency: "UGX",
+			date: "2026-12-20",
+			purpose: "for_buying",
+			allowStale: 0,
+			staleDays: 30,
+		});
+		expect(staleInverse).toBeNull();
+	});
 });

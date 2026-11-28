@@ -99,6 +99,7 @@
 						:outstanding-by-currency="outstanding_by_currency"
 						:total-outstanding="total_outstanding_amount"
 						:total-selected="total_selected_invoices"
+						:selected-currency="invoiceTotalCurrency"
 						:selected-count="selected_invoices.length"
 						:loading="invoices_loading"
 						:auto-reconcile-loading="auto_reconcile_loading"
@@ -171,7 +172,7 @@
 						:invoice-total-currency="invoiceTotalCurrency"
 						:payment-total-currency="paymentTotalCurrency"
 						:mpesa-total-currency="mpesaTotalCurrency"
-						:company-currency="companyCurrency"
+						:company-currency="companyCurrencyLocal"
 						:exchange-rate-loading="exchangeRateLoading"
 						:exchange-rate-error="exchangeRateError"
 						:requires-exchange-rate="requiresExchangeRate"
@@ -244,7 +245,10 @@ import { getValidCachedOpeningForCurrentUser } from "../../../utils/openingCache
 
 // Composables
 import { usePosPayData } from "../../../composables/pos/payments/usePosPayData";
-import { usePosPaySelection } from "../../../composables/pos/payments/usePosPaySelection";
+import {
+	resolveInvoiceCurrency,
+	usePosPaySelection,
+} from "../../../composables/pos/payments/usePosPaySelection";
 import { usePosPaySubmission } from "../../../composables/pos/payments/usePosPaySubmission";
 import { usePaymentSharing } from "../../../composables/pos/payments/usePaymentSharing";
 import { resolveExchangeRate } from "../../../services/exchangeRateResolver";
@@ -328,6 +332,7 @@ export default {
 		const referenceDate = ref("");
 		const exchangeRateLoading = ref(false);
 		const exchangeRateError = ref(null);
+		const exchangeRateRequestKey = ref("");
 		const payment_method_currencies = ref({});
 		const payment_method_accounts = ref({});
 		const available_bank_accounts = ref({});
@@ -466,8 +471,17 @@ export default {
 		const invoiceTotalCurrency = computed(() => {
 			if (currency_filter.value && currency_filter.value !== "ALL") return currency_filter.value;
 			if (selected_invoices && selected_invoices.value.length > 0) {
-				const first = selected_invoices.value[0];
-				return first.party_account_currency || first.currency || pos_profile.value.currency;
+				const distinctCurrencies = new Set();
+				selected_invoices.value.forEach((invoice) => {
+					const currency = String(invoice?.currency || pos_profile.value?.currency || "").trim();
+					if (currency) {
+						distinctCurrencies.add(currency);
+					}
+				});
+				if (distinctCurrencies.size === 1) {
+					return Array.from(distinctCurrencies)[0];
+				}
+				return "";
 			}
 			return pos_profile.value.currency;
 		});
@@ -485,19 +499,35 @@ export default {
 		});
 
 		const companyCurrencyLocal = computed(
-			() => companyCurrency.value || pos_profile.value?.currency || "",
+			() =>
+				companyCurrency.value ||
+				pos_profile.value?.company_currency ||
+				selected_invoices.value.find((inv) => inv?.company_currency)?.company_currency ||
+				pos_profile.value?.currency ||
+				"",
+		);
+		const exchangeRatePurpose = computed(() =>
+			paymentEntryType.value === "Pay" || partyType.value === "Supplier"
+				? "for_buying"
+				: "for_selling",
 		);
 		const requiresExchangeRate = computed(
-			() => invoiceTotalCurrency.value !== companyCurrencyLocal.value,
+			() => Boolean(invoiceTotalCurrency.value) && invoiceTotalCurrency.value !== companyCurrencyLocal.value,
 		);
 
 		const total_outstanding_amount = computed(() => {
 			if (!outstanding_invoices.value.length) return 0;
-			return outstanding_invoices.value.reduce(
-				(acc, cur) =>
-					acc + flt(cur?.outstanding_amount_in_invoice_currency ?? cur?.outstanding_amount ?? 0),
-				0,
-			);
+			return outstanding_invoices.value.reduce((acc, cur) => {
+				const conversionUnavailable = Boolean(
+					cur?.outstanding_amount_in_invoice_currency == null &&
+						(cur?.outstanding_conversion_unavailable ||
+							(cur?.party_account_currency &&
+								cur?.currency &&
+								cur.party_account_currency !== cur.currency)),
+				);
+				if (conversionUnavailable) return acc;
+				return acc + flt(cur?.outstanding_amount_in_invoice_currency ?? cur?.outstanding_amount ?? 0);
+			}, 0);
 		});
 
 		const total_unallocated_amount = computed(() => {
@@ -511,7 +541,7 @@ export default {
 		const invoice_currencies = computed(() => {
 			const currencies = new Set();
 			if (pos_profile.value?.currency) currencies.add(pos_profile.value.currency);
-			if (companyCurrency.value) currencies.add(companyCurrency.value);
+			if (companyCurrencyLocal.value) currencies.add(companyCurrencyLocal.value);
 
 			// Add currencies from payment methods
 			if (pos_profile.value?.payments) {
@@ -530,6 +560,16 @@ export default {
 		const outstanding_by_currency = computed(() => {
 			const summary = {};
 			outstanding_invoices.value.forEach((inv) => {
+				const conversionUnavailable = Boolean(
+					inv?.outstanding_amount_in_invoice_currency == null &&
+						(inv?.outstanding_conversion_unavailable ||
+							(inv?.party_account_currency &&
+								inv?.currency &&
+								inv.party_account_currency !== inv.currency)),
+				);
+				if (conversionUnavailable) {
+					return;
+				}
 				const partyCurr = inv.party_account_currency || inv.currency || pos_profile.value.currency;
 				const invoiceCurr = inv.currency || pos_profile.value.currency;
 				const key = `${partyCurr}-${invoiceCurr}`;
@@ -575,7 +615,7 @@ export default {
 			return [...new Set([
 				...(configured.length
 					? configured
-					: [pos_profile.value?.currency, companyCurrency.value]),
+					: [pos_profile.value?.currency, companyCurrencyLocal.value]),
 			].filter(Boolean))];
 		});
 
@@ -675,10 +715,16 @@ export default {
 			partyType,
 			paymentType: paymentEntryType,
 			company,
+			companyCurrency: companyCurrencyLocal,
 			posProfile: pos_profile,
 			posOpeningShift: pos_opening_shift,
 			postingDate,
+			currencyFilter: currency_filter,
 			exchangeRate,
+			requiresExchangeRate,
+			exchangeRateLoading,
+			exchangeRateError,
+			exchangeRateRequestKey,
 			invoiceTotalCurrency,
 			referenceNo,
 			referenceDate,
@@ -718,39 +764,99 @@ export default {
 						fieldname: "default_currency",
 					},
 				});
-				companyCurrency.value = r.message?.default_currency || pos_profile.value?.currency || "";
+				companyCurrency.value =
+					r.message?.default_currency ||
+					pos_profile.value?.company_currency ||
+					null;
 			} catch (e) {
 				console.error("Failed to fetch company currency", e);
-				companyCurrency.value = pos_profile.value?.currency || "";
+				companyCurrency.value =
+					pos_profile.value?.company_currency ||
+					null;
 			}
 		};
 
+		const exchangeRateRequestState = { seq: 0, key: "" };
+
 		const fetchExchangeRate = async () => {
-			if (exchangeRateLoading.value || !requiresExchangeRate.value) {
-				exchangeRate.value = requiresExchangeRate.value ? null : 1;
+			const requestState =
+				typeof exchangeRateRequestState !== "undefined"
+					? exchangeRateRequestState
+					: (exchangeRateLoading._requestState ||= { seq: 0, key: "" });
+			const resolvedKeyRef =
+				typeof exchangeRateRequestKey !== "undefined" ? exchangeRateRequestKey : null;
+			if (!requiresExchangeRate.value) {
+				requestState.seq += 1;
+				requestState.key = "";
+				if (resolvedKeyRef) {
+					resolvedKeyRef.value = "";
+				}
+				exchangeRateLoading.value = false;
+				exchangeRateError.value = null;
+				exchangeRate.value = 1;
 				return;
 			}
-			if (!invoiceTotalCurrency.value || !companyCurrencyLocal.value) {
+			const fromCurrency = invoiceTotalCurrency.value;
+			const toCurrency = companyCurrencyLocal.value;
+			const effectiveDate = postingDate.value || getTodayDate();
+			const purpose = exchangeRatePurpose.value;
+			if (!fromCurrency || !toCurrency) {
+				requestState.seq += 1;
+				requestState.key = "";
+				if (resolvedKeyRef) {
+					resolvedKeyRef.value = "";
+				}
+				exchangeRateLoading.value = false;
 				return;
+			}
+			const requestKey = `${fromCurrency}|${toCurrency}|${purpose}|${effectiveDate}`;
+			if (exchangeRateLoading.value && requestState.key === requestKey) {
+				return;
+			}
+			const requestSeq = ++requestState.seq;
+			requestState.key = requestKey;
+			if (resolvedKeyRef) {
+				resolvedKeyRef.value = "";
 			}
 			exchangeRateLoading.value = true;
 			exchangeRateError.value = null;
+			const isCurrentRequest = () =>
+				requestSeq === requestState.seq &&
+				fromCurrency === invoiceTotalCurrency.value &&
+				toCurrency === companyCurrencyLocal.value &&
+				purpose === exchangeRatePurpose.value &&
+				effectiveDate === (postingDate.value || getTodayDate());
 			try {
 				const result = await resolveExchangeRate({
 					profileName: pos_profile.value?.name,
 					company: company.value,
-					fromCurrency: invoiceTotalCurrency.value,
-					toCurrency: companyCurrencyLocal.value,
-					effectiveDate: postingDate.value || getTodayDate(),
-					purpose: "for_selling",
+					fromCurrency,
+					toCurrency,
+					effectiveDate,
+					purpose,
 				});
+				if (!isCurrentRequest()) {
+					return;
+				}
 				if (!result.found || !result.rate) throw new Error(__("Exchange rate unavailable"));
 				exchangeRate.value = result.rate;
+				if (resolvedKeyRef) {
+					resolvedKeyRef.value = requestKey;
+				}
 			} catch (e) {
+				if (!isCurrentRequest()) {
+					return;
+				}
 				exchangeRateError.value = e.message;
 				exchangeRate.value = null;
+				if (resolvedKeyRef) {
+					resolvedKeyRef.value = "";
+				}
 			} finally {
-				exchangeRateLoading.value = false;
+				if (isCurrentRequest()) {
+					requestState.key = "";
+					exchangeRateLoading.value = false;
+				}
 			}
 		};
 
@@ -769,7 +875,10 @@ export default {
 			}));
 		};
 
+		const paymentMethodRateSeqs = new WeakMap();
+
 		const resolvePaymentMethodRate = async (method) => {
+			if (!method) return;
 			const selectedAccount = (available_bank_accounts.value?.[method.mode_of_payment] || []).find(
 				(account) => account.account === method.bank_account,
 			);
@@ -777,52 +886,178 @@ export default {
 				method.payment_currency ||
 				selectedAccount?.account_currency ||
 				getPaymentMethodCurrency(method.mode_of_payment);
-			if (!paymentCurrency || !invoiceTotalCurrency.value || !companyCurrencyLocal.value) return;
+			const targetInvoiceCurrency = invoiceTotalCurrency.value;
+			const targetCompanyCurrency = companyCurrencyLocal.value;
+			const effectiveDate = postingDate.value || getTodayDate();
+			const purpose = exchangeRatePurpose.value;
+			const requestKey = `${effectiveDate}|${purpose}|${targetInvoiceCurrency}|${paymentCurrency}|${targetCompanyCurrency}`;
+			const seqStore =
+				typeof paymentMethodRateSeqs !== "undefined" ? paymentMethodRateSeqs : null;
+			const nextSeq = ((seqStore ? seqStore.get(method) : method._fxRequestSeq) || 0) + 1;
+			if (seqStore) {
+				seqStore.set(method, nextSeq);
+			} else {
+				method._fxRequestSeq = nextSeq;
+			}
+			if (!paymentCurrency || !targetInvoiceCurrency || !targetCompanyCurrency) {
+				method._rate_loading = false;
+				method._fx_request_key = null;
+				return;
+			}
+			const isCurrentRequest = () => {
+				const latestSeq = seqStore ? seqStore.get(method) : method._fxRequestSeq;
+				const currentAccount = (available_bank_accounts.value?.[method.mode_of_payment] || []).find(
+					(account) => account.account === method.bank_account,
+				);
+				const currentPaymentCurrency =
+					method.payment_currency ||
+					currentAccount?.account_currency ||
+					getPaymentMethodCurrency(method.mode_of_payment);
+				return (
+					nextSeq === latestSeq &&
+					currentPaymentCurrency === paymentCurrency &&
+					targetInvoiceCurrency === invoiceTotalCurrency.value &&
+					targetCompanyCurrency === companyCurrencyLocal.value &&
+					purpose === exchangeRatePurpose.value &&
+					effectiveDate === (postingDate.value || getTodayDate())
+				);
+			};
+			method._rate_loading = true;
+			method._rate_error = false;
+			method._fx_request_key = null;
+			method.rate_date = null;
 			const common = {
 				profileName: pos_profile.value?.name,
 				company: company.value,
 				fromCurrency: paymentCurrency,
-				effectiveDate: postingDate.value || getTodayDate(),
+				effectiveDate,
+				purpose,
 			};
-			const [invoiceResult, companyResult] = await Promise.all([
-				resolveExchangeRate({ ...common, toCurrency: invoiceTotalCurrency.value }),
-				resolveExchangeRate({ ...common, toCurrency: companyCurrencyLocal.value }),
-			]);
-			method.payment_currency = paymentCurrency;
-			method._rate_error = !invoiceResult.found || !companyResult.found;
-			method.invoice_equivalent = invoiceResult.rate
-				? flt(flt(method.amount) * invoiceResult.rate)
-				: 0;
-			method.company_exchange_rate = companyResult.rate || null;
-			method.invoice_exchange_rate = invoiceResult.rate || null;
-			method.rate_date = invoiceResult.rateDate || null;
-			method.rate_source = invoiceResult.source || null;
+			let invoiceResult;
+			let companyResult;
+			try {
+				[invoiceResult, companyResult] = await Promise.all([
+					resolveExchangeRate({ ...common, toCurrency: targetInvoiceCurrency }),
+					resolveExchangeRate({ ...common, toCurrency: targetCompanyCurrency }),
+				]);
+				if (!isCurrentRequest()) {
+					return;
+				}
+				method.payment_currency = paymentCurrency;
+				method._rate_error = !invoiceResult.found || !companyResult.found;
+				method.invoice_equivalent = invoiceResult.rate
+					? flt(flt(method.amount) * invoiceResult.rate)
+					: 0;
+				method.company_exchange_rate = companyResult.rate || null;
+				method.invoice_exchange_rate = invoiceResult.rate || null;
+				method.rate_date = invoiceResult.rateDate || null;
+				method.rate_source = invoiceResult.source || null;
+				method._fx_request_key = method._rate_error ? null : requestKey;
+			} catch {
+				if (!isCurrentRequest()) {
+					return;
+				}
+				method.payment_currency = paymentCurrency;
+				method._rate_error = true;
+				method.invoice_equivalent = 0;
+				method.company_exchange_rate = null;
+				method.invoice_exchange_rate = null;
+				method.rate_date = null;
+				method.rate_source = null;
+				method._fx_request_key = null;
+			} finally {
+				if (isCurrentRequest()) {
+					method._rate_loading = false;
+				}
+			}
 		};
 
 		watch(
-			() => payment_methods.value.map((m) => [m.mode_of_payment, m.amount, m.bank_account, getPaymentMethodCurrency(m.mode_of_payment)]),
+			() => [
+				companyCurrencyLocal.value,
+				invoiceTotalCurrency.value,
+				exchangeRatePurpose.value,
+				postingDate.value,
+				...payment_methods.value.map((m) => [m.mode_of_payment, m.amount, m.bank_account, getPaymentMethodCurrency(m.mode_of_payment)]),
+			],
 			() => payment_methods.value.forEach((method) => void resolvePaymentMethodRate(method)),
 			{ deep: true },
 		);
 
+		const selectedPaymentRateSeqs = new WeakMap();
+
 		const normalizeSelectedPayment = async (row, amountField) => {
+			if (!row) return;
 			const fromCurrency = row.currency || pos_profile.value?.currency;
 			const toCurrency = invoiceTotalCurrency.value;
-			if (!fromCurrency || !toCurrency) return;
-			const result = await resolveExchangeRate({
-				profileName: pos_profile.value?.name,
-				company: company.value,
-				fromCurrency,
-				toCurrency,
-				effectiveDate: postingDate.value || getTodayDate(),
-			});
-			row._rate_error = !result.found;
-			row.invoice_equivalent = result.rate ? flt(row?.[amountField] || 0) * result.rate : 0;
+			const effectiveDate = postingDate.value || getTodayDate();
+			const purpose = exchangeRatePurpose.value;
+			const requestKey = `${effectiveDate}|${purpose}|${toCurrency}|${fromCurrency}`;
+			const seqStore =
+				typeof selectedPaymentRateSeqs !== "undefined" ? selectedPaymentRateSeqs : null;
+			const nextSeq = ((seqStore ? seqStore.get(row) : row._fxRequestSeq) || 0) + 1;
+			if (seqStore) {
+				seqStore.set(row, nextSeq);
+			} else {
+				row._fxRequestSeq = nextSeq;
+			}
+			if (!fromCurrency || !toCurrency) {
+				row._rate_loading = false;
+				row._fx_request_key = null;
+				return;
+			}
+			const isCurrentRequest = () => {
+				const latestSeq = seqStore ? seqStore.get(row) : row._fxRequestSeq;
+				const currentFromCurrency = row.currency || pos_profile.value?.currency;
+				return (
+					nextSeq === latestSeq &&
+					currentFromCurrency === fromCurrency &&
+					toCurrency === invoiceTotalCurrency.value &&
+					purpose === exchangeRatePurpose.value &&
+					effectiveDate === (postingDate.value || getTodayDate())
+				);
+			};
+			row._rate_loading = true;
+			row._rate_error = false;
+			row._fx_request_key = null;
+			row.rate_date = null;
+			let result;
+			try {
+				result = await resolveExchangeRate({
+					profileName: pos_profile.value?.name,
+					company: company.value,
+					fromCurrency,
+					toCurrency,
+					effectiveDate,
+					purpose,
+				});
+				if (!isCurrentRequest()) {
+					return;
+				}
+				row._rate_error = !result.found;
+				row.invoice_equivalent = result.rate ? flt(row?.[amountField] || 0) * result.rate : 0;
+				row.rate_date = result.rateDate || null;
+				row._fx_request_key = row._rate_error ? null : requestKey;
+			} catch {
+				if (!isCurrentRequest()) {
+					return;
+				}
+				row._rate_error = true;
+				row.invoice_equivalent = 0;
+				row.rate_date = null;
+				row._fx_request_key = null;
+			} finally {
+				if (isCurrentRequest()) {
+					row._rate_loading = false;
+				}
+			}
 		};
 
 		watch(
 			() => [
 				invoiceTotalCurrency.value,
+				exchangeRatePurpose.value,
+				postingDate.value,
 				...selected_payments.value.map((row) => `${row.name}:${row.unallocated_amount}:${row.currency}`),
 				...selected_mpesa_payments.value.map((row) => `${row.name}:${row.amount}:${row.currency}`),
 			],
@@ -954,7 +1189,10 @@ export default {
 			pos_profile.value = data.pos_profile;
 			pos_opening_shift.value = data.pos_opening_shift;
 			company.value = data.company?.name || data.pos_profile?.company || "";
-			companyCurrency.value = data.company?.default_currency || data.pos_profile?.currency || null;
+			companyCurrency.value =
+				data.company?.default_currency ||
+				data.pos_profile?.company_currency ||
+				null;
 			uiStore.setRegisterData(data);
 			proxy?.eventBus?.emit("payments_register_pos_profile", data);
 			set_payment_methods();
@@ -1097,13 +1335,32 @@ export default {
 			return get_outstanding_invoices(pos_profile_search.value || null);
 		}
 		function handleInvoiceSelection(item) {
-			toggleInvoiceSelection(item, customer_name, (cust) => {
+			if (
+				!isInvoiceSelected(item) &&
+				currency_filter.value &&
+				currency_filter.value !== "ALL" &&
+				resolveInvoiceCurrency(item, pos_profile.value?.currency) !== currency_filter.value
+			) {
+				toastStore.show({
+					title: __("Selected invoice currency does not match the active currency filter."),
+					color: "error",
+				});
+				return;
+			}
+			const updated = toggleInvoiceSelection(item, customer_name, (cust) => {
 				if (isCustomerPartyType.value) {
 					customersStore.setSelectedCustomer(cust);
 					return;
 				}
 				customer_name.value = cust;
 			});
+			if (updated === false) {
+				toastStore.show({
+					title: __("Select invoices in a single currency per payment."),
+					color: "error",
+				});
+				return;
+			}
 			fetchPartyAccount();
 			loadPaymentMethodCurrencies();
 		}
@@ -1161,7 +1418,6 @@ export default {
 			clearSelections();
 			selected_invoices.value = [matchedInvoice];
 			currency_filter.value =
-				matchedInvoice.party_account_currency ||
 				matchedInvoice.currency ||
 				pos_profile.value.currency ||
 				"ALL";
@@ -1288,9 +1544,28 @@ export default {
 			get_draft_mpesa_payments_register(payment_methods_list.value);
 		});
 
+		watch(
+			currency_filter,
+			(nextFilter) => {
+				const normalizedFilter = String(nextFilter || "").trim();
+				if (!normalizedFilter || normalizedFilter === "ALL") {
+					return;
+				}
+				const fallbackCurrency = pos_profile.value?.currency;
+				const compatibleInvoices = selected_invoices.value.filter(
+					(invoice) => resolveInvoiceCurrency(invoice, fallbackCurrency) === normalizedFilter,
+				);
+				if (compatibleInvoices.length !== selected_invoices.value.length) {
+					selected_invoices.value = compatibleInvoices;
+				}
+			},
+			{ flush: "sync" },
+		);
+
 		watch(invoiceTotalCurrency, fetchExchangeRate, { immediate: true });
-		watch(companyCurrency, fetchExchangeRate, { immediate: true });
+		watch(companyCurrencyLocal, fetchExchangeRate, { immediate: true });
 		watch(postingDate, fetchExchangeRate, { immediate: true });
+		watch(exchangeRatePurpose, fetchExchangeRate, { immediate: true });
 		watch([paymentRouteTarget, outstanding_invoices], () => {
 			applyPaymentRouteTarget();
 		});
@@ -1318,6 +1593,7 @@ export default {
 			autoAllocatePaymentAmount,
 			exchangeRate,
 			companyCurrency,
+			companyCurrencyLocal,
 			referenceNo,
 			referenceDate,
 			exchangeRateLoading,

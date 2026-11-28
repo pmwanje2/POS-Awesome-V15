@@ -1930,6 +1930,277 @@ class TestPosPaymentProcessing(unittest.TestCase):
         self.assertEqual(reconcile_row["dr_or_cr"], "debit_in_account_currency")
         self.assertEqual(reconcile_row["against_voucher_type"], "Purchase Invoice")
 
+    def test_payment_currency_normalization_uses_for_selling_and_matches_three_currency_parity(self):
+        class Row(dict):
+            __getattr__ = dict.get
+            __setattr__ = dict.__setitem__
+
+            def precision(self, _fieldname):
+                return 2
+
+        captured_purposes = []
+
+        def fake_get_latest_rate(from_currency, to_currency, **kwargs):
+            purpose = kwargs.get("purpose")
+            captured_purposes.append((from_currency, to_currency, purpose))
+            if (from_currency, to_currency) == ("USD", "UGX"):
+                # Newer buying-only rate is 4050; selling rate is 3700.
+                return (3700.0, "2026-11-27") if purpose == "for_selling" else (4050.0, "2026-11-28")
+            if (from_currency, to_currency) == ("EUR", "USD"):
+                return (1.1, "2026-11-28") if purpose == "for_selling" else (1.25, "2026-11-28")
+            if (from_currency, to_currency) == ("EUR", "UGX"):
+                return (4200.0, "2026-11-28") if purpose == "for_selling" else (4500.0, "2026-11-28")
+            return (1.0, "2026-11-28")
+
+        fake_invoice_utils = types.ModuleType("posawesome.posawesome.api.invoice_processing.utils")
+        fake_invoice_utils.get_latest_rate = fake_get_latest_rate
+
+        profile = Row(
+            name="POS-UGX-MC",
+            posa_enable_multi_currency_payments=1,
+            posa_enable_multi_currency_change=1,
+            posa_allow_manual_payment_exchange_rate=0,
+            posa_allowed_currencies=[
+                Row(currency="UGX", allow_for_payments=1, allow_for_change=1),
+                Row(currency="USD", allow_for_payments=1, allow_for_change=1),
+                Row(currency="EUR", allow_for_payments=1, allow_for_change=1),
+            ],
+        )
+
+        with (
+            patch.dict(
+                sys.modules,
+                {"posawesome.posawesome.api.invoice_processing.utils": fake_invoice_utils},
+            ),
+            patch.object(self.creation.frappe, "get_cached_doc", return_value=profile),
+            patch.object(
+                self.creation.frappe,
+                "get_cached_value",
+                side_effect=lambda doctype, _name, _field: "UGX" if doctype in {"Company", "Account"} else None,
+            ),
+            patch.object(
+                self.creation.frappe,
+                "format_value",
+                side_effect=lambda value, *_args: str(value),
+                create=True,
+            ),
+        ):
+            sys.modules.pop("posawesome.posawesome.api.payment_currency", None)
+            from posawesome.posawesome.api.payment_currency import (
+                normalize_change_returns,
+                normalize_invoice_payment_currencies,
+            )
+
+            # Case 1 (P1-3): USD 10 tender + USD 1 change on UGX invoice must use for_selling (3,700), not newer buying-only (4,050).
+            ugx_invoice = Row(
+                company="Uganda Co",
+                currency="UGX",
+                conversion_rate=1.0,
+                posting_date="2026-11-28",
+                pos_profile=profile.name,
+                rounded_total=33300.0,
+                grand_total=33300.0,
+                payments=[
+                    Row(
+                        type="Cash",
+                        account="Cash - UG",
+                        posa_payment_currency="USD",
+                        posa_original_amount=10.0,
+                        amount=0.0,
+                        base_amount=0.0,
+                    )
+                ],
+                posa_change_returns=[
+                    Row(
+                        currency="USD",
+                        original_amount=1.0,
+                    )
+                ],
+            )
+            normalize_invoice_payment_currencies(ugx_invoice, profile_doc=profile)
+            normalize_change_returns(ugx_invoice, profile_doc=profile)
+
+            self.assertEqual(ugx_invoice.payments[0].amount, 37000.0)
+            self.assertEqual(ugx_invoice.payments[0].base_amount, 37000.0)
+            self.assertEqual(ugx_invoice.posa_change_returns[0].invoice_amount, 3700.0)
+            self.assertEqual(ugx_invoice.posa_change_returns[0].base_amount, 3700.0)
+
+            # Case 2 (P1-4): Three-currency EUR 10 tender on USD invoice (conversion_rate=3700) in UGX company.
+            usd_invoice = Row(
+                company="Uganda Co",
+                currency="USD",
+                conversion_rate=3700.0,
+                posting_date="2026-11-28",
+                pos_profile=profile.name,
+                rounded_total=11.0,
+                grand_total=11.0,
+                payments=[
+                    Row(
+                        type="Cash",
+                        account="Cash - UG",
+                        posa_payment_currency="EUR",
+                        posa_original_amount=10.0,
+                        amount=0.0,
+                        base_amount=0.0,
+                    )
+                ],
+            )
+            normalize_invoice_payment_currencies(usd_invoice, profile_doc=profile)
+            self.assertAlmostEqual(usd_invoice.payments[0].amount, 11.0, places=6)
+            self.assertAlmostEqual(usd_invoice.payments[0].base_amount, 40700.0, places=6)
+            self.assertAlmostEqual(usd_invoice.payments[0].posa_company_exchange_rate, 4070.0, places=6)
+
+        self.assertTrue(captured_purposes)
+        for _from_c, _to_c, purpose in captured_purposes:
+            self.assertEqual(purpose, "for_selling")
+
+    @patch("posawesome.posawesome.api.payment_processing.data.get_exchange_rate")
+    @patch("posawesome.posawesome.api.payment_processing.data.frappe")
+    def test_get_outstanding_invoices_multiplies_third_currency_forward_rate(
+        self,
+        mock_frappe,
+        mock_get_exchange_rate,
+    ):
+        mock_frappe._dict.side_effect = lambda value: AttrDict(value)
+        mock_frappe.get_precision.return_value = 2
+
+        def fake_get_cached_value(doctype, name, fieldname):
+            if doctype == "Company" and fieldname == "default_currency":
+                return "UGX"
+            if doctype == "Customer" and fieldname == "customer_name":
+                return "Euro Debtor"
+            return None
+
+        mock_frappe.get_cached_value.side_effect = fake_get_cached_value
+        mock_frappe.get_list.return_value = [
+            AttrDict(
+                {
+                    "name": "SINV-3CCY-0001",
+                    "posting_date": "2026-11-28",
+                    "due_date": "2026-12-05",
+                    "outstanding_amount": 10.0,
+                    "conversion_rate": 3700.0,
+                    "rounded_total": 11.0,
+                    "grand_total": 11.0,
+                    "currency": "USD",
+                    "party_account_currency": "EUR",
+                    "pos_profile": "POS-USD",
+                    "customer_name": "Euro Debtor",
+                }
+            )
+        ]
+        # Forward rate: 1 EUR = 1.1 USD -> EUR 10 outstanding = USD 11.00 (not 10 / 1.1 = 9.09).
+        mock_get_exchange_rate.return_value = 1.1
+
+        rows = self.data.get_outstanding_invoices(
+            customer="CUST-EUR",
+            company="Uganda Co",
+            currency="USD",
+            pos_profile="POS-USD",
+            include_all_currencies=True,
+        )
+
+        self.assertEqual(len(rows), 1)
+        mock_get_exchange_rate.assert_called_once_with("EUR", "USD", "2026-11-28", "for_selling")
+        self.assertAlmostEqual(rows[0]["outstanding_amount_in_invoice_currency"], 11.0, places=2)
+
+    @patch("posawesome.posawesome.api.payment_processing.data.frappe")
+    def test_get_outstanding_invoices_returns_company_currency_on_each_row(
+        self,
+        mock_frappe,
+    ):
+        mock_frappe._dict.side_effect = lambda value: AttrDict(value)
+        mock_frappe.get_precision.return_value = 2
+
+        def fake_get_cached_value(doctype, name, fieldname):
+            if doctype == "Company" and fieldname == "default_currency":
+                return "UGX"
+            if doctype == "Customer" and fieldname == "customer_name":
+                return "USD Customer"
+            return None
+
+        mock_frappe.get_cached_value.side_effect = fake_get_cached_value
+        mock_frappe.get_list.return_value = [
+            AttrDict(
+                {
+                    "name": "SINV-USD-CO-UGX",
+                    "posting_date": "2026-11-28",
+                    "due_date": "2026-12-05",
+                    "outstanding_amount": 10.0,
+                    "conversion_rate": 3700.0,
+                    "rounded_total": 10.0,
+                    "grand_total": 10.0,
+                    "currency": "USD",
+                    "party_account_currency": "USD",
+                    "pos_profile": "POS-USD",
+                    "customer_name": "USD Customer",
+                }
+            )
+        ]
+
+        rows = self.data.get_outstanding_invoices(
+            customer="CUST-USD",
+            company="Uganda Co",
+            currency="USD",
+            pos_profile="POS-USD",
+            include_all_currencies=False,
+        )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].get("company_currency"), "UGX")
+
+    @patch("posawesome.posawesome.api.payment_processing.data.get_exchange_rate")
+    @patch("posawesome.posawesome.api.payment_processing.data.frappe")
+    def test_get_outstanding_invoices_refuses_unrelated_conversion_rate_on_missing_third_currency_quote(
+        self,
+        mock_frappe,
+        mock_get_exchange_rate,
+    ):
+        mock_frappe._dict.side_effect = lambda value: AttrDict(value)
+        mock_frappe.get_precision.return_value = 2
+
+        def fake_get_cached_value(doctype, name, fieldname):
+            if doctype == "Company" and fieldname == "default_currency":
+                return "UGX"
+            if doctype == "Customer" and fieldname == "customer_name":
+                return "Euro Debtor"
+            return None
+
+        mock_frappe.get_cached_value.side_effect = fake_get_cached_value
+        mock_frappe.get_list.return_value = [
+            AttrDict(
+                {
+                    "name": "SINV-3CCY-NOQUOTE",
+                    "posting_date": "2026-11-28",
+                    "due_date": "2026-12-05",
+                    "outstanding_amount": 10.0,
+                    "conversion_rate": 3700.0,
+                    "rounded_total": 11.0,
+                    "grand_total": 11.0,
+                    "currency": "USD",
+                    "party_account_currency": "EUR",
+                    "pos_profile": "POS-USD",
+                    "customer_name": "Euro Debtor",
+                }
+            )
+        ]
+        # Missing EUR->USD selling quote must NOT divide 10 by unrelated USD->UGX rate 3700.
+        mock_get_exchange_rate.return_value = 0
+
+        rows = self.data.get_outstanding_invoices(
+            customer="CUST-EUR",
+            company="Uganda Co",
+            currency="USD",
+            pos_profile="POS-USD",
+            include_all_currencies=True,
+        )
+
+        self.assertEqual(len(rows), 1)
+        self.assertIsNone(rows[0].get("outstanding_amount_in_invoice_currency"))
+        self.assertTrue(rows[0].get("outstanding_conversion_unavailable"))
+        self.assertEqual(rows[0].get("outstanding_amount"), 10.0)
+        self.assertEqual(rows[0].get("party_account_currency"), "EUR")
+
 
 if __name__ == "__main__":
     unittest.main()

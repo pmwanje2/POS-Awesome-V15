@@ -1844,8 +1844,218 @@ def _save_draft_with_latest_timestamp(invoice_doc, retries=2):
 
 
 def _apply_tax_contract_before_save(invoice_doc):
-    _merge_duplicate_taxes(invoice_doc)
-    apply_pos_tax_inclusion_contract(invoice_doc)
+    _merge_duplicate_taxes(invoice_doc, recalculate=False)
+    apply_pos_tax_inclusion_contract(invoice_doc, recalculate=False)
+    calculate = getattr(invoice_doc, "calculate_taxes_and_totals", None)
+    if callable(calculate):
+        calculate()
+
+
+def _row_field_precision(row, invoice_doc, fieldname):
+    precision_fn = getattr(row, "precision", None)
+    if callable(precision_fn):
+        return precision_fn(fieldname)
+    doc_precision_fn = getattr(invoice_doc, "precision", None)
+    if callable(doc_precision_fn):
+        try:
+            return doc_precision_fn(fieldname, row)
+        except TypeError:
+            return doc_precision_fn(fieldname)
+    return 2
+
+
+def _item_get(item, fieldname):
+    if isinstance(item, dict):
+        return item.get(fieldname)
+    if hasattr(item, "get"):
+        return item.get(fieldname)
+    return getattr(item, fieldname, None)
+
+
+def _item_set(item, fieldname, value):
+    if isinstance(item, dict):
+        item[fieldname] = value
+    elif hasattr(item, "set"):
+        item.set(fieldname, value)
+    else:
+        setattr(item, fieldname, value)
+
+
+def _apply_authoritative_currency_rates(
+    invoice_doc,
+    payload=None,
+    currency_cache=None,
+    update_base_in_words=False,
+):
+    """Resolve authoritative server exchange rates and sync company-currency amounts."""
+
+    payload = payload if isinstance(payload, dict) else {}
+    company = invoice_doc.get("company")
+    company_currency = (
+        frappe.get_cached_value("Company", company, "default_currency") if company else None
+    )
+    selected_currency = payload.get("currency") or invoice_doc.get("currency")
+    if selected_currency:
+        invoice_doc.currency = selected_currency
+    invoice_currency = invoice_doc.get("currency") or company_currency
+    company_currency = company_currency or invoice_currency
+
+    selling_price_list = invoice_doc.get("selling_price_list") or payload.get("selling_price_list")
+    db_price_list_currency = (
+        frappe.db.get_value("Price List", selling_price_list, "currency")
+        if selling_price_list
+        else None
+    )
+    if not isinstance(db_price_list_currency, str) or not db_price_list_currency.strip():
+        db_price_list_currency = None
+    price_list_currency = (
+        db_price_list_currency
+        or payload.get("price_list_currency")
+        or invoice_doc.get("price_list_currency")
+        or company_currency
+    )
+
+    rates = resolve_erpnext_currency_rates(
+        invoice_currency,
+        price_list_currency,
+        company_currency,
+        invoice_doc.get("posting_date"),
+        cache=currency_cache,
+    )
+    conversion_rate = rates["conversion_rate"]
+    plc_conversion_rate = rates["plc_conversion_rate"]
+    exchange_rate_date = rates["exchange_rate_date"]
+
+    if (
+        invoice_currency
+        and company_currency
+        and invoice_currency != company_currency
+        and not conversion_rate
+    ):
+        frappe.throw(
+            _(
+                "Unable to find exchange rate for {0} to {1}. Please create a Currency Exchange record manually"
+            ).format(invoice_currency, company_currency)
+        )
+    if (
+        price_list_currency
+        and company_currency
+        and price_list_currency != company_currency
+        and not plc_conversion_rate
+    ):
+        frappe.throw(
+            _(
+                "Unable to find exchange rate for {0} to {1}. Please create a Currency Exchange record manually"
+            ).format(price_list_currency, company_currency)
+        )
+
+    conversion_rate = flt(conversion_rate) or 1.0
+    plc_conversion_rate = flt(plc_conversion_rate) or 1.0
+    invoice_doc.conversion_rate = conversion_rate
+    invoice_doc.plc_conversion_rate = plc_conversion_rate
+    invoice_doc.price_list_currency = price_list_currency
+
+    for item in invoice_doc.get("items") or []:
+        price_list_rate = _item_get(item, "price_list_rate")
+        if price_list_rate:
+            _item_set(
+                item,
+                "base_price_list_rate",
+                flt(
+                    flt(price_list_rate) * conversion_rate,
+                    _row_field_precision(item, invoice_doc, "base_price_list_rate"),
+                ),
+            )
+        rate = _item_get(item, "rate")
+        if rate:
+            _item_set(
+                item,
+                "base_rate",
+                flt(
+                    flt(rate) * conversion_rate,
+                    _row_field_precision(item, invoice_doc, "base_rate"),
+                ),
+            )
+        amount = _item_get(item, "amount")
+        if amount:
+            _item_set(
+                item,
+                "base_amount",
+                flt(
+                    flt(amount) * conversion_rate,
+                    _row_field_precision(item, invoice_doc, "base_amount"),
+                ),
+            )
+        net_rate = _item_get(item, "net_rate")
+        if net_rate not in (None, ""):
+            _item_set(
+                item,
+                "base_net_rate",
+                flt(
+                    flt(net_rate) * conversion_rate,
+                    _row_field_precision(item, invoice_doc, "base_net_rate"),
+                ),
+            )
+        elif _item_get(item, "base_net_rate") not in (None, ""):
+            _item_set(item, "base_net_rate", None)
+        net_amount = _item_get(item, "net_amount")
+        if net_amount not in (None, ""):
+            _item_set(
+                item,
+                "base_net_amount",
+                flt(
+                    flt(net_amount) * conversion_rate,
+                    _row_field_precision(item, invoice_doc, "base_net_amount"),
+                ),
+            )
+        elif _item_get(item, "base_net_amount") not in (None, ""):
+            _item_set(item, "base_net_amount", None)
+        discount_amount = _item_get(item, "discount_amount")
+        if discount_amount:
+            _item_set(
+                item,
+                "base_discount_amount",
+                flt(
+                    flt(discount_amount) * conversion_rate,
+                    _row_field_precision(item, invoice_doc, "base_discount_amount"),
+                ),
+            )
+
+    if invoice_doc.get("total") is not None:
+        invoice_doc.base_total = flt(
+            flt(invoice_doc.get("total")) * conversion_rate,
+            invoice_doc.precision("base_total"),
+        )
+    if invoice_doc.get("net_total") is not None:
+        invoice_doc.base_net_total = flt(
+            flt(invoice_doc.get("net_total")) * conversion_rate,
+            invoice_doc.precision("base_net_total"),
+        )
+    if invoice_doc.get("grand_total") is not None:
+        invoice_doc.base_grand_total = flt(
+            flt(invoice_doc.get("grand_total")) * conversion_rate,
+            invoice_doc.precision("base_grand_total"),
+        )
+    if invoice_doc.get("rounded_total") is not None:
+        invoice_doc.base_rounded_total = flt(
+            flt(invoice_doc.get("rounded_total")) * conversion_rate,
+            invoice_doc.precision("base_rounded_total"),
+        )
+    if invoice_doc.get("discount_amount") is not None:
+        invoice_doc.base_discount_amount = flt(
+            flt(invoice_doc.get("discount_amount")) * conversion_rate,
+            invoice_doc.precision("base_discount_amount"),
+        )
+    if update_base_in_words and invoice_doc.get("base_rounded_total") is not None:
+        invoice_doc.base_in_words = money_in_words(invoice_doc.base_rounded_total, company_currency)
+
+    return {
+        "conversion_rate": conversion_rate,
+        "plc_conversion_rate": plc_conversion_rate,
+        "price_list_currency": price_list_currency,
+        "exchange_rate_date": exchange_rate_date,
+        "company_currency": company_currency,
+    }
 
 
 def _resolve_payment_amounts(payment, conversion_rate=1):
@@ -2172,67 +2382,58 @@ def update_invoice(data):
     # Reapply any custom item names after defaults are set
     _apply_item_name_overrides(invoice_doc, overrides)
 
-    _apply_tax_contract_before_save(invoice_doc)
+    rate_info = _apply_authoritative_currency_rates(
+        invoice_doc,
+        payload={
+            "currency": selected_currency,
+            "price_list_currency": price_list_currency,
+            "selling_price_list": invoice_doc.get("selling_price_list"),
+        },
+        currency_cache=currency_cache,
+        update_base_in_words=True,
+    )
+    conversion_rate = rate_info["conversion_rate"]
+    plc_conversion_rate = rate_info["plc_conversion_rate"]
+    exchange_rate_date = rate_info["exchange_rate_date"]
 
     if locked_items:
         for item in invoice_doc.items:
             locked = locked_items.get(item.idx)
             if locked:
                 item.update(locked)
-        invoice_doc.calculate_taxes_and_totals()
 
-    company_currency = (
-        frappe.get_cached_value("Company", invoice_doc.company, "default_currency") or invoice_doc.currency
-    )
+    _apply_tax_contract_before_save(invoice_doc)
 
-    # Ensure selected currency is preserved after set_missing_values
-    if selected_currency:
-        invoice_doc.currency = selected_currency
-    price_list_currency = price_list_currency or company_currency
-
-    rates = resolve_erpnext_currency_rates(
-        invoice_doc.currency,
-        price_list_currency,
-        company_currency,
-        invoice_doc.posting_date,
-        cache=currency_cache,
-    )
-    conversion_rate = rates["conversion_rate"]
-    plc_conversion_rate = rates["plc_conversion_rate"]
-    exchange_rate_date = rates["exchange_rate_date"]
-
-    if invoice_doc.currency != company_currency and not conversion_rate:
-        frappe.throw(
-            _(
-                "Unable to find exchange rate for {0} to {1}. Please create a Currency Exchange record manually"
-            ).format(invoice_doc.currency, company_currency)
+    if invoice_doc.get("total") is not None:
+        invoice_doc.base_total = flt(
+            flt(invoice_doc.get("total")) * conversion_rate,
+            invoice_doc.precision("base_total"),
         )
-    if price_list_currency != company_currency and not plc_conversion_rate:
-        frappe.throw(
-            _(
-                "Unable to find exchange rate for {0} to {1}. Please create a Currency Exchange record manually"
-            ).format(price_list_currency, company_currency)
+    if invoice_doc.get("net_total") is not None:
+        invoice_doc.base_net_total = flt(
+            flt(invoice_doc.get("net_total")) * conversion_rate,
+            invoice_doc.precision("base_net_total"),
         )
-
-    invoice_doc.conversion_rate = conversion_rate
-    invoice_doc.plc_conversion_rate = plc_conversion_rate
-    invoice_doc.price_list_currency = price_list_currency
-
-    for item in invoice_doc.items:
-        if item.price_list_rate:
-            item.base_price_list_rate = flt(
-                item.price_list_rate * conversion_rate,
-                item.precision("base_price_list_rate"),
-            )
-        if item.rate:
-            item.base_rate = flt(item.rate * conversion_rate, item.precision("base_rate"))
-        if item.amount:
-            item.base_amount = flt(item.amount * conversion_rate, item.precision("base_amount"))
-        if item.discount_amount:
-            item.base_discount_amount = flt(
-                item.discount_amount * conversion_rate,
-                item.precision("base_discount_amount"),
-            )
+    if invoice_doc.get("grand_total") is not None:
+        invoice_doc.base_grand_total = flt(
+            flt(invoice_doc.get("grand_total")) * conversion_rate,
+            invoice_doc.precision("base_grand_total"),
+        )
+    if invoice_doc.get("rounded_total") is not None:
+        invoice_doc.base_rounded_total = flt(
+            flt(invoice_doc.get("rounded_total")) * conversion_rate,
+            invoice_doc.precision("base_rounded_total"),
+        )
+    if invoice_doc.get("discount_amount") is not None:
+        invoice_doc.base_discount_amount = flt(
+            flt(invoice_doc.get("discount_amount")) * conversion_rate,
+            invoice_doc.precision("base_discount_amount"),
+        )
+    if invoice_doc.get("base_rounded_total") is not None:
+        invoice_doc.base_in_words = money_in_words(
+            invoice_doc.base_rounded_total,
+            rate_info["company_currency"],
+        )
 
     for payment in invoice_doc.payments:
         payment.amount, payment.base_amount = _resolve_payment_amounts(payment, conversion_rate)
@@ -2243,25 +2444,6 @@ def update_invoice(data):
         rate_cache=currency_cache,
     )
     normalize_change_returns(invoice_doc, profile_doc=profile_doc, rate_cache=currency_cache)
-
-    invoice_doc.base_total = flt(flt(invoice_doc.total) * conversion_rate, invoice_doc.precision("base_total"))
-    invoice_doc.base_net_total = flt(
-        flt(invoice_doc.net_total) * conversion_rate,
-        invoice_doc.precision("base_net_total"),
-    )
-    invoice_doc.base_grand_total = flt(
-        flt(invoice_doc.grand_total) * conversion_rate,
-        invoice_doc.precision("base_grand_total"),
-    )
-    invoice_doc.base_rounded_total = flt(
-        flt(invoice_doc.rounded_total) * conversion_rate,
-        invoice_doc.precision("base_rounded_total"),
-    )
-    invoice_doc.base_discount_amount = flt(
-        flt(invoice_doc.discount_amount) * conversion_rate,
-        invoice_doc.precision("base_discount_amount"),
-    )
-    invoice_doc.base_in_words = money_in_words(invoice_doc.base_rounded_total, company_currency)
 
     data["conversion_rate"] = conversion_rate
     data["plc_conversion_rate"] = plc_conversion_rate
@@ -2583,6 +2765,7 @@ def _submit_invoice_once(invoice, data, submit_in_background=False):
         )
         invoice = _sanitize_stale_child_row_names(invoice_doc, invoice)
         invoice_doc.update(invoice)
+        _apply_authoritative_currency_rates(invoice_doc, payload=invoice)
 
     _validate_effective_return_reference(invoice_doc, doctype, company)
     set_invoice_client_request_id(invoice_doc, client_request_id)
@@ -2688,6 +2871,8 @@ def _submit_invoice_once(invoice, data, submit_in_background=False):
     invoice_doc.flags.ignore_permissions = True
     frappe.flags.ignore_account_permission = True
     invoice_doc.posa_is_printed = 1
+    if getattr(invoice_doc, "flags", None) is not None:
+        invoice_doc.flags.posa_item_sale_controls_validated = False
     invoice_doc = _run_without_return_outstanding_prompts(
         invoice_doc,
         lambda: _save_draft_with_latest_timestamp(invoice_doc),
@@ -2902,6 +3087,11 @@ def submit_in_background_job(kwargs):
         invoice_doc.flags.ignore_permissions = True
         frappe.flags.ignore_account_permission = True
 
+        # Re-establish authoritative currency rates and tax inclusion before floor validation.
+        if invoice_doc.get("currency"):
+            _apply_authoritative_currency_rates(invoice_doc)
+        _apply_tax_contract_before_save(invoice_doc)
+
         # Re-run validations that may be impacted while queued (stock, credit limits)
         _validate_stock_on_invoice(invoice_doc)
         validate_invoice_item_sale_controls(invoice_doc)
@@ -2910,8 +3100,6 @@ def submit_in_background_job(kwargs):
 
         invoice_doc.remarks = _build_invoice_remarks(invoice_doc)
 
-        _apply_tax_contract_before_save(invoice_doc)
-
         _apply_write_off_settings(invoice_doc, data)
 
         _apply_loyalty_redemption_settings(invoice_doc, invoice_doc.pos_profile)
@@ -2919,6 +3107,8 @@ def submit_in_background_job(kwargs):
         _apply_invoice_gift_card_settlement(invoice_doc, data)
         _normalize_return_payment_rows(invoice_doc, invoice_doc.get("conversion_rate") or 1)
 
+        if getattr(invoice_doc, "flags", None) is not None:
+            invoice_doc.flags.posa_item_sale_controls_validated = False
         invoice_doc = _save_draft_with_latest_timestamp(invoice_doc)
         _normalize_return_payment_rows(invoice_doc, invoice_doc.get("conversion_rate") or 1)
 

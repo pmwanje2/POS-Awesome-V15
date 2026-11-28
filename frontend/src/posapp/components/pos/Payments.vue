@@ -587,6 +587,8 @@ const displayCurrency = computed(() => (invoice_doc.value ? invoice_doc.value.cu
 const companyCurrency = computed(
 	() =>
 		uiStore.companyDoc?.default_currency ||
+		pos_profile.value?.company_currency ||
+		invoice_doc.value?.company_currency ||
 		pos_profile.value?.currency ||
 		invoice_doc.value?.currency ||
 		"",
@@ -756,6 +758,7 @@ const {
 } = usePaymentCurrencies({
 	invoiceDoc: computed(() => invoiceStore.invoiceDoc),
 	posProfile: pos_profile,
+	companyCurrency,
 	currencyPrecision: currency_precision,
 	formatFloat: (value, precision) => flt(value, precision),
 });

@@ -2,7 +2,7 @@ import {
 	getSyncResourceDefinitions,
 	getSyncResourcesForTrigger,
 } from "./resourceRegistry";
-import { setSyncResourceState } from "./syncState";
+import * as syncStateModule from "./syncState";
 import type {
 	SyncLifecycleState,
 	SyncResourceDefinition,
@@ -372,8 +372,41 @@ export class SyncCoordinator {
 		try {
 			const runResult = await this.runResource(resource, trigger);
 			const resolvedStatus = runResult?.status || "fresh";
+			let persistedMeta: Partial<SyncResourceState> = {};
+			if (runResult?.syncedCurrencyPairs === undefined) {
+				try {
+					const getState = (syncStateModule as any)
+						?.getSyncResourceState;
+					if (typeof getState === "function") {
+						const persisted = await getState(resource.id);
+						if (persisted?.syncedCurrencyPairs !== undefined) {
+							persistedMeta.syncedCurrencyPairs =
+								persisted.syncedCurrencyPairs;
+						}
+						if (
+							runResult?.scopeSignature === undefined &&
+							persisted?.scopeSignature !== undefined
+						) {
+							persistedMeta.scopeSignature =
+								persisted.scopeSignature;
+						}
+					}
+				} catch {
+					persistedMeta = {};
+				}
+			}
+			const definedRunResult = runResult
+				? (Object.fromEntries(
+						Object.entries(runResult).filter(
+							([, value]) => value !== undefined,
+						),
+					) as Partial<SyncResourceState> & {
+						status?: SyncLifecycleState;
+					})
+				: {};
 			const nextState = await this.updateResourceState(resource.id, {
-				...runResult,
+				...persistedMeta,
+				...definedRunResult,
 				status: resolvedStatus,
 				lastSyncedAt:
 					runResult?.lastSyncedAt ||
@@ -442,12 +475,15 @@ export class SyncCoordinator {
 	) {
 		const previousState =
 			this.resourceStates.get(resourceId) || createInitialState(resourceId);
+		const definedPatch = Object.fromEntries(
+			Object.entries(patch).filter(([, value]) => value !== undefined),
+		) as Partial<SyncResourceState> & { status?: SyncLifecycleState };
 		const nextState = {
 			...previousState,
-			...patch,
+			...definedPatch,
 		};
 		this.resourceStates.set(resourceId, nextState);
-		await setSyncResourceState(nextState);
+		await syncStateModule.setSyncResourceState(nextState);
 		this.emitStateChange();
 		return nextState;
 	}

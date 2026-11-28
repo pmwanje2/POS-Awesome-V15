@@ -34,6 +34,14 @@ const itemSelectionSpies = vi.hoisted(() => ({
 	registerContext: vi.fn(),
 }));
 
+const itemDetailFetcherSpies = vi.hoisted(() => ({
+	registerContext: vi.fn(),
+}));
+
+const itemCurrencySpies = vi.hoisted(() => ({
+	applyCurrencyConversionToItem: vi.fn(),
+}));
+
 vi.mock("../src/offline/index", () => ({
 	memoryInitPromise: Promise.resolve(),
 }));
@@ -153,7 +161,7 @@ vi.mock("../src/posapp/composables/pos/items/useItemAvailability", () => ({
 
 vi.mock("../src/posapp/composables/pos/items/useItemDetailFetcher", () => ({
 	useItemDetailFetcher: () => ({
-		registerContext: vi.fn(),
+		registerContext: itemDetailFetcherSpies.registerContext,
 		update_cur_items_details: vi.fn(),
 		update_items_details: vi.fn(async () => {}),
 		cancelItemDetailsRequest: vi.fn(),
@@ -336,7 +344,7 @@ vi.mock("../src/posapp/composables/pos/items/useScanProcessor", () => ({
 
 vi.mock("../src/posapp/composables/pos/items/useItemCurrency", () => ({
 	useItemCurrency: () => ({
-		applyCurrencyConversionToItem: vi.fn(),
+		applyCurrencyConversionToItem: itemCurrencySpies.applyCurrencyConversionToItem,
 	}),
 }));
 
@@ -629,5 +637,64 @@ describe("ItemsSelector stock wiring", () => {
 			false,
 			context,
 		);
+	});
+
+	it("passes true company currency and preserves foreign selling conversion_rate on fixed foreign-currency tills", async () => {
+		const { useUIStore } = await import("../src/posapp/stores/uiStore");
+		const uiStore = useUIStore();
+		uiStore.setRegisterData({
+			pos_profile: {
+				name: "POS-USD-TILL",
+				company: "Uganda Co",
+				currency: "USD",
+				company_currency: "UGX",
+				selling_price_list: "USD Selling",
+			} as any,
+			company: {
+				name: "Uganda Co",
+				default_currency: "UGX",
+			},
+		});
+
+		const ItemsSelector = (await import(
+			"../src/posapp/components/pos/items/ItemsSelector.vue"
+		)).default;
+		const wrapper = shallowMount(ItemsSelector, {
+			global: {
+				provide: {
+					eventBus: { on: vi.fn(), off: vi.fn(), emit: vi.fn() },
+				},
+			},
+		});
+
+		await Promise.resolve();
+		await wrapper.vm.$nextTick();
+
+		const foreignItem = {
+			item_code: "ITEM-USD-TILL",
+			qty: 1,
+			rate: 10.5,
+			price_list_rate: 10.5,
+			currency: "USD",
+			original_currency: "USD",
+			company_currency: "UGX",
+			conversion_rate: 3700,
+			base_buying_rate: 40500,
+		};
+
+		const fetcherCtx = itemDetailFetcherSpies.registerContext.mock.calls.at(-1)?.[0];
+		expect(fetcherCtx?.applyCurrencyConversionToItem).toEqual(expect.any(Function));
+		fetcherCtx.applyCurrencyConversionToItem(foreignItem);
+
+		const conversionArgs =
+			itemCurrencySpies.applyCurrencyConversionToItem.mock.calls.at(-1)?.[1];
+		expect(conversionArgs?.company?.default_currency).toBe("UGX");
+		expect(conversionArgs?.conversion_rate).toBe(3700);
+
+		const selectorContext = itemSelectionSpies.registerContext.mock.calls.at(-1)?.[0];
+		await selectorContext.addItem(foreignItem, { qty: 1 });
+		const addContext = itemAdditionSpies.prepareItemForCart.mock.calls.at(-1)?.[2];
+		expect(addContext?.company?.default_currency).toBe("UGX");
+		expect(addContext?.conversion_rate).toBe(3700);
 	});
 });

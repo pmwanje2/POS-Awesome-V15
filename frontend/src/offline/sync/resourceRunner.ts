@@ -10,7 +10,12 @@ import {
 	syncStockResource,
 } from "./adapters";
 import { syncInvoiceOutboxResource } from "../invoiceOutbox";
-import type { SyncScopedProfile } from "./adapters/common";
+import { db } from "../db";
+import { getCachedPriceListMeta, getOpeningStorage } from "../cache";
+import {
+	buildScopeSignature,
+	type SyncScopedProfile,
+} from "./adapters/common";
 import type {
 	SyncResourceDefinition,
 	SyncResourceId,
@@ -32,10 +37,87 @@ const SUPPORTED_OFFLINE_SYNC_RESOURCE_IDS = new Set<SyncResourceId>([
 
 type SupportedSyncProfile = SyncScopedProfile & {
 	currency?: string | null;
+	company_currency?: string | null;
 	selling_price_list?: string | null;
+	buying_price_list?: string | null;
 	posa_allow_multi_currency?: boolean;
 	payments?: any[];
 };
+
+async function collectCurrencyMatrixPairs(
+	posProfile: SupportedSyncProfile,
+): Promise<Array<{ from_currency: string; to_currency: string }>> {
+	let storedProfile: any = null;
+	try {
+		if (posProfile?.name) {
+			if (!db.isOpen()) {
+				await db.open();
+			}
+			storedProfile = await db.table("pos_profiles").get(posProfile.name);
+		}
+	} catch {
+		storedProfile = null;
+	}
+
+	const openingCompanyCurrency = String(
+		getOpeningStorage()?.company?.default_currency || "",
+	).trim();
+	const companyCurrency = String(
+		posProfile.company_currency ||
+			storedProfile?.company_currency ||
+			openingCompanyCurrency ||
+			"",
+	).trim();
+	if (!companyCurrency) {
+		return [];
+	}
+
+	const foreignCurrencies = new Set<string>();
+	const addCurrency = (value: unknown) => {
+		const normalized = String(value || "").trim();
+		if (normalized && normalized !== companyCurrency) {
+			foreignCurrencies.add(normalized);
+		}
+	};
+
+	addCurrency(posProfile.currency);
+	addCurrency(storedProfile?.currency);
+	const priceListMeta = posProfile?.name
+		? getCachedPriceListMeta(posProfile.name)
+		: null;
+	addCurrency(priceListMeta?.price_list_currency);
+
+	const buyingPriceList = String(
+		posProfile.buying_price_list || storedProfile?.buying_price_list || "",
+	).trim();
+	if (buyingPriceList) {
+		try {
+			const buyingRows = await db
+				.table("item_price_records")
+				.where("price_list")
+				.equals(buyingPriceList)
+				.toArray();
+			for (const row of buyingRows) {
+				addCurrency(row?.currency);
+			}
+		} catch {
+			// Best-effort discovery from local buying price cache.
+		}
+	}
+
+	const pairs: Array<{ from_currency: string; to_currency: string }> = [];
+	for (const foreignCurrency of foreignCurrencies) {
+		pairs.push({
+			from_currency: foreignCurrency,
+			to_currency: companyCurrency,
+		});
+		pairs.push({
+			from_currency: companyCurrency,
+			to_currency: foreignCurrency,
+		});
+	}
+	return pairs;
+}
 
 type CallOfflineSyncMethod = (
 	_method: string,
@@ -107,12 +189,18 @@ async function runSupportedOfflineSyncResourceOnce({
 	callOfflineSyncMethod,
 }: RunSupportedOfflineSyncResourceArgs) {
 	const persistedState = await getPersistedState(resource.id);
+	const currentScopeSignature = buildScopeSignature(posProfile);
+	const scopeChanged = Boolean(
+		persistedState?.scopeSignature &&
+			persistedState.scopeSignature !== currentScopeSignature,
+	);
+	const scopedPersistedState = scopeChanged ? null : persistedState;
 	const sharedArgs = {
 		posProfile,
-		watermark: getPersistedWatermark(persistedState),
+		watermark: getPersistedWatermark(scopedPersistedState),
 		// Resource endpoints evolve independently. Persisted server state is the
 		// protocol authority; a global frontend date cannot represent them all.
-		schemaVersion: persistedState?.schemaVersion || null,
+		schemaVersion: scopedPersistedState?.schemaVersion || null,
 	};
 
 	switch (resource.id) {
@@ -142,12 +230,38 @@ async function runSupportedOfflineSyncResourceOnce({
 						},
 					),
 			});
-		case "currency_matrix":
+		case "currency_matrix": {
+			const discoveredCurrencyPairs =
+				await collectCurrencyMatrixPairs(posProfile);
+			const previousSyncedPairs = new Set(
+				Array.isArray(scopedPersistedState?.syncedCurrencyPairs)
+					? scopedPersistedState.syncedCurrencyPairs.filter(Boolean)
+					: [],
+			);
+			const backfillPairs = sharedArgs.watermark
+				? discoveredCurrencyPairs.filter(
+						(pair) =>
+							!previousSyncedPairs.has(
+								`${pair.from_currency}::${pair.to_currency}`,
+							),
+					)
+				: [];
 			return syncCurrencyMatrixResource({
 				...sharedArgs,
+				...(discoveredCurrencyPairs.length
+					? { currencyPairs: discoveredCurrencyPairs }
+					: {}),
+				...(backfillPairs.length ? { backfillPairs } : {}),
+				...(Array.isArray(scopedPersistedState?.syncedCurrencyPairs)
+					? {
+							syncedCurrencyPairs:
+								scopedPersistedState.syncedCurrencyPairs,
+						}
+					: {}),
 				fetcher: ({
 					posProfile,
 					currencyPairs = [],
+					backfillPairs = [],
 					watermark,
 					offset,
 					schemaVersion,
@@ -158,11 +272,15 @@ async function runSupportedOfflineSyncResourceOnce({
 							pos_profile: posProfile,
 							watermark,
 							currency_pairs: currencyPairs,
+							...(backfillPairs.length
+								? { backfill_pairs: backfillPairs }
+								: {}),
 							offset: offset || 0,
 							schema_version: schemaVersion,
 						},
 					),
 			});
+		}
 		case "payment_method_currencies":
 			return syncPaymentMethodCurrenciesResource({
 				...sharedArgs,

@@ -488,6 +488,20 @@ class ItemLookupData:
     serial_map: Dict[str, List[Dict[str, Any]]]
     bom_map: Dict[str, Dict[str, Any]]
     valuation_map: Dict[str, float] = field(default_factory=dict)
+    buying_price_not_uom_dependent: Optional[bool] = None
+
+
+def _is_price_list_not_uom_dependent(price_list_name: Optional[str]) -> bool:
+    """Return whether ``Price List.price_not_uom_dependent`` is enabled."""
+
+    if not price_list_name:
+        return False
+    val = frappe.db.get_value("Price List", price_list_name, "price_not_uom_dependent")
+    if val is None:
+        get_cached_value = getattr(frappe, "get_cached_value", None)
+        if callable(get_cached_value):
+            val = get_cached_value("Price List", price_list_name, "price_not_uom_dependent")
+    return val in (1, True, "1")
 
 
 def _select_price(
@@ -513,6 +527,33 @@ def _select_price(
     return next(iter(price_rows.values()), frappe._dict())
 
 
+def _select_buying_price(
+    price_rows: Dict[str, frappe._dict],
+    requested_uom: Optional[str],
+    stock_uom: Optional[str],
+) -> tuple[frappe._dict, bool]:
+    """Select a buying price strictly matching the requested, stock, or unspecified UOM.
+
+    Mirrors ERPNext ``get_price_list_rate_for`` (``get_item_details.py:1569``):
+    never leak an unrelated UOM buying price (e.g. a Box price onto an Each row).
+    Returns ``(price_row, matched_exact_requested_uom)``.
+    """
+
+    if not price_rows:
+        return frappe._dict(), False
+
+    if requested_uom and requested_uom in price_rows:
+        return price_rows[requested_uom], True
+
+    if stock_uom and stock_uom in price_rows:
+        return price_rows[stock_uom], not requested_uom or requested_uom == stock_uom
+
+    if "None" in price_rows:
+        return price_rows["None"], not requested_uom or requested_uom == stock_uom
+
+    return frappe._dict(), False
+
+
 def _ensure_stock_uom(uoms: List[Dict[str, Any]], stock_uom: Optional[str]) -> List[Dict[str, Any]]:
     """Make sure the stock UOM is always present in the UOM listing."""
 
@@ -536,12 +577,13 @@ def merge_item_row(
         return dict(item)
 
     meta = lookup_data.meta_map.get(item_code, frappe._dict())
-    uoms = _ensure_stock_uom(lookup_data.uom_map.get(item_code, []), meta.get("stock_uom"))
+    stock_uom = meta.get("stock_uom") or item.get("stock_uom")
+    uoms = _ensure_stock_uom(lookup_data.uom_map.get(item_code, []), stock_uom)
     price_row = _select_price(
-        lookup_data.price_map.get(item_code, {}), item.get("uom"), meta.get("stock_uom")
+        lookup_data.price_map.get(item_code, {}), item.get("uom"), stock_uom
     )
-    buying_price_row = _select_price(
-        lookup_data.buying_price_map.get(item_code, {}), item.get("uom"), meta.get("stock_uom")
+    buying_price_row, buying_exact_uom = _select_buying_price(
+        lookup_data.buying_price_map.get(item_code, {}), item.get("uom"), stock_uom
     )
     price_currency = price_row.get("currency") if price_row else None
 
@@ -553,10 +595,57 @@ def merge_item_row(
     warehouse_valuation = flt((lookup_data.valuation_map or {}).get(item_code) or 0)
     effective_valuation = warehouse_valuation if warehouse_valuation > 0 else meta.get("valuation_rate")
 
+    row_currency = price_currency or price_list_currency
+    buying_currency = buying_price_row.get("currency") if buying_price_row else None
+    buying_price_list_name = buying_price_row.get("price_list") if buying_price_row else None
+    if lookup_data.buying_price_not_uom_dependent is not None:
+        price_not_uom_dependent = bool(lookup_data.buying_price_not_uom_dependent)
+    elif buying_price_row and buying_price_row.get("price_not_uom_dependent") is not None:
+        price_not_uom_dependent = buying_price_row.get("price_not_uom_dependent") in (1, True, "1")
+    else:
+        price_not_uom_dependent = _is_price_list_not_uom_dependent(buying_price_list_name)
+    raw_buying_rate = (
+        flt(buying_price_row.get("price_list_rate"))
+        if buying_price_row and buying_price_row.get("price_list_rate") is not None
+        else None
+    )
+    if (
+        raw_buying_rate is not None
+        and not buying_exact_uom
+        and item.get("uom")
+        and not price_not_uom_dependent
+    ):
+        uom_factor = next(
+            (
+                flt(entry.get("conversion_factor"))
+                for entry in uoms
+                if entry.get("uom") == item.get("uom") and flt(entry.get("conversion_factor")) > 0
+            ),
+            0.0,
+        )
+        raw_buying_rate = raw_buying_rate * uom_factor if uom_factor > 0 else None
+    base_buying_rate = (
+        raw_buying_rate * flt(buying_exchange_rate)
+        if raw_buying_rate is not None and flt(buying_exchange_rate) > 0
+        else None
+    )
+    if raw_buying_rate is None:
+        normalized_buying_rate = None
+        buying_rate_currency = None
+    elif flt(buying_exchange_rate) > 0 and flt(exchange_rate) > 0:
+        normalized_buying_rate = (
+            raw_buying_rate * flt(buying_exchange_rate) / flt(exchange_rate)
+        )
+        buying_rate_currency = row_currency or buying_currency
+    else:
+        normalized_buying_rate = None
+        buying_rate_currency = None
+
     row = dict(item)
     row.update(
         {
             "item_uoms": uoms,
+            "stock_uom": stock_uom,
             "item_barcode": lookup_data.barcode_map.get(item_code, []),
             "actual_qty": actual_qty,
             "has_batch_no": meta.get("has_batch_no"),
@@ -567,16 +656,19 @@ def merge_item_row(
             "valuation_rate": effective_valuation,
             "warehouse_valuation_rate": warehouse_valuation if warehouse_valuation > 0 else None,
             "last_purchase_rate": meta.get("last_purchase_rate"),
-            "trade_price": buying_price_row.get("price_list_rate") if buying_price_row else None,
-            "buying_rate": buying_price_row.get("price_list_rate") if buying_price_row else None,
+            "base_buying_rate": base_buying_rate,
+            "trade_price": normalized_buying_rate,
+            "buying_rate": normalized_buying_rate,
+            "buying_rate_currency": buying_rate_currency,
             "buying_price_list": buying_price_row.get("price_list") if buying_price_row else None,
-            "buying_price_currency": buying_price_row.get("currency") if buying_price_row else None,
+            "buying_price_currency": buying_currency,
+            "buying_exchange_rate": flt(buying_exchange_rate) if flt(buying_exchange_rate) > 0 else None,
             "default_bom": meta.get("default_bom"),
             "batch_no_data": batch_rows,
             "serial_no_data": lookup_data.serial_map.get(item_code, []),
             "rate": price_row.get("price_list_rate") if price_row else 0,
             "price_list_rate": price_row.get("price_list_rate") if price_row else 0,
-            "currency": price_currency or price_list_currency,
+            "currency": row_currency,
             "price_list_currency": price_list_currency,
             "plc_conversion_rate": exchange_rate,
             "conversion_rate": exchange_rate,
@@ -604,11 +696,21 @@ def merge_item_row(
             if flt(buying_exchange_rate) > 0
             else None
         )
+        entry_not_uom_dependent = (
+            price_not_uom_dependent
+            if pr.get("price_list") == buying_price_list_name
+            else (
+                bool(lookup_data.buying_price_not_uom_dependent)
+                if lookup_data.buying_price_not_uom_dependent is not None
+                else _is_price_list_not_uom_dependent(pr.get("price_list"))
+            )
+        )
         buying_prices_by_uom[uom_name] = {
             "price_list_rate": raw_rate,
             "base_price_list_rate": normalized_rate,
             "currency": pr.get("currency"),
             "price_list": pr.get("price_list"),
+            "price_not_uom_dependent": 1 if entry_not_uom_dependent else 0,
         }
     row["_buying_prices_by_uom"] = buying_prices_by_uom
 
@@ -668,27 +770,31 @@ class ItemDetailAggregator:
             or ("Standard Buying" if frappe.db.exists("Price List", "Standard Buying") else None)
         )
 
-    def _compute_exchange_rate(self) -> float:
+    def _compute_exchange_rate(self) -> Optional[float]:
         """Compute the price list to company currency exchange rate."""
 
         company = self.pos_profile.get("company")
-        allow_multi_currency = self.pos_profile.get("posa_allow_multi_currency") or 0
         company_currency = frappe.db.get_value("Company", company, "default_currency") if company else None
         price_list_currency = self.price_list_currency or self.pos_profile.get("currency")
 
+        # Always resolve foreign-to-company selling FX regardless of posa_allow_multi_currency
+        # so fixed foreign-currency POS Profiles never divide company costs by 1.
         if (
             company_currency
             and price_list_currency
             and price_list_currency != company_currency
-            and allow_multi_currency
         ):
             try:
-                return get_exchange_rate(price_list_currency, company_currency, self.today)
+                rate = get_exchange_rate(
+                    price_list_currency, company_currency, self.today, "for_selling"
+                )
+                return rate if flt(rate) > 0 else None
             except Exception:
                 frappe.log_error(
                     f"Missing exchange rate from {price_list_currency} to {company_currency}",
                     "POS Awesome",
                 )
+                return None
         return 1
 
     def _prepare_lookup(self, item_codes: Iterable[str]) -> ItemLookupData:
@@ -721,6 +827,7 @@ class ItemDetailAggregator:
                 )
 
         buying_price_list = self._resolve_buying_price_list()
+        buying_price_not_uom_dependent = _is_price_list_not_uom_dependent(buying_price_list)
         buying_price_currency = self._determine_price_list_currency(buying_price_list)
         company = self.pos_profile.get("company")
         company_currency = (
@@ -729,7 +836,7 @@ class ItemDetailAggregator:
         if buying_price_currency and company_currency and buying_price_currency != company_currency:
             try:
                 self.buying_exchange_rate = get_exchange_rate(
-                    buying_price_currency, company_currency, self.today
+                    buying_price_currency, company_currency, self.today, "for_buying"
                 )
             except Exception:
                 self.buying_exchange_rate = None
@@ -854,6 +961,7 @@ class ItemDetailAggregator:
             serial_map=serial_map,
             bom_map=bom_map,
             valuation_map=valuation_map,
+            buying_price_not_uom_dependent=buying_price_not_uom_dependent,
         )
 
     def build_details(self, items_data: Sequence[Dict[str, object]]) -> List[Dict[str, object]]:

@@ -22,6 +22,7 @@ import {
 	findLossRiskItems,
 	getItemCostFloor,
 	isPricingRuleFreeLine,
+	resolveInvoiceDiscountPercentage,
 	resolveSaleFloorPolicy,
 } from "../../../utils/lossPrevention";
 
@@ -79,6 +80,388 @@ export interface SubmissionCallbacks {
 		waitForPostSubmitPayments?: boolean;
 		waitForInvoiceProcessing?: boolean;
 	}) => void;
+}
+
+const SCALAR_COST_FALLBACK_FIELDS = [
+	"_company_buying_price",
+	"base_buying_rate",
+	"trade_price",
+	"buying_price",
+	"buying_rate",
+	"last_buying_rate",
+	"valuation_rate",
+	"last_purchase_rate",
+	"manufacturing_cost",
+	"_source_buying_price",
+] as const;
+
+const METADATA_FALLBACK_FIELDS = [
+	"currency",
+	"price_list_currency",
+	"company_currency",
+	"conversion_rate",
+	"plc_conversion_rate",
+	"buying_rate_currency",
+	"buying_price_currency",
+	"buying_exchange_rate",
+	"_source_buying_currency",
+	"uom",
+	"stock_uom",
+	"conversion_factor",
+] as const;
+
+function resolveCurrencyPrecision(value: unknown): number {
+	const raw = unref(value as any);
+	if (raw === null || raw === undefined || raw === "") {
+		return 2;
+	}
+	const numeric = Number(raw);
+	return Number.isInteger(numeric) && numeric >= 0 ? numeric : 2;
+}
+
+function isBlankValue(value: unknown): boolean {
+	return value === undefined || value === null || value === "";
+}
+
+function isPositiveFinite(value: unknown): boolean {
+	if (isBlankValue(value)) {
+		return false;
+	}
+	const numeric = Number(value);
+	return Number.isFinite(numeric) && numeric > 0;
+}
+
+const BUYING_LIST_SCALAR_FIELDS = new Set<string>([
+	"trade_price",
+	"buying_price",
+	"buying_rate",
+]);
+
+function normalizeRowUom(row: Record<string, any> | null | undefined): string {
+	return String(row?.uom || row?.stock_uom || "").trim();
+}
+
+function areRowUomsCompatible(
+	docItem: Record<string, any>,
+	cartItem: Record<string, any>,
+): boolean {
+	const docUom = normalizeRowUom(docItem);
+	const cartUom = normalizeRowUom(cartItem);
+	return !docUom || !cartUom || docUom === cartUom;
+}
+
+function resolveCartItemMatches(
+	docItems: Array<Record<string, any>>,
+	liveCartItems: Array<Record<string, any>>,
+): number[] {
+	const matchedIndexes = new Array<number>(docItems.length).fill(-1);
+	if (!liveCartItems.length) {
+		return matchedIndexes;
+	}
+	const usedCartIndexes = new Set<number>();
+
+	// Pass 1a: reserve all exact posa_row_id matches first so earlier anonymous rows cannot steal them.
+	for (let i = 0; i < docItems.length; i++) {
+		const docItem = docItems[i];
+		if (!docItem || typeof docItem !== "object" || !docItem.posa_row_id) {
+			continue;
+		}
+		const byRowId = liveCartItems.findIndex(
+			(cartItem, idx) =>
+				!usedCartIndexes.has(idx) &&
+				cartItem &&
+				cartItem.posa_row_id === docItem.posa_row_id,
+		);
+		if (byRowId !== -1) {
+			matchedIndexes[i] = byRowId;
+			usedCartIndexes.add(byRowId);
+		}
+	}
+
+	// Pass 1b: reserve remaining exact child row name matches.
+	for (let i = 0; i < docItems.length; i++) {
+		if (matchedIndexes[i] !== -1) {
+			continue;
+		}
+		const docItem = docItems[i];
+		if (!docItem || typeof docItem !== "object" || !docItem.name) {
+			continue;
+		}
+		const byName = liveCartItems.findIndex(
+			(cartItem, idx) =>
+				!usedCartIndexes.has(idx) &&
+				cartItem &&
+				cartItem.name === docItem.name,
+		);
+		if (byName !== -1) {
+			matchedIndexes[i] = byName;
+			usedCartIndexes.add(byName);
+		}
+	}
+
+	// Pass 2a: positional exact (item_code, uom) match for anonymous rows carrying an explicit UOM.
+	for (let i = 0; i < docItems.length; i++) {
+		if (matchedIndexes[i] !== -1 || usedCartIndexes.has(i)) {
+			continue;
+		}
+		const docItem = docItems[i];
+		const docUom = normalizeRowUom(docItem);
+		const sameIndex = liveCartItems[i];
+		if (
+			docItem &&
+			typeof docItem === "object" &&
+			docUom &&
+			sameIndex &&
+			sameIndex.item_code === docItem.item_code &&
+			normalizeRowUom(sameIndex) === docUom
+		) {
+			matchedIndexes[i] = i;
+			usedCartIndexes.add(i);
+		}
+	}
+
+	// Pass 2b: unclaimed exact (item_code, uom) match so reordered same-SKU different-UOM rows never swap costs.
+	for (let i = 0; i < docItems.length; i++) {
+		if (matchedIndexes[i] !== -1) {
+			continue;
+		}
+		const docItem = docItems[i];
+		if (!docItem || typeof docItem !== "object" || !docItem.item_code) {
+			continue;
+		}
+		const docUom = normalizeRowUom(docItem);
+		if (!docUom) {
+			continue;
+		}
+		const unclaimedBySkuAndUom = liveCartItems.findIndex(
+			(cartItem, idx) =>
+				!usedCartIndexes.has(idx) &&
+				cartItem &&
+				cartItem.item_code === docItem.item_code &&
+				normalizeRowUom(cartItem) === docUom,
+		);
+		if (unclaimedBySkuAndUom !== -1) {
+			matchedIndexes[i] = unclaimedBySkuAndUom;
+			usedCartIndexes.add(unclaimedBySkuAndUom);
+		}
+	}
+
+	// Pass 2c: positional bare-SKU fallback when UOMs are absent or compatible.
+	for (let i = 0; i < docItems.length; i++) {
+		if (matchedIndexes[i] !== -1 || usedCartIndexes.has(i)) {
+			continue;
+		}
+		const docItem = docItems[i];
+		const sameIndex = liveCartItems[i];
+		if (
+			docItem &&
+			typeof docItem === "object" &&
+			sameIndex &&
+			sameIndex.item_code === docItem.item_code &&
+			areRowUomsCompatible(docItem, sameIndex)
+		) {
+			matchedIndexes[i] = i;
+			usedCartIndexes.add(i);
+		}
+	}
+
+	// Pass 2d: unclaimed UOM-compatible SKU fallback, then any UOM-compatible SKU match for split rows.
+	for (let i = 0; i < docItems.length; i++) {
+		if (matchedIndexes[i] !== -1) {
+			continue;
+		}
+		const docItem = docItems[i];
+		if (!docItem || typeof docItem !== "object" || !docItem.item_code) {
+			continue;
+		}
+		const unclaimedBySku = liveCartItems.findIndex(
+			(cartItem, idx) =>
+				!usedCartIndexes.has(idx) &&
+				cartItem &&
+				cartItem.item_code === docItem.item_code &&
+				areRowUomsCompatible(docItem, cartItem),
+		);
+		if (unclaimedBySku !== -1) {
+			matchedIndexes[i] = unclaimedBySku;
+			usedCartIndexes.add(unclaimedBySku);
+			continue;
+		}
+		const anyBySku = liveCartItems.findIndex(
+			(cartItem) =>
+				cartItem &&
+				cartItem.item_code === docItem.item_code &&
+				areRowUomsCompatible(docItem, cartItem),
+		);
+		if (anyBySku !== -1) {
+			matchedIndexes[i] = anyBySku;
+		}
+	}
+
+	return matchedIndexes;
+}
+
+function applyAuthoritativeDocHeaderFx(
+	row: Record<string, any>,
+	doc?: Record<string, any> | null,
+): Record<string, any> {
+	// Mirror ERPNext taxes_and_totals.py:344: parent invoice header currency & FX
+	// are authoritative for every child item, overriding any stale child-row or
+	// cart-row currency / conversion_rate (including stale positive values like 1).
+	if (!doc || typeof doc !== "object") {
+		return row;
+	}
+	const originalRowCurrency = String(row.currency || "").trim();
+	const docCurrency = String(doc.currency || "").trim();
+	if (docCurrency) {
+		if (
+			originalRowCurrency &&
+			originalRowCurrency !== docCurrency &&
+			isBlankValue(row.buying_rate_currency) &&
+			isBlankValue(row._source_buying_currency) &&
+			(Number(row.trade_price) > 0 ||
+				Number(row.buying_price) > 0 ||
+				Number(row.buying_rate) > 0)
+		) {
+			row._source_buying_currency = originalRowCurrency;
+		}
+		row.currency = doc.currency;
+		if (
+			originalRowCurrency &&
+			originalRowCurrency !== docCurrency &&
+			isBlankValue(doc.conversion_rate)
+		) {
+			row.conversion_rate = undefined;
+		}
+	}
+	if (!isBlankValue(doc.price_list_currency)) {
+		row.price_list_currency = doc.price_list_currency;
+	}
+	if (!isBlankValue(doc.company_currency)) {
+		row.company_currency = doc.company_currency;
+	}
+	if (isPositiveFinite(doc.conversion_rate)) {
+		row.conversion_rate = doc.conversion_rate;
+	} else if (!isBlankValue(doc.conversion_rate)) {
+		row.conversion_rate = doc.conversion_rate;
+	}
+	if (isPositiveFinite(doc.plc_conversion_rate)) {
+		row.plc_conversion_rate = doc.plc_conversion_rate;
+	} else if (!isBlankValue(doc.plc_conversion_rate)) {
+		row.plc_conversion_rate = doc.plc_conversion_rate;
+	}
+	return row;
+}
+
+function mergeDocItemsWithCartCostFallback(
+	docItems: Array<Record<string, any>>,
+	liveCartItems: Array<Record<string, any>>,
+	doc?: Record<string, any> | null,
+): Array<Record<string, any>> {
+	if (!docItems.length) {
+		return liveCartItems.map((cartItem) =>
+			cartItem && typeof cartItem === "object"
+				? applyAuthoritativeDocHeaderFx({ ...cartItem }, doc)
+				: cartItem,
+		);
+	}
+	const matchedIndexes = resolveCartItemMatches(docItems, liveCartItems);
+	return docItems.map((docItem, index) => {
+		if (!docItem || typeof docItem !== "object") {
+			return docItem;
+		}
+		const matchedIndex = matchedIndexes[index] ?? -1;
+		const matched = matchedIndex !== -1 ? liveCartItems[matchedIndex] : null;
+		const merged: Record<string, any> = applyAuthoritativeDocHeaderFx(
+			{ ...docItem },
+			doc,
+		);
+
+		if (matched && typeof matched === "object") {
+			if (
+				matched._buying_prices_by_uom &&
+				typeof matched._buying_prices_by_uom === "object"
+			) {
+				const existingMap =
+					merged._buying_prices_by_uom &&
+					typeof merged._buying_prices_by_uom === "object"
+						? merged._buying_prices_by_uom
+						: null;
+				merged._buying_prices_by_uom = existingMap
+					? { ...matched._buying_prices_by_uom, ...existingMap }
+					: { ...matched._buying_prices_by_uom };
+			}
+			let copiedBuyingListScalar = false;
+			for (const field of SCALAR_COST_FALLBACK_FIELDS) {
+				const currentVal = merged[field];
+				const currentMissing =
+					isBlankValue(currentVal) || !(Number(currentVal) > 0);
+				if (currentMissing && Number(matched[field]) > 0) {
+					merged[field] = matched[field];
+					if (BUYING_LIST_SCALAR_FIELDS.has(field)) {
+						copiedBuyingListScalar = true;
+					}
+				}
+			}
+			for (const field of METADATA_FALLBACK_FIELDS) {
+				if (field === "conversion_rate") {
+					const cartCurrency = String(matched.currency || "").trim();
+					const rowCurrency = String(merged.currency || "").trim();
+					const currencyMatches =
+						!cartCurrency || !rowCurrency || cartCurrency === rowCurrency;
+					if (
+						currencyMatches &&
+						isBlankValue(merged.conversion_rate) &&
+						!isBlankValue(matched.conversion_rate)
+					) {
+						merged.conversion_rate = matched.conversion_rate;
+					}
+					continue;
+				}
+				if (field === "plc_conversion_rate") {
+					const cartPlc = String(matched.price_list_currency || "").trim();
+					const rowPlc = String(merged.price_list_currency || "").trim();
+					const plcMatches = !cartPlc || !rowPlc || cartPlc === rowPlc;
+					if (
+						plcMatches &&
+						isBlankValue(merged.plc_conversion_rate) &&
+						!isBlankValue(matched.plc_conversion_rate)
+					) {
+						merged.plc_conversion_rate = matched.plc_conversion_rate;
+					}
+					continue;
+				}
+				if (isBlankValue(merged[field]) && !isBlankValue(matched[field])) {
+					merged[field] = matched[field];
+				}
+			}
+			if (
+				copiedBuyingListScalar &&
+				isBlankValue(merged.buying_rate_currency) &&
+				isBlankValue(merged._source_buying_currency)
+			) {
+				const matchedScalarCurrency = String(
+					matched.buying_rate_currency ||
+						matched._source_buying_currency ||
+						matched.buying_price_currency ||
+						matched.currency ||
+						matched.price_list_currency ||
+						"",
+				).trim();
+				const mergedInvoiceCurrency = String(
+					merged.currency || merged.price_list_currency || "",
+				).trim();
+				if (
+					matchedScalarCurrency &&
+					mergedInvoiceCurrency &&
+					matchedScalarCurrency !== mergedInvoiceCurrency
+				) {
+					merged._source_buying_currency = matchedScalarCurrency;
+				}
+			}
+		}
+
+		return merged;
+	});
 }
 
 export function usePaymentSubmission(options: PaymentSubmissionOptions) {
@@ -441,7 +824,7 @@ export function usePaymentSubmission(options: PaymentSubmissionOptions) {
 	};
 
 	const getLoyaltyRedemptionForSubmission = (doc: any) => {
-		const prec = unref(options.currencyPrecision) || 2;
+		const prec = resolveCurrencyPrecision(options.currencyPrecision);
 		const hasExplicitLoyaltyAmount = Object.prototype.hasOwnProperty.call(
 			options,
 			"loyaltyAmount",
@@ -491,7 +874,7 @@ export function usePaymentSubmission(options: PaymentSubmissionOptions) {
 	const validateSubmission = async (payment_received = false) => {
 		const doc = unref(invoiceDoc);
 		const profile = unref(posProfile);
-		const prec = unref(options.currencyPrecision) || 2;
+		const prec = resolveCurrencyPrecision(options.currencyPrecision);
 		const {
 			isCashback,
 			paidChange,
@@ -529,47 +912,35 @@ export function usePaymentSubmission(options: PaymentSubmissionOptions) {
 				? storeItemsSource.value
 				: [];
 		const saleFloorPolicy = resolveSaleFloorPolicy(profile);
-		const invoiceGrossAmount = (doc?.items || []).reduce(
-			(total: number, item: any) => {
-				if (
-					item?.is_return ||
-					item?.posa_is_replace ||
-					Number(item?.qty || 0) <= 0
-				) {
-					return total;
-				}
-				return (
-					total +
-					Math.abs(Number(item?.rate || 0) * Number(item?.qty || 0))
-				);
-			},
-			0,
+		const applyDiscountOn = String(
+			doc?.apply_discount_on || "Grand Total",
+		).trim();
+		const isCashOrNonTradeDiscount = Boolean(
+			doc?.is_cash_or_non_trade_discount,
 		);
-		const explicitInvoiceDiscount = Math.max(
-			Number(doc?.additional_discount_percentage || 0),
-			0,
+		const docItems = Array.isArray(doc?.items) ? doc.items : [];
+		const effectiveItems = mergeDocItemsWithCartCostFallback(
+			docItems,
+			liveCartItems,
+			doc,
 		);
-		const fixedInvoiceDiscountPercentage =
-			explicitInvoiceDiscount <= 0 && invoiceGrossAmount > 0
-				? (Math.max(Number(doc?.discount_amount || 0), 0) /
-						invoiceGrossAmount) *
-					100
-				: 0;
+		const invoiceDiscountPercentage = resolveInvoiceDiscountPercentage(
+			doc,
+			effectiveItems,
+		);
 		const lossOptions = {
 			minimumMarginPercentage: saleFloorPolicy.minimumMarginPercentage,
-			invoiceDiscountPercentage:
-				explicitInvoiceDiscount || fixedInvoiceDiscountPercentage,
+			invoiceDiscountPercentage,
+			applyDiscountOn,
+			isCashOrNonTradeDiscount,
+			taxes: Array.isArray(doc?.taxes) ? doc.taxes : [],
+			currencyPrecision: prec,
 		};
-		const docLossRiskItems = saleFloorPolicy.enabled
-			? findLossRiskItems(doc?.items || [], lossOptions)
+		const lossRiskItems = saleFloorPolicy.enabled
+			? findLossRiskItems(effectiveItems, lossOptions)
 			: [];
-		const lossRiskItems = docLossRiskItems.length
-			? docLossRiskItems
-			: saleFloorPolicy.enabled
-				? findLossRiskItems(liveCartItems, lossOptions)
-				: [];
 		const missingCostItems = saleFloorPolicy.enabled
-			? (doc?.items || []).filter(
+			? effectiveItems.filter(
 					(item: any) =>
 						!item?.is_return &&
 						!item?.posa_is_replace &&
@@ -582,7 +953,7 @@ export function usePaymentSubmission(options: PaymentSubmissionOptions) {
 			missingCostItems.length &&
 			saleFloorPolicy.missingCostAction === "Block"
 		) {
-			const first = missingCostItems[0];
+			const first = missingCostItems[0]!;
 			throw new Error(
 				__(
 					"Cannot submit invoice because no valid buying floor is available for {0}.",
@@ -982,7 +1353,7 @@ export function usePaymentSubmission(options: PaymentSubmissionOptions) {
 		const doc = unref(invoiceDoc);
 		const profile = unref(posProfile);
 		const type = unref(invoiceType);
-		const prec = unref(options.currencyPrecision) || 2;
+		const prec = resolveCurrencyPrecision(options.currencyPrecision);
 		const {
 			isCashback,
 			paidChange,
@@ -1376,7 +1747,7 @@ export function usePaymentSubmission(options: PaymentSubmissionOptions) {
 				const exchangeSummary = r.message?.exchange_summary;
 				const exchangeDifference = formatFloat(
 					exchangeSummary?.difference_amount || 0,
-					unref(options.currencyPrecision) || 2,
+					resolveCurrencyPrecision(options.currencyPrecision),
 				);
 				const exchangeDetail =
 					exchangeDifference > 0

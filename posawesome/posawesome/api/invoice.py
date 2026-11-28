@@ -26,11 +26,11 @@ SUBMISSION_LEDGER_DOCTYPE = "POS Invoice Submission Ledger"
 
 def validate(doc, method):
     validate_shift(doc)
-    validate_pos_invoice_item_sale_controls(doc)
     set_patient(doc)
     auto_set_delivery_charges(doc)
     calc_delivery_charges(doc)
     apply_tax_inclusive(doc)
+    validate_pos_invoice_item_sale_controls(doc)
 
 
 def before_submit(doc, method):

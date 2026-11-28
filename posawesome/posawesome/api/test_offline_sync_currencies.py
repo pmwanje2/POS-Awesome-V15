@@ -231,6 +231,314 @@ class TestOfflineSyncCurrencies(unittest.TestCase):
         self.assertIn("next_watermark", response)
         self.assertIn("has_more", response)
 
+    def test_sync_currency_scope_requests_and_emits_purpose_flags_and_name(self):
+        orig_get_all = self.module.frappe.get_all
+        orig_get_latest_rate = self.module.get_latest_rate
+        captured_fields = []
+        latest_rate_calls = []
+
+        def fake_get_all(doctype, **kwargs):
+            if doctype == "Currency Exchange":
+                captured_fields.append(list(kwargs.get("fields") or []))
+                return [
+                    AttrDict(
+                        {
+                            "name": "FX-USD-UGX-BUY",
+                            "from_currency": "USD",
+                            "to_currency": "UGX",
+                            "exchange_rate": 4050.0,
+                            "date": "2026-04-08",
+                            "for_buying": 1,
+                            "for_selling": 0,
+                            "modified": "2026-04-08T10:00:00",
+                        }
+                    ),
+                    AttrDict(
+                        {
+                            "name": "FX-USD-UGX-SELL",
+                            "from_currency": "USD",
+                            "to_currency": "UGX",
+                            "exchange_rate": 3700.0,
+                            "date": "2026-04-09",
+                            "for_buying": 0,
+                            "for_selling": 1,
+                            "modified": "2026-04-09T10:00:00",
+                        }
+                    ),
+                ]
+            return orig_get_all(doctype, **kwargs)
+
+        def fake_get_latest_rate(from_currency, to_currency, **kwargs):
+            latest_rate_calls.append((from_currency, to_currency, kwargs))
+            return 3700.0, "2026-04-09"
+
+        self.module.frappe.get_all = fake_get_all
+        self.module.get_latest_rate = fake_get_latest_rate
+        try:
+            response = self.module.sync_currency_scope(
+                pos_profile="POS-TEST",
+                watermark=None,
+                currency_pairs='[{"from_currency":"USD","to_currency":"UGX"}]',
+            )
+        finally:
+            self.module.frappe.get_all = orig_get_all
+            self.module.get_latest_rate = orig_get_latest_rate
+
+        self.assertEqual(len(captured_fields), 1)
+        for required_field in ("name", "for_buying", "for_selling"):
+            self.assertIn(required_field, captured_fields[0])
+        rate_changes = {
+            row["key"]: row["data"]
+            for row in response["changes"]
+            if row["key"].startswith("currency_rate::")
+        }
+        self.assertEqual(rate_changes["currency_rate::FX-USD-UGX-BUY"]["for_buying"], 1)
+        self.assertEqual(rate_changes["currency_rate::FX-USD-UGX-BUY"]["for_selling"], 0)
+        self.assertEqual(rate_changes["currency_rate::FX-USD-UGX-SELL"]["for_buying"], 0)
+        self.assertEqual(rate_changes["currency_rate::FX-USD-UGX-SELL"]["for_selling"], 1)
+        self.assertEqual(latest_rate_calls[0][2].get("purpose"), "for_selling")
+
+    def test_sync_currency_scope_emits_accounts_settings_stale_rate_policy(self):
+        orig_get_cached_doc = self.module.frappe.get_cached_doc
+
+        def fake_get_cached_doc(doctype, name=None):
+            if doctype == "Accounts Settings":
+                return AttrDict({"allow_stale": 0, "stale_days": 30})
+            return orig_get_cached_doc(doctype, name)
+
+        self.module.frappe.get_cached_doc = fake_get_cached_doc
+        try:
+            response = self.module.sync_currency_scope(
+                pos_profile="POS-TEST",
+                watermark=None,
+                currency_pairs=None,
+            )
+        finally:
+            self.module.frappe.get_cached_doc = orig_get_cached_doc
+
+        self.assertEqual(
+            response.get("currency_settings"),
+            {"allow_stale": 0, "stale_days": 30},
+        )
+
+    def test_sync_currency_scope_auto_discovers_foreign_till_and_buying_list_pairs_when_currency_pairs_empty(
+        self,
+    ):
+        orig_get_cached_doc = self.module.frappe.get_cached_doc
+        orig_get_value = self.module.frappe.db.get_value
+        orig_get_all = self.module.frappe.get_all
+        orig_get_pl_currency = self.module.get_price_list_currency
+
+        def fake_get_cached_doc(doctype, name=None):
+            if doctype == "POS Profile":
+                return AttrDict(
+                    {
+                        "name": "POS-USD-UGX",
+                        "company": "Uganda Co",
+                        "currency": "USD",
+                        "selling_price_list": "USD Selling",
+                        "buying_price_list": "EUR Buying",
+                        "posa_allow_multi_currency": 0,
+                        "modified": "2026-04-09T10:01:00",
+                        "payments": [{"mode_of_payment": "Cash"}],
+                    }
+                )
+            return orig_get_cached_doc(doctype, name)
+
+        def fake_get_value(doctype, name, fieldname=None):
+            if doctype == "Company" and fieldname == "default_currency":
+                return "UGX"
+            if doctype == "Price List" and name == "EUR Buying" and fieldname == "currency":
+                return "EUR"
+            if doctype == "Price List" and name == "USD Selling" and fieldname == "currency":
+                return "USD"
+            return orig_get_value(doctype, name, fieldname)
+
+        def fake_get_all(doctype, **kwargs):
+            if doctype == "Currency Exchange":
+                filters = kwargs.get("filters") or {}
+                from_vals = filters.get("from_currency")[1]
+                to_vals = filters.get("to_currency")[1]
+                rows = [
+                    AttrDict(
+                        {
+                            "name": "FX-USD-UGX-BUY",
+                            "from_currency": "USD",
+                            "to_currency": "UGX",
+                            "exchange_rate": 4050.0,
+                            "date": "2026-04-09",
+                            "for_buying": 1,
+                            "for_selling": 0,
+                            "modified": "2026-04-09T10:05:00",
+                        }
+                    ),
+                    AttrDict(
+                        {
+                            "name": "FX-UGX-EUR-SELL",
+                            "from_currency": "UGX",
+                            "to_currency": "EUR",
+                            "exchange_rate": 1.0 / 4300.0,
+                            "date": "2026-04-09",
+                            "for_buying": 0,
+                            "for_selling": 1,
+                            "modified": "2026-04-09T10:05:00",
+                        }
+                    ),
+                ]
+                return [
+                    r
+                    for r in rows
+                    if r["from_currency"] in from_vals and r["to_currency"] in to_vals
+                ]
+            if doctype == "Item Price":
+                return [{"currency": "EUR"}]
+            return orig_get_all(doctype, **kwargs)
+
+        def fake_get_pl_currency(price_list):
+            if price_list == "USD Selling":
+                return "USD"
+            if price_list == "EUR Buying":
+                return "EUR"
+            return orig_get_pl_currency(price_list)
+
+        self.module.frappe.get_cached_doc = fake_get_cached_doc
+        self.module.frappe.db.get_value = fake_get_value
+        self.module.frappe.get_all = fake_get_all
+        self.module.get_price_list_currency = fake_get_pl_currency
+        try:
+            response = self.module.sync_currency_scope(
+                pos_profile="POS-USD-UGX",
+                watermark=None,
+                currency_pairs=[],
+            )
+        finally:
+            self.module.frappe.get_cached_doc = orig_get_cached_doc
+            self.module.frappe.db.get_value = orig_get_value
+            self.module.frappe.get_all = orig_get_all
+            self.module.get_price_list_currency = orig_get_pl_currency
+
+        keys = {row["key"] for row in response["changes"]}
+        self.assertIn("currency_rate::FX-USD-UGX-BUY", keys)
+        self.assertIn("currency_rate::FX-UGX-EUR-SELL", keys)
+
+    def test_sync_currency_scope_backfills_newly_expanded_pairs_older_than_watermark(self):
+        orig_get_cached_doc = self.module.frappe.get_cached_doc
+        orig_get_value = self.module.frappe.db.get_value
+        orig_get_all = self.module.frappe.get_all
+        orig_get_pl_currency = self.module.get_price_list_currency
+
+        def fake_get_cached_doc(doctype, name=None):
+            if doctype == "POS Profile":
+                return AttrDict(
+                    {
+                        "name": "POS-EXPAND",
+                        "company": "Uganda Co",
+                        "currency": "USD",
+                        "selling_price_list": "USD Selling",
+                        "buying_price_list": "EUR Buying",
+                        "posa_allow_multi_currency": 0,
+                        "modified": "2026-04-09T09:00:00",
+                        "payments": [{"mode_of_payment": "Cash"}],
+                    }
+                )
+            return orig_get_cached_doc(doctype, name)
+
+        def fake_get_value(doctype, name, fieldname=None):
+            if doctype == "Company" and fieldname == "default_currency":
+                return "UGX"
+            if doctype == "Price List" and name == "EUR Buying" and fieldname == "currency":
+                return "EUR"
+            if doctype == "Price List" and name == "USD Selling" and fieldname == "currency":
+                return "USD"
+            return orig_get_value(doctype, name, fieldname)
+
+        def fake_get_all(doctype, **kwargs):
+            if doctype == "Currency Exchange":
+                filters = kwargs.get("filters") or {}
+                from_vals = filters.get("from_currency")[1]
+                to_vals = filters.get("to_currency")[1]
+                rows = [
+                    AttrDict(
+                        {
+                            "name": "FX-USD-UGX-OLD",
+                            "from_currency": "USD",
+                            "to_currency": "UGX",
+                            "exchange_rate": 3700.0,
+                            "date": "2026-04-08",
+                            "for_buying": 0,
+                            "for_selling": 1,
+                            "modified": "2026-04-09T09:30:00",
+                        }
+                    ),
+                    AttrDict(
+                        {
+                            "name": "FX-EUR-UGX-PRE-WM",
+                            "from_currency": "EUR",
+                            "to_currency": "UGX",
+                            "exchange_rate": 4300.0,
+                            "date": "2026-04-08",
+                            "for_buying": 1,
+                            "for_selling": 0,
+                            "modified": "2026-04-09T09:00:00",
+                        }
+                    ),
+                ]
+                return [
+                    r
+                    for r in rows
+                    if r["from_currency"] in from_vals and r["to_currency"] in to_vals
+                ]
+            if doctype == "Item Price":
+                return [{"currency": "EUR"}]
+            return orig_get_all(doctype, **kwargs)
+
+        self.module.frappe.get_cached_doc = fake_get_cached_doc
+        self.module.frappe.db.get_value = fake_get_value
+        self.module.frappe.get_all = fake_get_all
+        self.module.get_price_list_currency = (
+            lambda pl: "EUR" if pl == "EUR Buying" else "USD" if pl == "USD Selling" else orig_get_pl_currency(pl)
+        )
+        try:
+            # Delta sync after watermark=10:10:00 expanding with EUR<->UGX in backfill_pairs:
+            # existing EUR row (09:00:00 <= watermark) MUST be returned while unchanged USD row stays skipped.
+            response = self.module.sync_currency_scope(
+                pos_profile="POS-EXPAND",
+                watermark="2026-04-09T10:10:00",
+                currency_pairs=[
+                    {"from_currency": "USD", "to_currency": "UGX"},
+                    {"from_currency": "UGX", "to_currency": "USD"},
+                    {"from_currency": "EUR", "to_currency": "UGX"},
+                    {"from_currency": "UGX", "to_currency": "EUR"},
+                ],
+                backfill_pairs=[
+                    {"from_currency": "EUR", "to_currency": "UGX"},
+                    {"from_currency": "UGX", "to_currency": "EUR"},
+                ],
+            )
+            # First sync with partial client list (only USD<->UGX) also includes server-discovered EUR floor pair.
+            first_sync = self.module.sync_currency_scope(
+                pos_profile="POS-EXPAND",
+                watermark=None,
+                currency_pairs=[
+                    {"from_currency": "USD", "to_currency": "UGX"},
+                    {"from_currency": "UGX", "to_currency": "USD"},
+                ],
+            )
+        finally:
+            self.module.frappe.get_cached_doc = orig_get_cached_doc
+            self.module.frappe.db.get_value = orig_get_value
+            self.module.frappe.get_all = orig_get_all
+            self.module.get_price_list_currency = orig_get_pl_currency
+
+        keys = {row["key"] for row in response["changes"]}
+        self.assertIn("currency_rate::FX-EUR-UGX-PRE-WM", keys)
+        self.assertNotIn("currency_rate::FX-USD-UGX-OLD", keys)
+        self.assertEqual(response["next_watermark"], "2026-04-09T10:10:00")
+        self.assertIn({"from_currency": "EUR", "to_currency": "UGX"}, response.get("synced_pairs") or [])
+
+        first_keys = {row["key"] for row in first_sync["changes"]}
+        self.assertIn("currency_rate::FX-EUR-UGX-PRE-WM", first_keys)
+
 
 if __name__ == "__main__":
     unittest.main()

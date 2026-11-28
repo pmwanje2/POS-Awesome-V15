@@ -3185,5 +3185,548 @@ class TestInvoiceDeadlockRetry(unittest.TestCase):
         self.assertEqual([call.args[0] for call in sleep.call_args_list], [0.01, 0.02])
 
 
+class TestExistingDraftFloorHardening(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.frappe, cls.enqueue_calls = _install_framework_stubs()
+        _install_dependency_stubs()
+        _install_package_stubs()
+        sys.modules.pop("posawesome.posawesome.api.idempotency", None)
+        cls.creation = _load_module()
+
+    def setUp(self):
+        self.enqueue_calls.clear()
+        self.frappe._publish_realtime_calls.clear()
+        self._saved_creation_attrs = {
+            name: getattr(self.creation, name)
+            for name in (
+                "_validate_invoice_opening_shift",
+                "get_active_terminal_cashier",
+                "resolve_erpnext_currency_rates",
+                "validate_invoice_item_sale_controls",
+                "_save_draft_with_latest_timestamp",
+                "_apply_invoice_gift_card_settlement",
+                "_process_post_submit_payments",
+                "_apply_tax_contract_before_save",
+                "normalize_invoice_payment_currencies",
+                "normalize_change_returns",
+            )
+        }
+        self._saved_frappe_attrs = {
+            "get_cached_value": self.creation.frappe.get_cached_value,
+            "get_value": getattr(self.creation.frappe, "get_value", None),
+            "get_doc": self.creation.frappe.get_doc,
+            "db_exists": self.creation.frappe.db.exists,
+            "db_get_value": self.creation.frappe.db.get_value,
+        }
+        self.creation._validate_invoice_opening_shift = lambda *args, **kwargs: _till_shift()
+        self.creation.get_active_terminal_cashier = lambda *_args, **_kwargs: "cashier@example.com"
+        self.creation._apply_invoice_gift_card_settlement = lambda *args, **kwargs: None
+        self.creation._process_post_submit_payments = lambda *args, **kwargs: None
+        self.creation.normalize_invoice_payment_currencies = lambda *args, **kwargs: None
+        self.creation.normalize_change_returns = lambda *args, **kwargs: None
+        self.creation.frappe.get_value = lambda *args, **kwargs: 0
+
+    def tearDown(self):
+        for name, value in self._saved_creation_attrs.items():
+            setattr(self.creation, name, value)
+        self.creation.frappe.get_cached_value = self._saved_frappe_attrs["get_cached_value"]
+        self.creation.frappe.get_value = self._saved_frappe_attrs["get_value"]
+        self.creation.frappe.get_doc = self._saved_frappe_attrs["get_doc"]
+        self.creation.frappe.db.exists = self._saved_frappe_attrs["db_exists"]
+        self.creation.frappe.db.get_value = self._saved_frappe_attrs["db_get_value"]
+
+    def _build_fx_draft(self, **overrides):
+        base = {
+            "doctype": "Sales Invoice",
+            "name": "ACC-SINV-FX-0001",
+            "pos_profile": "Main POS",
+            "company": "Test Company",
+            "customer": "CUST-0001",
+            "currency": "USD",
+            "price_list_currency": "USD",
+            "selling_price_list": "USD Selling",
+            "conversion_rate": 3700.0,
+            "plc_conversion_rate": 3700.0,
+            "posting_date": "2026-11-28",
+            "is_return": 0,
+            "items": [
+                FakeDoc(
+                    item_code="FX-ITEM",
+                    item_name="FX Item",
+                    qty=1,
+                    rate=10,
+                    amount=10,
+                    net_rate=10,
+                    net_amount=10,
+                    base_rate=37000,
+                    base_amount=37000,
+                    base_net_rate=37000,
+                    base_net_amount=37000,
+                    price_list_rate=10,
+                    base_price_list_rate=37000,
+                    discount_amount=0,
+                    base_discount_amount=0,
+                )
+            ],
+            "payments": [],
+            "taxes": [],
+            "flags": types.SimpleNamespace(ignore_pricing_rule=False, ignore_permissions=False),
+            "paid_amount": 0,
+            "base_paid_amount": 0,
+            "total": 10,
+            "discount_amount": 0,
+            "net_total": 10,
+            "grand_total": 10,
+            "rounded_total": 10,
+            "docstatus": 0,
+            "posa_pos_opening_shift": TILL_SHIFT_NAME,
+            "redeem_loyalty_points": 0,
+            "loyalty_program": None,
+            "loyalty_redemption_account": None,
+            "loyalty_redemption_cost_center": None,
+            "remarks": "",
+            "update_stock": 1,
+        }
+        base.update(overrides)
+        return FakeDoc(**base)
+
+    def test_submit_invoice_existing_draft_overwrites_client_conversion_rate_before_floor_check(self):
+        invoice_doc = self._build_fx_draft()
+        invoice_doc.submit = lambda: setattr(invoice_doc, "docstatus", 1)
+        seen_before_floor = {}
+
+        def capture_floor_check(doc):
+            first_item = doc.items[0]
+            seen_before_floor["conversion_rate"] = doc.get("conversion_rate")
+            seen_before_floor["plc_conversion_rate"] = doc.get("plc_conversion_rate")
+            seen_before_floor["base_rate"] = (
+                first_item.get("base_rate")
+                if isinstance(first_item, dict)
+                else getattr(first_item, "base_rate", None)
+            )
+            seen_before_floor["base_net_rate"] = (
+                first_item.get("base_net_rate")
+                if isinstance(first_item, dict)
+                else getattr(first_item, "base_net_rate", None)
+            )
+
+        self.creation.validate_invoice_item_sale_controls = capture_floor_check
+        self.creation._save_draft_with_latest_timestamp = lambda doc: doc
+        self.creation.frappe.db.exists = lambda doctype, name: name == "ACC-SINV-FX-0001"
+        self.creation.frappe.db.get_value = (
+            lambda doctype, name, fieldname=None, *args, **kwargs: "USD"
+            if (doctype, fieldname) == ("Price List", "currency")
+            else 0
+        )
+        self.creation.frappe.get_cached_value = (
+            lambda doctype, name, fieldname: "UGX"
+            if (doctype, fieldname) == ("Company", "default_currency")
+            else None
+        )
+        self.creation.frappe.get_doc = lambda *args: invoice_doc
+        self.creation.resolve_erpnext_currency_rates = lambda *args, **kwargs: {
+            "conversion_rate": 3700.0,
+            "plc_conversion_rate": 3700.0,
+            "price_list_currency": "USD",
+            "exchange_rate_date": "2026-11-28",
+        }
+
+        result = self.creation.submit_invoice(
+            json.dumps(
+                {
+                    "doctype": "Sales Invoice",
+                    "name": "ACC-SINV-FX-0001",
+                    "pos_profile": "Main POS",
+                    "company": "Test Company",
+                    "currency": "USD",
+                    "price_list_currency": "USD",
+                    "selling_price_list": "USD Selling",
+                    "conversion_rate": 1000000.0,
+                    "plc_conversion_rate": 1000000.0,
+                    "customer": "CUST-0001",
+                    "posting_date": "2026-11-28",
+                    "total": 10,
+                    "net_total": 10,
+                    "grand_total": 10,
+                    "rounded_total": 10,
+                    "items": [
+                        {
+                            "item_code": "FX-ITEM",
+                            "item_name": "FX Item",
+                            "qty": 1,
+                            "rate": 10,
+                            "amount": 10,
+                            "net_rate": 10,
+                            "net_amount": 10,
+                            "price_list_rate": 10,
+                            "base_rate": 10000000.0,
+                            "base_net_rate": 10000000.0,
+                        }
+                    ],
+                    "payments": [],
+                }
+            ),
+            json.dumps({}),
+            submit_in_background=0,
+        )
+
+        self.assertEqual(result["status"], 1)
+        self.assertEqual(seen_before_floor["conversion_rate"], 3700.0)
+        self.assertEqual(seen_before_floor["plc_conversion_rate"], 3700.0)
+        self.assertEqual(seen_before_floor["base_rate"], 37000.0)
+        self.assertEqual(seen_before_floor["base_net_rate"], 37000.0)
+
+    def test_submit_invoice_existing_draft_rejects_missing_foreign_exchange_rate(self):
+        invoice_doc = self._build_fx_draft()
+        invoice_doc.submit = lambda: setattr(invoice_doc, "docstatus", 1)
+
+        self.creation._save_draft_with_latest_timestamp = lambda doc: doc
+        self.creation.frappe.db.exists = lambda doctype, name: name == "ACC-SINV-FX-0001"
+        self.creation.frappe.db.get_value = (
+            lambda doctype, name, fieldname=None, *args, **kwargs: "USD"
+            if (doctype, fieldname) == ("Price List", "currency")
+            else 0
+        )
+        self.creation.frappe.get_cached_value = (
+            lambda doctype, name, fieldname: "UGX"
+            if (doctype, fieldname) == ("Company", "default_currency")
+            else None
+        )
+        self.creation.frappe.get_doc = lambda *args: invoice_doc
+        self.creation.resolve_erpnext_currency_rates = lambda *args, **kwargs: {
+            "conversion_rate": None,
+            "plc_conversion_rate": None,
+            "price_list_currency": "USD",
+            "exchange_rate_date": "2026-11-28",
+        }
+
+        with self.assertRaisesRegex(Exception, "Unable to find exchange rate"):
+            self.creation.submit_invoice(
+                json.dumps(
+                    {
+                        "doctype": "Sales Invoice",
+                        "name": "ACC-SINV-FX-0001",
+                        "pos_profile": "Main POS",
+                        "company": "Test Company",
+                        "currency": "USD",
+                        "conversion_rate": 999999.0,
+                        "customer": "CUST-0001",
+                        "posting_date": "2026-11-28",
+                        "items": [{"item_code": "FX-ITEM", "qty": 1, "rate": 10}],
+                        "payments": [],
+                    }
+                ),
+                json.dumps({}),
+                submit_in_background=0,
+            )
+
+    def test_submit_in_background_job_refreshes_authoritative_conversion_rate_before_floor_check(
+        self,
+    ):
+        invoice_doc = self._build_fx_draft(
+            name="ACC-SINV-BG-FX-0001",
+            conversion_rate=1000000.0,
+            plc_conversion_rate=1000000.0,
+        )
+        invoice_doc.submit = lambda: setattr(invoice_doc, "docstatus", 1)
+        events = []
+
+        def fake_tax_contract(doc):
+            events.append(("tax_contract", doc.get("conversion_rate")))
+
+        def fake_floor_check(doc):
+            events.append(("floor_check", doc.get("conversion_rate")))
+            doc.flags.posa_item_sale_controls_validated = True
+
+        def fake_save(doc):
+            events.append(
+                (
+                    "save",
+                    getattr(doc.flags, "posa_item_sale_controls_validated", False),
+                )
+            )
+            return doc
+
+        self.creation._apply_tax_contract_before_save = fake_tax_contract
+        self.creation.validate_invoice_item_sale_controls = fake_floor_check
+        self.creation._save_draft_with_latest_timestamp = fake_save
+        self.creation.frappe.get_doc = lambda *args: invoice_doc
+        self.creation.frappe.db.get_value = (
+            lambda doctype, name, fieldname=None, *args, **kwargs: "USD"
+            if (doctype, fieldname) == ("Price List", "currency")
+            else None
+        )
+        self.creation.frappe.get_cached_value = (
+            lambda doctype, name, fieldname: "UGX"
+            if (doctype, fieldname) == ("Company", "default_currency")
+            else None
+        )
+        self.creation.resolve_erpnext_currency_rates = lambda *args, **kwargs: {
+            "conversion_rate": 3700.0,
+            "plc_conversion_rate": 3700.0,
+            "price_list_currency": "USD",
+            "exchange_rate_date": "2026-11-28",
+        }
+
+        self.creation.submit_in_background_job(
+            {
+                "invoice": "ACC-SINV-BG-FX-0001",
+                "doctype": "Sales Invoice",
+                "data": {},
+                "payments": [],
+                "user": "cashier@example.com",
+            }
+        )
+
+        self.assertEqual(invoice_doc.docstatus, 1)
+        self.assertEqual(
+            events,
+            [
+                ("tax_contract", 3700.0),
+                ("floor_check", 3700.0),
+                ("save", False),
+            ],
+        )
+
+    def test_submit_invoice_clears_sale_controls_validated_flag_before_save(self):
+        invoice_doc = self._build_fx_draft(
+            name="ACC-SINV-FLAG-0001",
+            currency="UGX",
+            price_list_currency="UGX",
+            conversion_rate=1.0,
+            plc_conversion_rate=1.0,
+        )
+        invoice_doc.submit = lambda: setattr(invoice_doc, "docstatus", 1)
+        flag_during_save = []
+
+        def mark_validated(doc):
+            doc.flags.posa_item_sale_controls_validated = True
+
+        def observe_save(doc):
+            flag_during_save.append(
+                getattr(doc.flags, "posa_item_sale_controls_validated", False)
+            )
+            return doc
+
+        self.creation.validate_invoice_item_sale_controls = mark_validated
+        self.creation._save_draft_with_latest_timestamp = observe_save
+        self.creation.frappe.db.exists = lambda doctype, name: name == "ACC-SINV-FLAG-0001"
+        self.creation.frappe.db.get_value = lambda *args, **kwargs: 0
+        self.creation.frappe.get_cached_value = (
+            lambda doctype, name, fieldname: "UGX"
+            if (doctype, fieldname) == ("Company", "default_currency")
+            else None
+        )
+        self.creation.frappe.get_doc = lambda *args: invoice_doc
+
+        result = self.creation.submit_invoice(
+            json.dumps(
+                {
+                    "doctype": "Sales Invoice",
+                    "name": "ACC-SINV-FLAG-0001",
+                    "pos_profile": "Main POS",
+                    "company": "Test Company",
+                    "currency": "UGX",
+                    "customer": "CUST-0001",
+                    "posting_date": "2026-11-28",
+                    "items": [{"item_code": "FX-ITEM", "qty": 1, "rate": 100}],
+                    "payments": [],
+                }
+            ),
+            json.dumps({}),
+            submit_in_background=0,
+        )
+
+        self.assertEqual(result["status"], 1)
+        self.assertEqual(flag_during_save, [False])
+
+    def test_submit_invoice_recalculates_edited_draft_stale_net_rate_before_floor_check(self):
+        def run_repriced_submit(old_rate, new_rate, floor_rate):
+            tax_row = {
+                "charge_type": "On Net Total",
+                "account_head": "VAT 10% - TC",
+                "rate": 10,
+                "included_in_print_rate": 0,
+            }
+            invoice_doc = self._build_fx_draft(
+                name="ACC-SINV-REPRICE-0001",
+                currency="UGX",
+                price_list_currency="UGX",
+                conversion_rate=1.0,
+                plc_conversion_rate=1.0,
+                items=[
+                    FakeDoc(
+                        item_code="REPRICE-ITEM",
+                        item_name="Repriced Item",
+                        qty=1,
+                        rate=old_rate,
+                        amount=old_rate,
+                        net_rate=old_rate,
+                        net_amount=old_rate,
+                        base_rate=old_rate,
+                        base_amount=old_rate,
+                        base_net_rate=old_rate,
+                        base_net_amount=old_rate,
+                        price_list_rate=old_rate,
+                        base_price_list_rate=old_rate,
+                        discount_amount=0,
+                        base_discount_amount=0,
+                    )
+                ],
+                taxes=[dict(tax_row)],
+            )
+            recalc_rates = []
+
+            def recalc():
+                for row in invoice_doc.items:
+                    rate = row["rate"] if isinstance(row, dict) else row.rate
+                    qty = row["qty"] if isinstance(row, dict) else row.qty
+                    net = rate
+                    base_net = net * (invoice_doc.get("conversion_rate") or 1.0)
+                    if isinstance(row, dict):
+                        row["amount"] = rate * qty
+                        row["net_rate"] = net
+                        row["net_amount"] = net * qty
+                        row["base_net_rate"] = base_net
+                        row["base_net_amount"] = base_net * qty
+                    else:
+                        row.amount = rate * qty
+                        row.net_rate = net
+                        row.net_amount = net * qty
+                        row.base_net_rate = base_net
+                        row.base_net_amount = base_net * qty
+                    recalc_rates.append(base_net)
+
+            object.__setattr__(invoice_doc, "calculate_taxes_and_totals", recalc)
+            invoice_doc.submit = lambda: setattr(invoice_doc, "docstatus", 1)
+
+            def floor_check(doc):
+                row = doc.items[0]
+                net = row["base_net_rate"] if isinstance(row, dict) else row.base_net_rate
+                if net < floor_rate:
+                    self.creation.frappe.throw(f"below floor {net} < {floor_rate}")
+
+            self.creation.validate_invoice_item_sale_controls = floor_check
+            self.creation._save_draft_with_latest_timestamp = lambda doc: doc
+            self.creation.frappe.db.exists = lambda doctype, name: name == "ACC-SINV-REPRICE-0001"
+            self.creation.frappe.db.get_value = lambda *args, **kwargs: 0
+            self.creation.frappe.get_cached_value = (
+                lambda doctype, name, fieldname: 0
+                if (doctype, name, fieldname) == ("POS Profile", "Main POS", "posa_tax_inclusive")
+                else ("UGX" if (doctype, fieldname) == ("Company", "default_currency") else None)
+            )
+            self.creation.frappe.get_doc = lambda *args: invoice_doc
+
+            result = self.creation.submit_invoice(
+                json.dumps(
+                    {
+                        "doctype": "Sales Invoice",
+                        "name": "ACC-SINV-REPRICE-0001",
+                        "pos_profile": "Main POS",
+                        "company": "Test Company",
+                        "currency": "UGX",
+                        "customer": "CUST-0001",
+                        "posting_date": "2026-11-28",
+                        "items": [
+                            {
+                                "item_code": "REPRICE-ITEM",
+                                "item_name": "Repriced Item",
+                                "qty": 1,
+                                "rate": new_rate,
+                                "amount": new_rate,
+                                "net_rate": old_rate,
+                                "net_amount": old_rate,
+                                "base_net_rate": old_rate,
+                                "base_net_amount": old_rate,
+                            }
+                        ],
+                        "taxes": [dict(tax_row)],
+                        "payments": [],
+                    }
+                ),
+                json.dumps({}),
+                submit_in_background=0,
+            )
+            return result, recalc_rates
+
+        with self.subTest("repriced above floor 90 -> 120 vs 95 succeeds"):
+            result, recalc_rates = run_repriced_submit(90.0, 120.0, 95.0)
+            self.assertEqual(result["status"], 1)
+            self.assertEqual(recalc_rates, [120.0])
+
+        with self.subTest("repriced below floor 120 -> 90 vs 95 is rejected"):
+            with self.assertRaisesRegex(Exception, "below floor 90.0 < 95.0"):
+                run_repriced_submit(120.0, 90.0, 95.0)
+
+    def test_submit_in_background_job_recalculates_stale_net_rate_before_floor_check(self):
+        tax_row = {
+            "charge_type": "On Net Total",
+            "account_head": "VAT 10% - TC",
+            "rate": 10,
+            "included_in_print_rate": 0,
+        }
+        item_row = FakeDoc(
+            item_code="REPRICE-ITEM",
+            item_name="Repriced Item",
+            qty=1,
+            rate=120.0,
+            amount=120.0,
+            net_rate=90.0,
+            net_amount=90.0,
+            base_rate=120.0,
+            base_amount=120.0,
+            base_net_rate=90.0,
+            base_net_amount=90.0,
+            price_list_rate=120.0,
+            base_price_list_rate=120.0,
+            discount_amount=0,
+            base_discount_amount=0,
+        )
+        invoice_doc = self._build_fx_draft(
+            name="ACC-SINV-BG-REPRICE-0001",
+            currency="UGX",
+            price_list_currency="UGX",
+            conversion_rate=1.0,
+            plc_conversion_rate=1.0,
+            items=[item_row],
+            taxes=[dict(tax_row)],
+        )
+
+        def recalc():
+            item_row.net_rate = item_row.rate
+            item_row.base_net_rate = item_row.rate * (invoice_doc.get("conversion_rate") or 1.0)
+
+        object.__setattr__(invoice_doc, "calculate_taxes_and_totals", recalc)
+        invoice_doc.submit = lambda: setattr(invoice_doc, "docstatus", 1)
+
+        def floor_check(doc):
+            if doc.items[0].base_net_rate < 95.0:
+                self.creation.frappe.throw(f"below floor {doc.items[0].base_net_rate}")
+
+        self.creation.validate_invoice_item_sale_controls = floor_check
+        self.creation._save_draft_with_latest_timestamp = lambda doc: doc
+        self.creation.frappe.get_doc = lambda *args: invoice_doc
+        self.creation.frappe.db.get_value = lambda *args, **kwargs: None
+        self.creation.frappe.get_cached_value = (
+            lambda doctype, name, fieldname: 0
+            if (doctype, name, fieldname) == ("POS Profile", "Main POS", "posa_tax_inclusive")
+            else ("UGX" if (doctype, fieldname) == ("Company", "default_currency") else None)
+        )
+
+        self.creation.submit_in_background_job(
+            {
+                "invoice": "ACC-SINV-BG-REPRICE-0001",
+                "doctype": "Sales Invoice",
+                "data": {},
+                "payments": [],
+                "user": "cashier@example.com",
+            }
+        )
+
+        self.assertEqual(invoice_doc.docstatus, 1)
+        self.assertEqual(item_row.base_net_rate, 120.0)
+
+
 if __name__ == "__main__":
     unittest.main()

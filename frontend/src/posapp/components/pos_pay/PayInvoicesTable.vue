@@ -11,7 +11,7 @@
 				<p v-if="totalSelected" class="golden--text text-end">
 					<span>{{ __("Total Selected :") }}</span>
 					<span>
-						{{ currencySymbol(posProfile.currency) }}
+						{{ currencySymbol(selectedCurrency || posProfile.currency) }}
 						{{ formatCurrency(totalSelected) }}
 					</span>
 					<small>({{ selectedCount }} invoice(s))</small>
@@ -127,9 +127,9 @@
 			<template v-slot:item.outstanding_amount="{ item }">
 				<span class="text-primary"
 					>{{
-						currencySymbol(item?.currency || posProfile.currency)
+						currencySymbol(outstandingDisplayCurrency(item))
 					}}
-					{{ formatCurrency(item?.outstanding_amount_in_invoice_currency ?? item?.outstanding_amount ?? 0) }}</span
+					{{ formatCurrency(outstandingDisplayAmount(item)) }}</span
 				>
 			</template>
 		</v-data-table>
@@ -153,6 +153,7 @@ const props = defineProps({
 	outstandingByCurrency: Object,
 	totalOutstanding: Number,
 	totalSelected: Number,
+	selectedCurrency: String,
 	selectedCount: Number,
 	loading: Boolean,
 	autoReconcileLoading: Boolean,
@@ -203,6 +204,25 @@ const normalizedPosProfiles = computed(() =>
 );
 
 const resolvedSectionTitle = computed(() => props.sectionTitle || __("Invoices"));
+
+const isConversionUnavailable = (item) =>
+	Boolean(
+		item?.outstanding_amount_in_invoice_currency == null &&
+			(item?.outstanding_conversion_unavailable ||
+				(item?.party_account_currency &&
+					item?.currency &&
+					item.party_account_currency !== item.currency)),
+	);
+
+const outstandingDisplayCurrency = (item) =>
+	isConversionUnavailable(item)
+		? item?.party_account_currency || item?.currency || props.posProfile?.currency
+		: item?.currency || props.posProfile?.currency;
+
+const outstandingDisplayAmount = (item) =>
+	isConversionUnavailable(item)
+		? (item?.outstanding_amount ?? 0)
+		: (item?.outstanding_amount_in_invoice_currency ?? item?.outstanding_amount ?? 0);
 
 const invoiceRowProps = ({ item }) => {
 	if (!props.itemClass) {
