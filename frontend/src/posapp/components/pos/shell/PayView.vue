@@ -467,8 +467,17 @@ export default {
 		const invoiceTotalCurrency = computed(() => {
 			if (currency_filter.value && currency_filter.value !== "ALL") return currency_filter.value;
 			if (selected_invoices && selected_invoices.value.length > 0) {
-				const first = selected_invoices.value[0];
-				return first.currency || pos_profile.value.currency;
+				const distinctCurrencies = new Set();
+				selected_invoices.value.forEach((invoice) => {
+					const currency = String(invoice?.currency || pos_profile.value?.currency || "").trim();
+					if (currency) {
+						distinctCurrencies.add(currency);
+					}
+				});
+				if (distinctCurrencies.size === 1) {
+					return Array.from(distinctCurrencies)[0];
+				}
+				return "";
 			}
 			return pos_profile.value.currency;
 		});
@@ -499,7 +508,7 @@ export default {
 				: "for_selling",
 		);
 		const requiresExchangeRate = computed(
-			() => invoiceTotalCurrency.value !== companyCurrencyLocal.value,
+			() => Boolean(invoiceTotalCurrency.value) && invoiceTotalCurrency.value !== companyCurrencyLocal.value,
 		);
 
 		const total_outstanding_amount = computed(() => {
@@ -863,6 +872,24 @@ export default {
 				method._fxRequestSeq = nextSeq;
 			}
 			if (!paymentCurrency || !targetInvoiceCurrency || !targetCompanyCurrency) return;
+			const isCurrentRequest = () => {
+				const latestSeq = seqStore ? seqStore.get(method) : method._fxRequestSeq;
+				const currentAccount = (available_bank_accounts.value?.[method.mode_of_payment] || []).find(
+					(account) => account.account === method.bank_account,
+				);
+				const currentPaymentCurrency =
+					method.payment_currency ||
+					currentAccount?.account_currency ||
+					getPaymentMethodCurrency(method.mode_of_payment);
+				return (
+					nextSeq === latestSeq &&
+					currentPaymentCurrency === paymentCurrency &&
+					targetInvoiceCurrency === invoiceTotalCurrency.value &&
+					targetCompanyCurrency === companyCurrencyLocal.value &&
+					purpose === exchangeRatePurpose.value &&
+					effectiveDate === (postingDate.value || getTodayDate())
+				);
+			};
 			const common = {
 				profileName: pos_profile.value?.name,
 				company: company.value,
@@ -878,24 +905,19 @@ export default {
 					resolveExchangeRate({ ...common, toCurrency: targetCompanyCurrency }),
 				]);
 			} catch {
+				if (!isCurrentRequest()) {
+					return;
+				}
+				method.payment_currency = paymentCurrency;
+				method._rate_error = true;
+				method.invoice_equivalent = 0;
+				method.company_exchange_rate = null;
+				method.invoice_exchange_rate = null;
+				method.rate_date = null;
+				method.rate_source = null;
 				return;
 			}
-			const latestSeq = seqStore ? seqStore.get(method) : method._fxRequestSeq;
-			const currentAccount = (available_bank_accounts.value?.[method.mode_of_payment] || []).find(
-				(account) => account.account === method.bank_account,
-			);
-			const currentPaymentCurrency =
-				method.payment_currency ||
-				currentAccount?.account_currency ||
-				getPaymentMethodCurrency(method.mode_of_payment);
-			if (
-				nextSeq !== latestSeq ||
-				currentPaymentCurrency !== paymentCurrency ||
-				targetInvoiceCurrency !== invoiceTotalCurrency.value ||
-				targetCompanyCurrency !== companyCurrencyLocal.value ||
-				purpose !== exchangeRatePurpose.value ||
-				effectiveDate !== (postingDate.value || getTodayDate())
-			) {
+			if (!isCurrentRequest()) {
 				return;
 			}
 			method.payment_currency = paymentCurrency;
@@ -914,6 +936,7 @@ export default {
 				companyCurrencyLocal.value,
 				invoiceTotalCurrency.value,
 				exchangeRatePurpose.value,
+				postingDate.value,
 				...payment_methods.value.map((m) => [m.mode_of_payment, m.amount, m.bank_account, getPaymentMethodCurrency(m.mode_of_payment)]),
 			],
 			() => payment_methods.value.forEach((method) => void resolvePaymentMethodRate(method)),
@@ -937,6 +960,17 @@ export default {
 				row._fxRequestSeq = nextSeq;
 			}
 			if (!fromCurrency || !toCurrency) return;
+			const isCurrentRequest = () => {
+				const latestSeq = seqStore ? seqStore.get(row) : row._fxRequestSeq;
+				const currentFromCurrency = row.currency || pos_profile.value?.currency;
+				return (
+					nextSeq === latestSeq &&
+					currentFromCurrency === fromCurrency &&
+					toCurrency === invoiceTotalCurrency.value &&
+					purpose === exchangeRatePurpose.value &&
+					effectiveDate === (postingDate.value || getTodayDate())
+				);
+			};
 			let result;
 			try {
 				result = await resolveExchangeRate({
@@ -948,17 +982,14 @@ export default {
 					purpose,
 				});
 			} catch {
+				if (!isCurrentRequest()) {
+					return;
+				}
+				row._rate_error = true;
+				row.invoice_equivalent = 0;
 				return;
 			}
-			const latestSeq = seqStore ? seqStore.get(row) : row._fxRequestSeq;
-			const currentFromCurrency = row.currency || pos_profile.value?.currency;
-			if (
-				nextSeq !== latestSeq ||
-				currentFromCurrency !== fromCurrency ||
-				toCurrency !== invoiceTotalCurrency.value ||
-				purpose !== exchangeRatePurpose.value ||
-				effectiveDate !== (postingDate.value || getTodayDate())
-			) {
+			if (!isCurrentRequest()) {
 				return;
 			}
 			row._rate_error = !result.found;
@@ -969,6 +1000,7 @@ export default {
 			() => [
 				invoiceTotalCurrency.value,
 				exchangeRatePurpose.value,
+				postingDate.value,
 				...selected_payments.value.map((row) => `${row.name}:${row.unallocated_amount}:${row.currency}`),
 				...selected_mpesa_payments.value.map((row) => `${row.name}:${row.amount}:${row.currency}`),
 			],
@@ -1246,13 +1278,20 @@ export default {
 			return get_outstanding_invoices(pos_profile_search.value || null);
 		}
 		function handleInvoiceSelection(item) {
-			toggleInvoiceSelection(item, customer_name, (cust) => {
+			const updated = toggleInvoiceSelection(item, customer_name, (cust) => {
 				if (isCustomerPartyType.value) {
 					customersStore.setSelectedCustomer(cust);
 					return;
 				}
 				customer_name.value = cust;
 			});
+			if (updated === false) {
+				toastStore.show({
+					title: __("Select invoices in a single currency per payment."),
+					color: "error",
+				});
+				return;
+			}
 			fetchPartyAccount();
 			loadPaymentMethodCurrencies();
 		}

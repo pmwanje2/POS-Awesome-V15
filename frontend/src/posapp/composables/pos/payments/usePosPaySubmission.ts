@@ -1,6 +1,11 @@
 import { ref, type Ref } from "vue";
 import { isOffline, saveOfflinePayment } from "../../../../offline/index";
 import { ensurePaymentClientRequestId } from "../../../../offline/idempotency";
+import {
+	calculateEligibleSelectedInvoicesTotal,
+	getSelectedInvoiceCurrencies,
+	isInvoiceOutstandingConversionUnavailable,
+} from "./usePosPaySelection";
 
 declare const frappe: any;
 declare const __: (_text: string, _args?: any[]) => string;
@@ -106,6 +111,34 @@ export function usePosPaySubmission({
 			if (!party) {
 				frappe.throw(__("Please select a party"));
 			}
+			const selectedInvoiceCurrencies = getSelectedInvoiceCurrencies(
+				selected_invoices.value,
+				posProfile.value?.currency,
+			);
+			if (selectedInvoiceCurrencies.length > 1) {
+				const message = __(
+					"Cannot submit payment for invoices in multiple currencies. Select invoices in a single currency.",
+				);
+				eventBus?.emit?.("show_message", {
+					title: message,
+					color: "error",
+				});
+				frappe.throw(message);
+			}
+			if (
+				selected_invoices.value.some((invoice: any) =>
+					isInvoiceOutstandingConversionUnavailable(invoice),
+				)
+			) {
+				const message = __(
+					"Cannot submit payment for an invoice whose currency conversion rate is unavailable.",
+				);
+				eventBus?.emit?.("show_message", {
+					title: message,
+					color: "error",
+				});
+				frappe.throw(message);
+			}
 			if (
 				payment_methods.value.some((row: any) => flt(row.amount) > 0 && row._rate_error) ||
 				selected_payments.value.some((row: any) => row._rate_error) ||
@@ -140,12 +173,13 @@ export function usePosPaySubmission({
 				(invoice: any) => ({ ...invoice }),
 			);
 
-			const totalSelectedInvoicesAmount =
-				selectedInvoicesForPayload.reduce(
-					(acc: number, invoice: any) =>
-						acc + flt(invoice?.outstanding_amount || 0),
-					0,
-				);
+			const totalSelectedInvoicesAmount = calculateEligibleSelectedInvoicesTotal(
+				selectedInvoicesForPayload,
+				{
+					fallbackCurrency: posProfile.value?.currency,
+					fltFn: flt,
+				},
+			);
 
 		const payload = {
 			customer: party,
