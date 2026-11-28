@@ -1700,4 +1700,166 @@ describe("loss prevention", () => {
 			}
 		}
 	});
+
+	it("does not turn explicit invalid buying_exchange_rate: 0 into _company_buying_price in useItemCurrency", () => {
+		const { applyCurrencyConversionToItem } = useItemCurrency();
+		const item: Record<string, unknown> = {
+			item_code: "INVALID-BUY-FX-ITEM",
+			qty: 1,
+			rate: 12,
+			price_list_rate: 12,
+			currency: "USD",
+			company_currency: "UGX",
+			conversion_rate: 3700,
+			buying_price_currency: "USD",
+			buying_exchange_rate: 0,
+			trade_price: 10,
+			buying_rate: 10,
+			uom: "Nos",
+			stock_uom: "Nos",
+			conversion_factor: 1,
+		};
+
+		applyCurrencyConversionToItem(item, {
+			company: { default_currency: "UGX" },
+			pos_profile: { currency: "USD" },
+			price_list_currency: "USD",
+			selected_currency: "USD",
+			exchange_rate: 1,
+			conversion_rate: 3700,
+			currency_precision: 2,
+		});
+
+		expect(item._company_buying_price).toBeUndefined();
+		expect(item.base_buying_rate).toBeUndefined();
+		expect(item.buying_exchange_rate).toBe(0);
+		expect(getItemCostFloor(item)).toBeNull();
+	});
+
+	it("flags legitimate zero-net carried inclusive-tax row on undiscounted invoice while ignoring all-zero draft", () => {
+		const taxes = [
+			{
+				charge_type: "On Net Total",
+				account_head: "VAT 18% - CO",
+				rate: 18,
+				included_in_print_rate: 1,
+			},
+		];
+		// Five USD 0.01 lines @ 18% inclusive VAT -> ERPNext carried rounding [0.01, 0.01, 0.01, 0, 0.01].
+		const carriedNets = [0.01, 0.01, 0.01, 0, 0.01];
+		const items = carriedNets.map((net, idx) => ({
+			item_code: `CARRY-ZERO-${idx + 1}`,
+			item_name: `Carry Zero Line ${idx + 1}`,
+			qty: 1,
+			rate: 0.01,
+			amount: 0.01,
+			net_rate: net,
+			net_amount: net,
+			currency: "USD",
+			company_currency: "UGX",
+			conversion_rate: 3700,
+			valuation_rate: 20,
+		}));
+
+		const risks = findLossRiskItems(items, { taxes, currencyPrecision: 2 });
+		expect(risks).toHaveLength(1);
+		expect(risks[0]?.itemCode).toBe("CARRY-ZERO-4");
+		expect(risks[0]?.sellingRate).toBe(0);
+
+		// Uncalculated all-zero draft [0, 0, 0, 0, 0] does NOT reconcile and falls back to computed 0.00847 (UGX 31.35 >= 20).
+		const uncalculatedDraft = items.map((row) => ({
+			...row,
+			net_rate: 0,
+			net_amount: 0,
+		}));
+		expect(
+			findLossRiskItems(uncalculatedDraft, { taxes, currencyPrecision: 2 }),
+		).toEqual([]);
+	});
+
+	it("reconciles independently rounded inclusive-tax lines when round_row_wise_tax is enabled", () => {
+		const taxes = [
+			{
+				charge_type: "On Net Total",
+				account_head: "VAT 18% - CO",
+				rate: 18,
+				included_in_print_rate: 1,
+			},
+		];
+		// Two USD 0.03 lines @ 18% VAT: unrounded 0.02542 each -> flt(0.02542, 2) == 0.03 each under round_row_wise_tax=1.
+		// At FX 3,700 each earns UGX 111 >= UGX 100 floor (whereas unrounded 94.07 < 100).
+		const items = [1, 2].map((idx) => ({
+			item_code: `ROW-WISE-${idx}`,
+			qty: 1,
+			rate: 0.03,
+			amount: 0.03,
+			net_rate: 0.03,
+			net_amount: 0.03,
+			currency: "USD",
+			company_currency: "UGX",
+			conversion_rate: 3700,
+			valuation_rate: 100,
+		}));
+
+		// Enabled via option -> passes.
+		expect(
+			findLossRiskItems(items, {
+				taxes,
+				currencyPrecision: 2,
+				roundRowWiseTax: true,
+			}),
+		).toEqual([]);
+
+		// Enabled via frappe.boot.sysdefaults.round_row_wise_tax = 1 -> passes.
+		const previousFrappe = (globalThis as any).frappe;
+		(globalThis as any).frappe = {
+			...(previousFrappe || {}),
+			boot: {
+				...(previousFrappe?.boot || {}),
+				sysdefaults: {
+					...(previousFrappe?.boot?.sysdefaults || {}),
+					round_row_wise_tax: 1,
+				},
+			},
+		};
+		try {
+			expect(
+				findLossRiskItems(items, { taxes, currencyPrecision: 2 }),
+			).toEqual([]);
+		} finally {
+			if (previousFrappe === undefined) {
+				delete (globalThis as any).frappe;
+			} else {
+				(globalThis as any).frappe = previousFrappe;
+			}
+		}
+
+		// Disabled (default carried group rounding) -> [0.03, 0.03] sum 0.06 vs 0.0508 still blocks both lines.
+		expect(
+			findLossRiskItems(items, { taxes, currencyPrecision: 2 }),
+		).toHaveLength(2);
+
+		// Even with roundRowWiseTax: true, forged USD 0.04 claiming net_amount=0.04 (flt(0.0339, 2)=0.03) still blocks.
+		const forged = [
+			{
+				item_code: "ROW-WISE-FORGED",
+				qty: 1,
+				rate: 0.04,
+				amount: 0.04,
+				net_rate: 0.04,
+				net_amount: 0.04,
+				currency: "USD",
+				company_currency: "UGX",
+				conversion_rate: 3700,
+				valuation_rate: 140,
+			},
+		];
+		expect(
+			findLossRiskItems(forged, {
+				taxes,
+				currencyPrecision: 2,
+				roundRowWiseTax: true,
+			}),
+		).toHaveLength(1);
+	});
 });

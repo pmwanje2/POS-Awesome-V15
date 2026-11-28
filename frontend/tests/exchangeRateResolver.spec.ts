@@ -78,4 +78,46 @@ describe("exchange rate resolver", () => {
 		expect(result).toMatchObject({ found: true, rate: 3, source: "manual" });
 		expect((globalThis as any).frappe.call).not.toHaveBeenCalled();
 	});
+
+	it("bypasses unqualified legacy warm cache when explicit purpose for_buying is requested", async () => {
+		offlineMocks.getCachedExchangeRate.mockReturnValue({
+			fromCurrency: "USD",
+			toCurrency: "UGX",
+			date: "2026-08-20",
+			exchange_rate: 3700,
+		});
+		repositoryMocks.currencyRateRepository.findLatestOnOrBefore.mockResolvedValue({
+			name: "FX-BUY-4050",
+			from_currency: "USD",
+			to_currency: "UGX",
+			date: "2026-08-20",
+			for_buying: 1,
+			for_selling: 0,
+			exchange_rate: 4050,
+		});
+
+		const result = await resolveExchangeRate({
+			profileName: "POS-1",
+			company: "Example Co",
+			fromCurrency: "USD",
+			toCurrency: "UGX",
+			effectiveDate: "2026-08-20",
+			purpose: "for_buying",
+		});
+
+		expect(result).toMatchObject({
+			found: true,
+			rate: 4050,
+			source: "offline_cache",
+		});
+		expect(
+			repositoryMocks.currencyRateRepository.findLatestOnOrBefore,
+		).toHaveBeenCalledWith(
+			expect.objectContaining({
+				fromCurrency: "USD",
+				toCurrency: "UGX",
+				purpose: "for_buying",
+			}),
+		);
+	});
 });

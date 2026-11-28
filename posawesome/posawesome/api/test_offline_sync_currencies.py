@@ -298,6 +298,29 @@ class TestOfflineSyncCurrencies(unittest.TestCase):
         self.assertEqual(rate_changes["currency_rate::FX-USD-UGX-SELL"]["for_selling"], 1)
         self.assertEqual(latest_rate_calls[0][2].get("purpose"), "for_selling")
 
+    def test_sync_currency_scope_emits_accounts_settings_stale_rate_policy(self):
+        orig_get_cached_doc = self.module.frappe.get_cached_doc
+
+        def fake_get_cached_doc(doctype, name=None):
+            if doctype == "Accounts Settings":
+                return AttrDict({"allow_stale": 0, "stale_days": 30})
+            return orig_get_cached_doc(doctype, name)
+
+        self.module.frappe.get_cached_doc = fake_get_cached_doc
+        try:
+            response = self.module.sync_currency_scope(
+                pos_profile="POS-TEST",
+                watermark=None,
+                currency_pairs=None,
+            )
+        finally:
+            self.module.frappe.get_cached_doc = orig_get_cached_doc
+
+        self.assertEqual(
+            response.get("currency_settings"),
+            {"allow_stale": 0, "stale_days": 30},
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -291,4 +291,60 @@ describe("invoice offline fallbacks", () => {
 		expect(invoiceStore.items[0]._company_buying_price).toBeCloseTo(37000);
 		expect(invoiceStore.items[0].base_buying_rate).toBeCloseTo(37000);
 	});
+
+	it("does not synthesize _company_buying_price from selling FX when buying_exchange_rate is explicitly 0 in useInvoiceCurrency", async () => {
+		const { useUIStore } = await import("../src/posapp/stores/uiStore");
+		const { useInvoiceStore } = await import("../src/posapp/stores/invoiceStore");
+		const { useInvoiceCurrency } = await import(
+			"../src/posapp/composables/pos/invoice/useInvoiceCurrency"
+		);
+		const { getItemCostFloor } = await import(
+			"../src/posapp/utils/lossPrevention"
+		);
+
+		const uiStore = useUIStore();
+		uiStore.setPosProfile({
+			name: "POS-USD-BAD-FX",
+			company: "Test Company",
+			currency: "USD",
+			selling_price_list: "USD List",
+			posa_decimal_precision: "2",
+		} as any);
+		uiStore.setCompanyDoc({ default_currency: "UGX" });
+
+		const invoiceStore = useInvoiceStore();
+		invoiceStore.addItem({
+			item_code: "ITEM-BAD-BUY-FX",
+			qty: 1,
+			rate: 12,
+			price_list_rate: 12,
+			original_rate: 12,
+			original_currency: "USD",
+			currency: "USD",
+			company_currency: "UGX",
+			conversion_rate: 3700,
+			buying_price_currency: "USD",
+			buying_exchange_rate: 0,
+			trade_price: 10,
+			buying_rate: 10,
+			conversion_factor: 1,
+			discount_amount: 0,
+			base_discount_amount: 0,
+			amount: 12,
+			posa_row_id: "row-bad-buy-fx",
+		} as any);
+
+		const invoiceCurrency = useInvoiceCurrency();
+		invoiceCurrency.price_list_currency.value = "USD";
+		invoiceCurrency.selected_currency.value = "USD";
+		invoiceCurrency.exchange_rate.value = 1;
+		invoiceCurrency.conversion_rate.value = 3700;
+
+		await invoiceCurrency.update_item_rates();
+
+		expect(invoiceStore.items[0]._company_buying_price).toBeUndefined();
+		expect(invoiceStore.items[0].base_buying_rate).toBeUndefined();
+		expect(invoiceStore.items[0].buying_exchange_rate).toBe(0);
+		expect(getItemCostFloor(invoiceStore.items[0])).toBeNull();
+	});
 });

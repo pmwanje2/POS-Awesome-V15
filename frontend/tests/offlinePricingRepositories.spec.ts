@@ -318,4 +318,85 @@ describe("offline pricing repositories", () => {
 		expect(sellingRate?.name).toBe("FX-004");
 		expect(sellingRate?.exchange_rate).toBe(3700);
 	});
+
+	it("enforces strict Accounts Settings stale_days cutoff when allow_stale is 0", async () => {
+		await currencyRateRepository.upsertMany([
+			{
+				name: "FX-STALE-BOUNDARY",
+				profile_name: "POS-1",
+				company: "Test Co",
+				from_currency: "USD",
+				to_currency: "UGX",
+				exchange_rate: 3900,
+				date: "2026-10-29",
+				for_buying: 1,
+				for_selling: 0,
+			},
+			{
+				name: "FX-JAN-2025",
+				profile_name: "POS-1",
+				company: "Test Co",
+				from_currency: "USD",
+				to_currency: "UGX",
+				exchange_rate: 3800,
+				date: "2025-01-15",
+				for_buying: 1,
+				for_selling: 0,
+			},
+		]);
+
+		// With allow_stale=0 and stale_days=30 on 2026-11-28, checkpoint is 2026-10-29:
+		// ERPNext setup/utils.py:87 requires strict date > checkpoint_date -> both 2026-10-29 and 2025-01-15 are rejected.
+		const rejected = await currencyRateRepository.findLatestOnOrBefore({
+			profileName: "POS-1",
+			company: "Test Co",
+			fromCurrency: "USD",
+			toCurrency: "UGX",
+			date: "2026-11-28",
+			purpose: "for_buying",
+			allowStale: 0,
+			staleDays: 30,
+		});
+		expect(rejected).toBeNull();
+
+		// A rate dated 2026-10-30 (> 2026-10-29) IS accepted.
+		await currencyRateRepository.upsertMany([
+			{
+				name: "FX-FRESH",
+				profile_name: "POS-1",
+				company: "Test Co",
+				from_currency: "USD",
+				to_currency: "UGX",
+				exchange_rate: 4050,
+				date: "2026-10-30",
+				for_buying: 1,
+				for_selling: 0,
+			},
+		]);
+		const accepted = await currencyRateRepository.findLatestOnOrBefore({
+			profileName: "POS-1",
+			company: "Test Co",
+			fromCurrency: "USD",
+			toCurrency: "UGX",
+			date: "2026-11-28",
+			purpose: "for_buying",
+			allowStale: 0,
+			staleDays: 30,
+		});
+		expect(accepted?.name).toBe("FX-FRESH");
+		expect(accepted?.exchange_rate).toBe(4050);
+
+		// With allow_stale=1, stale rates remain eligible.
+		const permissive = await currencyRateRepository.findLatestOnOrBefore({
+			profileName: "POS-1",
+			company: "Test Co",
+			fromCurrency: "USD",
+			toCurrency: "UGX",
+			date: "2026-10-29",
+			purpose: "for_buying",
+			allowStale: 1,
+			staleDays: 30,
+		});
+		expect(permissive?.name).toBe("FX-STALE-BOUNDARY");
+	});
 });

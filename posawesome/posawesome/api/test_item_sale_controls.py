@@ -4820,6 +4820,121 @@ class TestItemSaleControls(unittest.TestCase):
             self.assertEqual(len(cross_group_errors), 1)
             self.assertEqual(cross_group_errors[0]["item_code"], "ITEM-CARRY-2")
 
+    def test_round_row_wise_tax_reconciles_independently_rounded_inclusive_tax_rows(self):
+        erpnext_pkg = types.ModuleType("erpnext")
+        erpnext_setup = types.ModuleType("erpnext.setup")
+        erpnext_utils = types.ModuleType("erpnext.setup.utils")
+        erpnext_utils.get_exchange_rate = (
+            lambda from_curr, to_curr, *_args, **_kwargs: 3700.0
+            if (from_curr, to_curr) == ("USD", "UGX")
+            else 1.0
+        )
+
+        # Two USD 0.03 lines @ 18% VAT: unrounded 0.02542 each -> flt(0.02542, 2) = 0.03 each under round_row_wise_tax=1.
+        # At FX 3,700, each earns UGX 111 >= UGX 100 floor (whereas unrounded 94.07 < 100).
+        def fake_get_all(doctype, **kwargs):
+            if doctype == "Item":
+                return [
+                    {"name": "ITEM-RW-1", "stock_uom": "Nos", "is_stock_item": 1, "valuation_rate": 0},
+                    {"name": "ITEM-RW-2", "stock_uom": "Nos", "is_stock_item": 1, "valuation_rate": 0},
+                    {"name": "ITEM-RW-FORGED", "stock_uom": "Nos", "is_stock_item": 1, "valuation_rate": 0},
+                ]
+            if doctype == "Bin":
+                return [
+                    {"item_code": "ITEM-RW-1", "warehouse": "Shop Floor - JBS", "valuation_rate": 100.0},
+                    {"item_code": "ITEM-RW-2", "warehouse": "Shop Floor - JBS", "valuation_rate": 100.0},
+                    {"item_code": "ITEM-RW-FORGED", "warehouse": "Shop Floor - JBS", "valuation_rate": 140.0},
+                ]
+            return []
+
+        self.frappe.get_all = fake_get_all
+        self.frappe.db.get_value = lambda doctype, name, fieldname=None: (
+            "UGX" if doctype == "Company" and fieldname == "default_currency" else None
+        )
+
+        rows = [
+            PrecisionDoc(
+                item_code=f"ITEM-RW-{idx}",
+                item_name=f"Row Wise {idx}",
+                qty=1,
+                rate=0.03,
+                amount=0.03,
+                net_rate=0.03,
+                net_amount=0.03,
+                base_net_rate=111.0,
+                base_net_amount=111.0,
+                uom="Nos",
+                warehouse="Shop Floor - JBS",
+                precision_value=2,
+            )
+            for idx in (1, 2)
+        ]
+        invoice = PrecisionDoc(
+            company="Test Co",
+            currency="USD",
+            conversion_rate=3700.0,
+            taxes=[
+                {
+                    "charge_type": "On Net Total",
+                    "account_head": "VAT 18% - CO",
+                    "rate": 18,
+                    "included_in_print_rate": 1,
+                }
+            ],
+            precision_value=2,
+        )
+
+        orig_get_single_value = self.frappe.db.get_single_value
+        with patch.dict(
+            sys.modules,
+            {
+                "erpnext": erpnext_pkg,
+                "erpnext.setup": erpnext_setup,
+                "erpnext.setup.utils": erpnext_utils,
+            },
+        ):
+            try:
+                # Default (round_row_wise_tax=0): [0.03, 0.03] sum 0.06 vs 0.0508 still blocks both lines.
+                self.frappe.db.get_single_value = lambda doctype, fieldname: (
+                    0 if doctype == "Accounts Settings" and fieldname == "round_row_wise_tax" else None
+                )
+                self.assertEqual(
+                    len(self.controls.collect_below_buying_price_errors(rows, invoice_doc=invoice)),
+                    2,
+                )
+
+                # Enabled (Accounts Settings.round_row_wise_tax=1): each row matches flt(0.02542, 2)=0.03 -> passes!
+                self.frappe.db.get_single_value = lambda doctype, fieldname: (
+                    1 if doctype == "Accounts Settings" and fieldname == "round_row_wise_tax" else None
+                )
+                self.assertEqual(
+                    self.controls.collect_below_buying_price_errors(rows, invoice_doc=invoice),
+                    [],
+                )
+
+                # Even with round_row_wise_tax=1, forged USD 0.04 claiming net_amount=0.04 (flt(0.0339, 2)=0.03) blocks.
+                forged = PrecisionDoc(
+                    item_code="ITEM-RW-FORGED",
+                    item_name="Row Wise Forged",
+                    qty=1,
+                    rate=0.04,
+                    amount=0.04,
+                    net_rate=0.04,
+                    net_amount=0.04,
+                    base_net_rate=148.0,
+                    base_net_amount=148.0,
+                    uom="Nos",
+                    warehouse="Shop Floor - JBS",
+                    precision_value=2,
+                )
+                forged_errors = self.controls.collect_below_buying_price_errors(
+                    [forged], invoice_doc=invoice
+                )
+                self.assertEqual(len(forged_errors), 1)
+                self.assertEqual(forged_errors[0]["item_code"], "ITEM-RW-FORGED")
+            finally:
+                self.frappe.db.get_single_value = orig_get_single_value
+
 
 if __name__ == "__main__":
     unittest.main()
