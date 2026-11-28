@@ -4,6 +4,7 @@ import { ensurePaymentClientRequestId } from "../../../../offline/idempotency";
 import {
 	calculateEligibleSelectedInvoicesTotal,
 	getSelectedInvoiceCurrencies,
+	hasPositivePaymentMethodAmount,
 	isInvoiceOutstandingConversionUnavailable,
 	resolveInvoiceCurrency,
 } from "./usePosPaySelection";
@@ -313,10 +314,9 @@ export function usePosPaySubmission({
 				return { loading: false, error: false, stale: false };
 			};
 
+			const positivePaymentMethods = payment_methods.value.filter(hasPositivePaymentMethodAmount);
 			const allRowFxStates = [
-				...payment_methods.value
-					.filter((row: any) => flt(row?.amount) > 0)
-					.map((row: any) => isRowFxPendingOrStale(row, "method")),
+				...positivePaymentMethods.map((row: any) => isRowFxPendingOrStale(row, "method")),
 				...selected_payments.value.map((row: any) =>
 					isRowFxPendingOrStale(row, "selected"),
 				),
@@ -404,9 +404,7 @@ export function usePosPaySubmission({
 			pos_opening_shift_name: posOpeningShift.value.name,
 			pos_profile_name: posProfile.value.name,
 			pos_profile: posProfile.value,
-			payment_methods: payment_methods.value
-				.filter((m: any) => flt(m.amount) > 0)
-				.map((m: any) => ({
+				payment_methods: positivePaymentMethods.map((m: any) => ({
 					mode_of_payment: m.mode_of_payment,
 					amount: m.amount,
 					payment_currency: m.payment_currency,
