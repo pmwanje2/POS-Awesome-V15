@@ -3608,23 +3608,62 @@ class TestItemSaleControls(unittest.TestCase):
                 [],
             )
 
+        with self.subTest("Pricing Rule Item Code child uom scales min_qty by SKU conversion"):
+            install_strict_rule(
+                child_doctype="Pricing Rule Item Code",
+                child_rows=[{"parent": "PR-FREE", "item_code": "TRIG", "uom": "Box"}],
+                apply_on="Item Code",
+                is_recursive=1,
+                min_qty=2,
+                recurse_for=1,
+                free_qty=1,
+                round_free_qty=1,
+                free_item_uom="Nos",
+            )
+            five_nos = self._promo_trigger_row()
+            five_nos["qty"] = 5
+            five_nos["uom"] = "Nos"
+            five_nos["stock_uom"] = "Nos"
+            five_nos["stock_qty"] = 5.0
+            free_one = self._promo_free_row(rate=0)
+            free_one["qty"] = 1
+            self.assertEqual(
+                len(
+                    self.controls.collect_below_buying_price_errors(
+                        [five_nos, free_one],
+                        invoice_doc=dict(self.PROMO_INVOICE),
+                    )
+                ),
+                1,
+            )
+
+            one_case = self._promo_trigger_row()
+            one_case["qty"] = 1
+            one_case["uom"] = "Case"
+            one_case["stock_uom"] = "Nos"
+            one_case["conversion_factor"] = 6.0
+            one_case["stock_qty"] = 6.0
+            self.assertEqual(
+                self.controls.collect_below_buying_price_errors(
+                    [one_case, free_one],
+                    invoice_doc=dict(self.PROMO_INVOICE),
+                ),
+                [],
+            )
+
+        # ERPNext pricing_rule/utils.py:423-435 + get_item_details.py:1784-1789:
+        # Brand and Item Group child rows carry no item_code, so get_conversion_factor(None, uom)
+        # returns 1.0 and 1 Box (stock_qty=3) >= min_qty=2 qualifies and awards 1 free unit.
         for label, apply_on, child_dt, child_row, item_extra in (
             (
-                "Pricing Rule Item Code child uom",
-                "Item Code",
-                "Pricing Rule Item Code",
-                {"parent": "PR-FREE", "item_code": "TRIG", "uom": "Box"},
-                None,
-            ),
-            (
-                "Pricing Rule Item Group child uom",
+                "Pricing Rule Item Group child uom uses factor 1.0 matching ERPNext",
                 "Item Group",
                 "Pricing Rule Item Group",
                 {"parent": "PR-FREE", "item_group": "Beverages", "uom": "Box"},
                 {"item_group": "Beverages"},
             ),
             (
-                "Pricing Rule Brand child uom",
+                "Pricing Rule Brand child uom uses factor 1.0 matching ERPNext",
                 "Brand",
                 "Pricing Rule Brand",
                 {"parent": "PR-FREE", "brand": "Acme", "uom": "Box"},
@@ -3644,39 +3683,37 @@ class TestItemSaleControls(unittest.TestCase):
                     round_free_qty=1,
                     free_item_uom="Nos",
                 )
-                five_nos = self._promo_trigger_row()
-                five_nos["qty"] = 5
-                five_nos["uom"] = "Nos"
-                five_nos["stock_uom"] = "Nos"
-                five_nos["stock_qty"] = 5.0
-                if item_extra:
-                    five_nos.update(item_extra)
+                one_box = self._promo_trigger_row()
+                one_box["qty"] = 1
+                one_box["uom"] = "Box"
+                one_box["stock_uom"] = "Nos"
+                one_box["conversion_factor"] = 3.0
+                one_box["stock_qty"] = 3.0
+                one_box.update(item_extra)
                 free_one = self._promo_free_row(rate=0)
                 free_one["qty"] = 1
                 self.assertEqual(
+                    self.controls.collect_below_buying_price_errors(
+                        [one_box, free_one],
+                        invoice_doc=dict(self.PROMO_INVOICE),
+                    ),
+                    [],
+                )
+
+                one_nos = self._promo_trigger_row()
+                one_nos["qty"] = 1
+                one_nos["uom"] = "Nos"
+                one_nos["stock_uom"] = "Nos"
+                one_nos["stock_qty"] = 1.0
+                one_nos.update(item_extra)
+                self.assertEqual(
                     len(
                         self.controls.collect_below_buying_price_errors(
-                            [five_nos, free_one],
+                            [one_nos, free_one],
                             invoice_doc=dict(self.PROMO_INVOICE),
                         )
                     ),
                     1,
-                )
-
-                one_case = self._promo_trigger_row()
-                one_case["qty"] = 1
-                one_case["uom"] = "Case"
-                one_case["stock_uom"] = "Nos"
-                one_case["conversion_factor"] = 6.0
-                one_case["stock_qty"] = 6.0
-                if item_extra:
-                    one_case.update(item_extra)
-                self.assertEqual(
-                    self.controls.collect_below_buying_price_errors(
-                        [one_case, free_one],
-                        invoice_doc=dict(self.PROMO_INVOICE),
-                    ),
-                    [],
                 )
 
     def test_reconciled_multi_unit_line_honors_native_rounded_net_rate_cross_currency(self):
@@ -3864,6 +3901,45 @@ class TestItemSaleControls(unittest.TestCase):
                 len(
                     self.controls.collect_below_buying_price_errors(
                         [line_a, line_b, free_six],
+                        invoice_doc=dict(self.PROMO_INVOICE),
+                    )
+                ),
+                1,
+            )
+
+        with self.subTest("is_cumulative=1 with mixed_conditions=0 evaluates max_qty per line and awards 6 (not 7)"):
+            self._install_promotional_rule(
+                apply_on="Item Code",
+                mixed_conditions=0,
+                is_cumulative=1,
+                is_recursive=1,
+                min_qty=1,
+                max_qty=4,
+                recurse_for=1,
+                free_qty=1,
+                round_free_qty=1,
+            )
+            line_a = self._promo_trigger_row()
+            line_a["qty"] = 3
+            line_b = self._promo_trigger_row()
+            line_b["qty"] = 3
+
+            free_six = self._promo_free_row(rate=0)
+            free_six["qty"] = 6
+            self.assertEqual(
+                self.controls.collect_below_buying_price_errors(
+                    [line_a, line_b, free_six],
+                    invoice_doc=dict(self.PROMO_INVOICE),
+                ),
+                [],
+            )
+
+            free_seven = self._promo_free_row(rate=0)
+            free_seven["qty"] = 7
+            self.assertEqual(
+                len(
+                    self.controls.collect_below_buying_price_errors(
+                        [line_a, line_b, free_seven],
                         invoice_doc=dict(self.PROMO_INVOICE),
                     )
                 ),

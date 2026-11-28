@@ -1037,4 +1037,94 @@ describe("loss prevention", () => {
 			"MULTI-UNIT-FORGED",
 		]);
 	});
+
+	it("does not let multi-UOM _buying_prices_by_uom insertion order override backend base_buying_rate when row uom/stock_uom are omitted", () => {
+		const item = {
+			item_code: "MULTI-UOM-NO-ROW-UOM",
+			qty: 1,
+			rate: 15,
+			currency: "USD",
+			company_currency: "USD",
+			conversion_rate: 1,
+			base_buying_rate: 10,
+			_buying_prices_by_uom: {
+				Box: {
+					price_list_rate: 100,
+					base_price_list_rate: 100,
+					currency: "USD",
+				},
+				Nos: {
+					price_list_rate: 10,
+					base_price_list_rate: 10,
+					currency: "USD",
+				},
+			},
+		};
+
+		const floor = getItemCostFloor(item);
+		expect(floor).not.toBeNull();
+		expect(floor?.rate).toBeCloseTo(10);
+		expect(getItemLossRisk(item)).toBeNull();
+	});
+
+	it("resolves invoice-currency _buying_prices_by_uom entry with null base_price_list_rate in a foreign-currency company", () => {
+		const item = {
+			item_code: "USD-INV-UGX-CO-NULL-BASE",
+			qty: 1,
+			rate: 12,
+			currency: "USD",
+			company_currency: "UGX",
+			conversion_rate: 3700,
+			uom: "Nos",
+			stock_uom: "Nos",
+			_company_buying_price: 37000,
+			_buying_prices_by_uom: {
+				Nos: {
+					currency: "USD",
+					price_list_rate: 10,
+					base_price_list_rate: null,
+				},
+			},
+		};
+
+		const floor = getItemCostFloor(item);
+		expect(floor).not.toBeNull();
+		expect(floor?.rate).toBeCloseTo(10);
+		expect(getItemLossRisk(item)).toBeNull();
+		expect(getItemLossRisk({ ...item, rate: 8 })?.belowCost).toBe(true);
+	});
+
+	it("preserves legitimate rounded zero net_rate === 0 on 3 x USD 0.01 with 0.02 discount against UGX 10 floor", () => {
+		const items = [
+			{
+				item_code: "ZERO-NET-RATE",
+				qty: 3,
+				rate: 0.01,
+				net_amount: 0.01,
+				net_rate: 0,
+				base_net_rate: 0,
+				currency: "USD",
+				company_currency: "UGX",
+				conversion_rate: 3700,
+				valuation_rate: 10,
+			},
+		];
+		const doc = {
+			apply_discount_on: "Net Total",
+			discount_amount: 0.02,
+			items,
+		};
+		const invoiceDiscountPercentage = resolveInvoiceDiscountPercentage(
+			doc,
+			items,
+		);
+		const risks = findLossRiskItems(items, {
+			invoiceDiscountPercentage,
+			applyDiscountOn: "Net Total",
+			currencyPrecision: 2,
+		});
+		expect(risks).toHaveLength(1);
+		expect(risks[0]?.itemCode).toBe("ZERO-NET-RATE");
+		expect(risks[0]?.sellingRate).toBe(0);
+	});
 });
